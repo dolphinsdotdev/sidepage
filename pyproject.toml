@@ -1,0 +1,32 @@
+[project]
+name = "sidepage"
+version = "0.1.0"
+description = "Sidepage CLI — local-first hosting, tunneling, and directory for small apps and MCP servers"
+requires-python = ">=3.12"
+dependencies = [
+    "rich>=13.7",
+    "typer>=0.12",
+]
+
+[project.scripts]
+sidepage = "sidepage.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.9.21,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
