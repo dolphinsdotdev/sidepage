@@ -21,13 +21,30 @@ skip calling into this module entirely for those, not call it with some
 `check_name` is no longer a standalone CLI command (`sidepage name check`
 was folded into `sidepage account status` territory, effectively dropped —
 name assignment now just happens implicitly during `serve`). It stays here
-as the internal primitive `serve`'s directory registration calls.
+as the internal primitive `serve`'s directory registration calls — and is
+now real, for the one caller that actually needs it: BYO-domain tunneling
+(`sidepage.core.tunnel_manager.open_byo_tunnel`), which needs a concrete
+`<app-name>-<id>.<domain>` hostname to create a DNS record for. The
+`<id>` is generated once per `app_name` and persisted (see
+`sidepage.config.settings.name_bindings_file`), not regenerated every
+`serve` call — otherwise the DNS record (and the URL you'd bookmark) would
+change on every restart. There's still no directory *service* backing
+this (no owner/scope/teardown-status tracking, no collision detection
+across machines) — just the local stability guarantee this module's
+docstring already promises for the id itself.
 """
 
 from __future__ import annotations
 
+import json
+import secrets
+import string
 from dataclasses import dataclass
 from enum import StrEnum
+
+from sidepage.config.settings import ensure_dirs, name_bindings_file
+
+_ID_ALPHABET = string.ascii_lowercase + string.digits
 
 
 class Scope(StrEnum):
@@ -47,14 +64,37 @@ class DirectoryEntry:
     status: str  # health/teardown status
 
 
-def check_name(app_name: str) -> str:
-    """Assign the `<app-name>-<4-char-id>` suffix for `app_name`. Called
-    internally by `sidepage.core.process.serve` during directory
-    registration — not exposed as its own CLI command in v3.
+def _load_bindings() -> dict[str, str]:
+    path = name_bindings_file()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
 
-    Not implemented.
-    """
-    raise NotImplementedError
+
+def _save_bindings(bindings: dict[str, str]) -> None:
+    ensure_dirs()
+    name_bindings_file().write_text(json.dumps(bindings))
+
+
+def check_name(app_name: str) -> str:
+    """Assign (or look up a previously-assigned) `<app-name>-<4-char-id>`
+    for `app_name`. Called internally by `sidepage.core.tunnel_manager.open_byo_tunnel`
+    when building the hostname to route — not exposed as its own CLI
+    command in v3.
+
+    The id is generated once per `app_name` and persisted locally, so
+    repeated `serve` calls for the same app name get the same hostname
+    (and don't need a new DNS record each time)."""
+    bindings = _load_bindings()
+    suffix = bindings.get(app_name)
+    if suffix is None:
+        suffix = "".join(secrets.choice(_ID_ALPHABET) for _ in range(4))
+        bindings[app_name] = suffix
+        _save_bindings(bindings)
+    return f"{app_name}-{suffix}"
 
 
 def promote(app_name: str, *, scope: Scope) -> DirectoryEntry:

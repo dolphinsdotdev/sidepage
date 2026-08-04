@@ -14,6 +14,10 @@ and can actually stop it afterward.
 
 from __future__ import annotations
 
+import base64
+import json
+
+import httpx
 import pytest
 from typer.testing import CliRunner
 
@@ -149,14 +153,26 @@ def test_serve_guardrail_flag_rejected_before_touching_target() -> None:
     assert "guardrail" in result.output.lower()
 
 
-def test_serve_domain_rejected() -> None:
-    """--domain (BYO Cloudflare) isn't implemented — rejected before
-    target detection, same as --guardrail."""
+def test_serve_domain_without_config_rejected() -> None:
+    """--domain (BYO Cloudflare) is real, but requires `account domain set`
+    first — rejected before target detection, same as --guardrail, but as
+    a real ValueError (exit 1), not a not-yet-implemented notice (exit 0):
+    the feature is built, this invocation is just missing a prerequisite."""
     result = runner.invoke(
         app, ["serve", "definitely-does-not-exist.py", "--domain", "example.com"]
     )
-    assert result.exit_code == 0, result.output
-    assert "isn't implemented" in _flat(result.output)
+    assert result.exit_code == 1, result.output
+    assert "isn't configured" in _flat(result.output)
+    assert "account domain set" in result.output
+
+
+def test_serve_domain_and_anon_mutually_exclusive() -> None:
+    result = runner.invoke(
+        app,
+        ["serve", "definitely-does-not-exist.py", "--domain", "example.com", "--anon"],
+    )
+    assert result.exit_code == 1, result.output
+    assert "mutually exclusive" in result.output
 
 
 def test_serve_non_local_scope_rejected() -> None:
@@ -196,12 +212,78 @@ def test_inspect_unknown_target_fails() -> None:
     assert "not-a-running-app" in result.output
 
 
-def test_account_domain_set_requires_both_token_names() -> None:
-    """v4: --zone-token-name and --tunnel-token-name are both required —
-    account domain set no longer accepts raw credential values at all."""
+def test_account_domain_set_requires_api_token_name() -> None:
+    """v4 delta: a single --api-token-name is required — the old
+    --zone-token-name/--tunnel-token-name pair is gone."""
     result = runner.invoke(app, ["account", "domain", "set", "example.com"])
     assert result.exit_code != 0
     assert "Missing option" in result.output
+
+
+def test_account_domain_set_rejects_unknown_secret_name() -> None:
+    """Real validation, not just flag presence: the name must already
+    resolve in the vault before any Cloudflare API call is attempted."""
+    result = runner.invoke(
+        app,
+        ["account", "domain", "set", "example.com", "--api-token-name", "no-such-secret"],
+    )
+    assert result.exit_code != 0
+    assert "no-such-secret" in result.output
+
+
+class _FakeCloudflareProvisioningTransport(httpx.BaseTransport):
+    """Minimal fake for the two Cloudflare API calls `account domain set`
+    now makes for real (zone lookup, then create-tunnel) — see
+    `tests/test_tunnel_byo.py` for the fuller stateful fake used to test
+    `tunnel_manager` directly; this one only needs to cover a single
+    happy-path `domain set` call."""
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/client/v4/zones":
+            return httpx.Response(
+                200,
+                json={"success": True, "result": [{"id": "zone-1", "account": {"id": "acct-1"}}]},
+            )
+        if path == "/client/v4/accounts/acct-1/cfd_tunnel" and request.method == "POST":
+            token = base64.b64encode(
+                json.dumps({"a": "acct-1", "t": "tun-1", "s": "sec"}).encode()
+            ).decode()
+            result = {"id": "tun-1", "token": token}
+            return httpx.Response(200, json={"success": True, "result": result})
+        return httpx.Response(404, json={"success": False, "errors": [f"unhandled: {path}"]})
+
+
+def test_serve_domain_with_configured_domain_passes_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once `account domain set` succeeds, `serve --domain` should clear
+    domain validation entirely — proven by it reaching target detection
+    (a later, different failure) instead of the "isn't configured" error.
+    `account domain set` itself now makes real Cloudflare API calls
+    (zone lookup + tunnel creation), so those are mocked here; `serve`
+    still never reaches the tunnel-opening step, since a nonexistent
+    target fails before that."""
+    real_client = httpx.Client
+
+    def fake_client(*a, **k):
+        return real_client(*a, **{**k, "transport": _FakeCloudflareProvisioningTransport()})
+
+    monkeypatch.setattr(httpx, "Client", fake_client)
+
+    runner.invoke(app, ["secrets", "set", "cf-api-tok"], input="cftok\ncftok\n")
+    set_result = runner.invoke(
+        app, ["account", "domain", "set", "example.com", "--api-token-name", "cf-api-tok"]
+    )
+    assert set_result.exit_code == 0, set_result.output
+    assert "cf-tunnel-token::example.com" in set_result.output
+
+    result = runner.invoke(
+        app, ["serve", "definitely-does-not-exist.py", "--domain", "example.com"]
+    )
+    assert result.exit_code != 0
+    assert "does not exist" in result.output
+    assert "isn't configured" not in result.output
 
 
 def test_secrets_set_prompts_for_hidden_value_and_persists() -> None:

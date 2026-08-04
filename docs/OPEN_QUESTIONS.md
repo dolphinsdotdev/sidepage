@@ -21,6 +21,11 @@ A further pass turned `inspect` real for generic HTTP/static targets,
 deliberately scoped short of the spec's actual "Postman-for-MCP" framing.
 Item 14 covers what's still open there.
 
+A real-world app surfaced a genuine dependency-resolution bug (an
+undeclared, hand-installed package silently missing at launch), fixed by
+no longer trusting an existing project `.venv`. Item 15 covers the
+residual gap that fix doesn't close.
+
 ---
 
 ## Resolved in v3
@@ -82,14 +87,41 @@ general HTTP token/gate-page flow. Newly parked in v3 (§15), not resolved.
 
 ---
 
-### 4. stdio-transport MCP servers
+### 4. stdio-transport MCP servers — resolved for the common case, still open for low-level-only servers
 
-No port at all — breaks the "everything is a port" assumption the whole
-proxy design (`sidepage.core.target`, `sidepage.core.reverse_proxy`) rests
-on. Needs a different bridging strategy if it's ever in scope. Newly parked
-in v3 (§15).
+Originally: no port at all — breaks the "everything is a port" assumption
+the whole proxy design (`sidepage.core.target`,
+`sidepage.core.reverse_proxy`) rests on. Newly parked in v3 (§15).
 
-**Affects:** `sidepage.core.target`, `sidepage.core.reverse_proxy`
+**Resolved for the case that actually matters in practice.** `sidepage
+serve` now supports Python MCP servers built on either recognized
+high-level API (the official SDK's `FastMCP`/`MCPServer`, or the
+third-party `fastmcp` package's `FastMCP` — see
+`sidepage.core.target.detect_mcp_package`). The resolution isn't "add
+stdio bridging" — it's that `serve` never executes the script's own
+`__main__`/`.run()` call at all (same bypass FastAPI targets already get),
+and instead launches `<var>.streamable_http_app()` / `<var>.http_app()`
+directly via `uvicorn --factory`. A script whose `__main__` only ever
+calls `mcp.run()` — stdio by construction, the default for both packages —
+still ends up served over real Streamable HTTP, because that `__main__`
+block is never reached. Verified end to end, including a script
+deliberately left stdio-only in its own entrypoint
+(`tests/fixtures/mcp-app`, `tests/test_serve_mcp.py`), against the
+actually-resolvable current releases of both packages rather than
+assumed from memory (the official SDK renamed its high-level class
+between the versions checked — `FastMCP` → `MCPServer` — which is exactly
+the kind of assumption worth verifying rather than trusting).
+
+**Still open:** a server built directly on the *low-level* API
+(`mcp.server.lowlevel.Server` wired to `mcp.server.stdio` by hand, with no
+`FastMCP`/`MCPServer`/`.streamable_http_app()` equivalent anywhere) has no
+ASGI app for `serve` to bypass into — there's genuinely no port to inject
+into for that case, and it's not detected (falls through to the generic
+`$PORT` fallback, which will just fail to launch it correctly). Not
+encountered in practice yet; flagged rather than silently mishandled if it
+comes up.
+
+**Affects:** `sidepage.core.target`, `sidepage.core.process`, `sidepage.core.reverse_proxy`
 
 ---
 
@@ -190,22 +222,61 @@ design commitment against it — just a scope decision for this pass.
 
 ---
 
-### 12. Brokered/BYO-domain tunneling: not implemented because no backend exists
+### 12. Brokered tunneling: not implemented because no backend exists; BYO-domain is now real, including tunnel creation itself
 
 Distinguishing this from the rest of the "not implemented" surface: v3's
 default tunnel mode (brokered, under Sidepage's own domain) requires a
-Sidepage cloud backend to issue scoped tunnel tokens, and BYO-domain
-requires real DNS automation against a user's Cloudflare zone. Neither can
-be built by writing more `sidepage` code — they need a backend service
-that doesn't exist yet, which is a different kind of gap than "not
-implemented yet" (e.g. `sidepage inspect`'s generic-HTTP mode, which
-*was* buildable and is now real — see item 14 for the one piece of
-`inspect` that has the same "needs something else first" shape as this
-item). `serve` without `--anon`/`--domain` falls back to serving on
-`127.0.0.1` only rather than either failing or silently pretending
-brokered mode ran.
+Sidepage cloud backend to issue scoped tunnel tokens. That can't be built
+by writing more `sidepage` code — it needs a backend service that doesn't
+exist yet, a different kind of gap than "not implemented yet" (e.g.
+`sidepage inspect`'s generic-HTTP mode, which *was* buildable and is now
+real — see item 14 for the one piece of `inspect` that has the same
+"needs something else first" shape). `serve` without `--anon`/`--domain`
+falls back to serving on `127.0.0.1` only rather than either failing or
+silently pretending brokered mode ran.
 
-**Affects:** `sidepage.core.tunnel_manager`, `sidepage.core.process`
+BYO-domain, unlike brokered, turned out to be buildable against a user's
+own Cloudflare account with no Sidepage backend involved, and is now real
+(`sidepage.core.tunnel_manager.provision_byo_domain`/`open_byo_tunnel`,
+`sidepage.core.account`, `sidepage.core.directory_client.check_name`; see
+`docs/CHECKLIST.md` §6).
+
+**Revised scope boundary (supersedes an earlier, narrower design).** The
+original two-token design (`Zone:DNS:Edit` + a separately-sourced
+per-tunnel run-token) deliberately had `open_byo_tunnel` **run** a tunnel
+the user already created out-of-band (`cloudflared tunnel create` or the
+dashboard), not **create** one — creating a tunnel needs
+`Cloudflare Tunnel:Edit`, a broader scope than that two-token model
+covered, and adding a third token type just to save one manual step wasn't
+judged worth it at the time.
+
+That call was revisited: a single Cloudflare API token scoped to
+Account→Tunnel:Edit, Zone→DNS:Edit, Zone→Zone:Read turned out to be no
+harder for the user to create than the old two-token pair (arguably
+easier — it's one token, not two independently-sourced ones), while
+letting `sidepage account domain set` provision the tunnel itself via the
+API (`provision_byo_domain`) rather than requiring a manual out-of-band
+step first. That in turn made it practical to move from "one `cloudflared`
+process + one tunnel per app" to **one shared tunnel per domain**, with
+per-app routing done via the Cloudflare Tunnel configurations API
+(GET-modify-PUT ingress rules) instead of the `--url` flag, which only
+ever supports a single hostname per process. The shared process is
+reference-counted against the local registry (`sidepage.core.registry`)
+and started/stopped only on the first/last app using a given domain, under
+a per-domain advisory file lock so concurrent `serve`/`stop` calls on the
+same domain can't race each other.
+
+Not yet verified: an actual end-to-end run against a real Cloudflare
+account (real zone, real tunnel, a browser reaching the resulting
+hostname). The logic is covered by mocked unit tests
+(`tests/test_tunnel_byo.py`) proving the request-building/response-handling,
+shared-process lifecycle, and locking are correct, but real credentials
+are needed for a live check — and per this project's working agreement,
+real API tokens are never pasted into chat or handled by the assistant
+directly, so this verification has to happen with the user running the
+commands themselves and reporting back.
+
+**Affects:** `sidepage.core.tunnel_manager`, `sidepage.core.process`, `sidepage.core.account`, `sidepage.core.directory_client`, `sidepage.core.registry`
 
 ---
 
@@ -225,21 +296,57 @@ real browser, outside this sandbox) was not verified end-to-end.
 
 ---
 
-### 14. `sidepage inspect`: MCP tool browsing deferred, client library choice not made
+### 14. `sidepage inspect`: MCP tool browsing deferred, client library choice not made — a real MCP fixture now exists, just not wired into `inspect`
 
 The spec frames `inspect` as "Postman-for-MCP" — browsing MCP tools,
 schemas, invoking calls over the MCP JSON-RPC/streamable-HTTP transport.
-Deliberately scoped down for this pass to generic HTTP/static request
-inspection instead (real, see `docs/CHECKLIST.md` §10), on the reasoning
-that neither prioritized fixture (static site, Streamlit app) is an MCP
-server, so there was nothing real to build the MCP piece against.
+Still scoped down to generic HTTP/static request inspection (real, see
+`docs/CHECKLIST.md` §10) — this item is specifically about `inspect`'s
+tool-browsing UI, not about MCP serving support, which is now real (see
+`docs/CHECKLIST.md` §1/§2, `sidepage.core.target`'s MCP detection).
 
-When MCP support is added, the client implementation is still an open
-choice: the official `mcp` Python SDK (correct, spec-compliant, but a new
-`sidepage` runtime dependency) vs. a hand-rolled JSON-RPC client over the
-already-present `httpx` (no new dependency, more protocol-maintenance
-risk). Also still open: whether to add a real MCP server test fixture
-(`tests/fixtures/mcp-server/`, matching how static-site/streamlit-app were
-verified) before or alongside that build.
+The original reasoning no longer fully applies: `tests/fixtures/mcp-app`
+is now a real MCP server fixture, and `sidepage serve` genuinely wraps it.
+What's still missing is `inspect`'s own MCP-aware mode — browsing
+`tools/list` output, invoking `tools/call` interactively, the way it
+already does ad-hoc HTTP requests. The client implementation is still an
+open choice: the official `mcp` Python SDK (correct, spec-compliant, but a
+new `sidepage` *runtime* dependency — note this is different from `serve`,
+which never imports `mcp` itself, only launches it inside the wrapped
+process's own `uv run` environment) vs. a hand-rolled JSON-RPC client over
+the already-present `httpx`, the approach `tests/test_serve_mcp.py` uses
+for test purposes and which could plausibly move into `sidepage.core`
+instead of staying test-only.
 
 **Affects:** `sidepage.core.inspector`, `sidepage.commands.inspect`
+
+---
+
+### 15. Dependency resolution: only the *detected launcher's* package is guaranteed, not every undeclared import
+
+`sidepage.core.ecosystem.resolve_python_runner` used to prefer an existing
+`.venv` next to the target, on the assumption it was already correctly set
+up. In practice, a real app (`chat-with-openrouter`) had a `.venv` built
+from a `requirements.txt` that only listed `openai` — Streamlit had been
+installed by hand at some point and never captured — so trusting that venv
+produced `ModuleNotFoundError: No module named 'streamlit'` at launch, no
+attempt to recover. Fixed: every launch now goes through `uv run`, layering
+`--with <package>` for each package `sidepage.core.target.detect_code_launcher`
+detected (Streamlit → `streamlit`; FastAPI → `fastapi` and `uvicorn`, added
+when FastAPI support was built) on top of `--with-requirements
+requirements.txt`, so the dependencies Sidepage itself knows about are
+never silently missing.
+
+What's still open: this only covers the *detected launcher's* package(s).
+`detect_code_launcher` doesn't do full static-import analysis — it
+recognizes exactly two frameworks (Streamlit, FastAPI) via a source scan.
+If a target imports some *other* undeclared package (not Streamlit or
+FastAPI's own deps, not in `requirements.txt`/`pyproject.toml`, not
+something Sidepage's own detection knows to look for), it'll still fail
+the same way, just for a dependency Sidepage has no way to know it needs.
+Broader fixes would mean either scanning all imports in the target (real
+static analysis, meaningfully more work), detecting more frameworks one at
+a time as they come up (the pattern so far), or just accepting this as a
+documented limitation of a heuristic-based approach — not decided.
+
+**Affects:** `sidepage.core.ecosystem`, `sidepage.core.target`, `sidepage.core.process`

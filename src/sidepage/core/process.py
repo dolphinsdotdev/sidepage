@@ -8,13 +8,20 @@ the wrapped process, starts the local reverse proxy
 `config.anon` (`sidepage.core.tunnel_manager`), and blocks the terminal
 until interrupted.
 
-**What's real vs. not**, since this orchestrates every other module: static
-and Streamlit-flavored code targets, `open`/`token` auth, `--env` secret
-injection, and `--anon` tunneling all actually work. `--domain` (BYO),
-non-local `--scope`, `network`/`oauth` auth, and `--guardrail` are rejected
-up front with a clear `NotImplementedError` (not silently ignored) —
-`sidepage.commands.serve` catches that and reports it the same way as any
-other not-yet-built feature.
+**What's real vs. not**, since this orchestrates every other module: static,
+Streamlit-flavored, FastAPI-flavored, and MCP-flavored (Python) code
+targets, `open`/`token` auth, `--env` secret injection, `--anon`
+tunneling, and `--domain` BYO tunneling (see
+`sidepage.core.tunnel_manager.open_byo_tunnel`) all actually work.
+Non-local `--scope`, `network`/`oauth` auth, and
+`--guardrail` are rejected up front with a clear `NotImplementedError`
+(not silently ignored) — `sidepage.commands.serve` catches that and
+reports it the same way as any other not-yet-built feature. A handful of
+other early rejections (`--domain` with no matching `account domain set`
+configuration, `--anon`+`--domain` together, an already-registered app
+name) are real validation, not missing features, so they raise
+`ValueError` instead — `sidepage.commands.serve` reports those as plain
+errors rather than "not yet implemented."
 
 Deliberately foreground/single-process by contract: killing the process
 (Ctrl+C, or `sidepage stop` sending SIGTERM — both routed through the same
@@ -33,16 +40,20 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from sidepage.core import ecosystem, registry, secrets_vault, tunnel_manager
+from sidepage.core import account, ecosystem, registry, secrets_vault, tunnel_manager
 from sidepage.core.auth import AuthTier
 from sidepage.core.directory_client import Scope
 from sidepage.core.reverse_proxy import ProxyHandle, start_proxy, stop_proxy
 from sidepage.core.static import validate_static_root
 from sidepage.core.target import (
+    MCP_APP_METHOD,
     CodeLauncher,
     TargetKind,
     allocate_port,
+    detect_asgi_app_variable,
     detect_code_launcher,
+    detect_mcp_app_variable,
+    detect_mcp_package,
     detect_target_kind,
 )
 from sidepage.core.token_runtime import RuntimeToken, resolve_token, write_runtime_file
@@ -65,8 +76,12 @@ class ServeConfig:
 
 def _build_code_launch_argv(target: Path, launcher: CodeLauncher, port: int) -> list[str]:
     if launcher is CodeLauncher.STREAMLIT:
-        runner = ecosystem.resolve_python_runner(target.parent, extra_package="streamlit")
-        streamlit_args = [
+        # extra_packages=["streamlit"] guarantees the launcher's own
+        # detected requirement is present even if the target's own
+        # requirements.txt doesn't declare it — see sidepage.core.ecosystem
+        # for why that matters in practice.
+        runner = ecosystem.resolve_python_runner(target.parent, extra_packages=["streamlit"])
+        return runner + [
             "streamlit",
             "run",
             str(target),
@@ -77,23 +92,74 @@ def _build_code_launch_argv(target: Path, launcher: CodeLauncher, port: int) -> 
             "--server.address",
             "127.0.0.1",
         ]
-        if runner[0] == "uv":
-            return runner + streamlit_args
-        # runner is [venv_python] — invoke streamlit as a module instead of
-        # relying on a console-script entry point being on PATH.
-        return runner + ["-m", "streamlit"] + streamlit_args[1:]
+
+    if launcher is CodeLauncher.FASTAPI:
+        # Launched via `uvicorn <module>:<app>`, not by running the script
+        # directly — bypasses whatever the script's own `__main__` block
+        # does (real FastAPI apps often hardcode a port there), and is the
+        # standard way to run an ASGI app regardless of whether one exists
+        # at all. See sidepage.core.target for the module/app-name detail.
+        runner = ecosystem.resolve_python_runner(
+            target.parent, extra_packages=["fastapi", "uvicorn"]
+        )
+        app_var = detect_asgi_app_variable(target)
+        return runner + [
+            "uvicorn",
+            f"{target.stem}:{app_var}",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ]
+
+    if launcher is CodeLauncher.MCP:
+        # Launched via `uvicorn <module>:<var>.<app-method> --factory`,
+        # never by running the script directly — bypasses whatever the
+        # script's own `__main__` block does, same reasoning as FastAPI
+        # above. The payoff is bigger here: most MCP servers' `__main__`
+        # calls `<var>.run()`, which defaults to the *stdio* transport
+        # (no HTTP at all) unless the author explicitly wired up
+        # `transport="streamable-http"` — calling `.streamable_http_app()`
+        # / `.http_app()` directly sidesteps that choice entirely, so even
+        # a script only ever authored for stdio becomes a real,
+        # reverse-proxied HTTP MCP server. See sidepage.core.target for
+        # which of the two recognized packages maps to which app-builder
+        # method.
+        package = detect_mcp_package(target)
+        app_method = MCP_APP_METHOD[package]
+        app_var = detect_mcp_app_variable(target)
+        runner = ecosystem.resolve_python_runner(
+            target.parent, extra_packages=[package.value, "uvicorn"]
+        )
+        return runner + [
+            "uvicorn",
+            f"{target.stem}:{app_var}.{app_method}",
+            "--factory",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ]
 
     # GENERIC_PYTHON: assume the script itself reads $PORT.
     runner = ecosystem.resolve_python_runner(target.parent)
     return runner + [str(target)]
 
 
-def _validate_supported(config: ServeConfig) -> None:
-    if config.domain is not None:
-        raise NotImplementedError(
-            "--domain (BYO Cloudflare domain) isn't implemented — it needs real Zone:DNS:Edit "
-            "and per-tunnel credentials plus DNS automation. Use --anon for a public URL, or "
-            "omit --domain/--anon to serve locally only."
+def _validate_supported(config: ServeConfig) -> account.DomainConfig | None:
+    """Validate `config` and resolve `--domain` against the persisted BYO
+    configuration, all before `serve` does anything else — including
+    touching the target file, so a bad flag combination or an
+    unconfigured domain fails immediately regardless of whether the target
+    itself even exists.
+
+    Returns the resolved `DomainConfig` when `config.domain` is set (used
+    by `serve` to actually open the tunnel), or `None` otherwise.
+    """
+    if config.domain is not None and config.anon:
+        raise ValueError(
+            "--domain and --anon are mutually exclusive — --anon is Cloudflare's anonymous "
+            "Quick Tunnel with no custom domain; --domain routes through your own BYO domain."
         )
     if config.scope is not Scope.LOCAL:
         raise NotImplementedError(
@@ -109,11 +175,22 @@ def _validate_supported(config: ServeConfig) -> None:
             "--guardrail isn't implemented — parked, see sidepage.core.guardrail."
         )
 
+    if config.domain is None:
+        return None
+    domain_config = account.get_default_domain()
+    if domain_config is None or domain_config.domain != config.domain:
+        raise ValueError(
+            f"--domain {config.domain} isn't configured — run `sidepage account domain "
+            f"set {config.domain} --api-token-name <name>` first (the name must already "
+            "be in the vault, see `sidepage secrets set`)."
+        )
+    return domain_config
+
 
 def serve(config: ServeConfig) -> None:
     """Start the app and block until interrupted. See module docstring for
     what's real vs. not."""
-    _validate_supported(config)
+    domain_config = _validate_supported(config)
 
     # Resolve to an absolute path up front — the wrapped subprocess runs
     # with `cwd=target.parent`, so any relative path built downstream
@@ -124,7 +201,7 @@ def serve(config: ServeConfig) -> None:
     target_kind = detect_target_kind(target, override=config.target_kind)
     app_name = config.name or target.stem or target.name
     if registry.get(app_name) is not None:
-        raise NotImplementedError(
+        raise ValueError(
             f"an app named {app_name!r} is already registered as running — "
             f"`sidepage stop {app_name}` it first, or pass --name for a different one."
         )
@@ -141,18 +218,29 @@ def serve(config: ServeConfig) -> None:
     proc: subprocess.Popen | None = None
     proxy: ProxyHandle
     tunnel = None
+    launcher: CodeLauncher | None = None
 
     def _teardown() -> None:
         stop_proxy(proxy)
+        # Unregister *before* closing the tunnel, not after: for BYO-domain,
+        # tunnel_manager.close_tunnel decides whether to kill the domain's
+        # shared cloudflared process by counting this domain's still-running
+        # apps in the registry (sidepage.core.registry.list_running_for_domain).
+        # If this app were still counted while that check runs, the very
+        # last app's teardown would never see zero and the process would
+        # never die — see tunnel_manager.close_tunnel's docstring.
+        registry.unregister(app_name)
         if tunnel is not None:
-            tunnel_manager.close_tunnel(tunnel)
+            try:
+                tunnel_manager.close_tunnel(tunnel)
+            except Exception as exc:
+                error(f"tunnel teardown failed: {exc}")
         if proc is not None and proc.poll() is None:
             proc.terminate()
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        registry.unregister(app_name)
         stdout.print()
         info(f"{app_name} stopped")
 
@@ -197,6 +285,19 @@ def serve(config: ServeConfig) -> None:
         info("opening anonymous Cloudflare Quick Tunnel...")
         tunnel = tunnel_manager.open_anon_tunnel(listen_port)
         tunnel_url = tunnel.url
+    elif domain_config is not None:
+        info(f"opening BYO-domain tunnel on {domain_config.domain}...")
+        tunnel = tunnel_manager.open_byo_tunnel(
+            app_name,
+            domain_config.domain,
+            listen_port,
+            zone_id=domain_config.zone_id,
+            account_id=domain_config.account_id,
+            tunnel_id=domain_config.tunnel_id,
+            api_token_name=domain_config.api_token_name,
+            tunnel_token_name=domain_config.tunnel_token_name,
+        )
+        tunnel_url = tunnel.url
 
     registry.register(
         registry.RunningApp(
@@ -208,10 +309,15 @@ def serve(config: ServeConfig) -> None:
             url=local_url,
             tunnel_url=tunnel_url,
             started_at=time.time(),
+            domain=domain_config.domain if domain_config is not None else None,
         )
     )
 
     success(f"{app_name} serving at {local_url}")
+    if launcher is CodeLauncher.FASTAPI:
+        info(f"API docs: {local_url}/docs (FastAPI's own Swagger UI — served automatically)")
+    if launcher is CodeLauncher.MCP:
+        info(f"MCP endpoint: {local_url}/mcp (Streamable HTTP, bypassing the script's transport)")
     if tunnel_url:
         success(f"public URL: {tunnel_url}")
     if token is not None:

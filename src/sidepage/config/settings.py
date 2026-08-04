@@ -7,10 +7,12 @@ Credentials (secrets vault contents, BYO-domain token *names*) are stored
 this module is the only place that reads/writes them.
 
 Real for the pieces `sidepage serve` and `sidepage secrets` actually use:
-the vault's encrypted-file store and the per-process runtime/registry
-files. Account config (`login`, `account status`, `account domain set`)
-and the directory-listing cache are still just path constants — those
-commands don't have a real backend to talk to yet.
+the vault's encrypted-file store, the per-process runtime/registry files,
+the account config (BYO domain + vault secret names, backing real
+`sidepage serve --domain`), and the name-bindings file (stable
+`<app-name>-<id>` assignment). `login`/`account status` (identity/session)
+and the directory-listing cache are still just unimplemented — those need
+a cloud backend that doesn't exist.
 
 All paths respect `SIDEPAGE_HOME` if set, redirecting every root under one
 directory instead of the real XDG locations — this is what tests use to
@@ -73,9 +75,42 @@ def registry_file() -> Path:
     return state_dir() / "running_apps.json"
 
 
+# --- Account config (§13) — real, used by sidepage.core.account for BYO
+# domain: the domain itself plus vault secret *names* (never credential
+# values — those stay in the vault, see sidepage.core.secrets_vault) ---
+def account_config_file() -> Path:
+    return config_dir() / "account.json"
+
+
+# --- Shared BYO-domain tunnel process tracking — real, used by
+# sidepage.core.tunnel_manager. One `cloudflared` process is shared across
+# every app running under a given BYO domain (ingress routing is done
+# remotely via the Cloudflare API, not one process per app) — the lock
+# file serializes concurrent `serve` calls racing to start/stop that
+# process or mutate its ingress config; the pid file is how a later
+# `serve`/`stop` call finds (or confirms the death of) the process a prior
+# invocation started, since it isn't a child of the current process. ---
+def tunnels_dir() -> Path:
+    return state_dir() / "tunnels"
+
+
+def tunnel_lock_file(domain: str) -> Path:
+    return tunnels_dir() / f"{domain}.lock"
+
+
+def tunnel_pid_file(domain: str) -> Path:
+    return tunnels_dir() / f"{domain}.pid"
+
+
+# --- Name bindings (§3) — real, used by sidepage.core.directory_client.
+# Stable <app-name> -> <4-char-id> mapping so a given app name resolves to
+# the same `<app-name>-<id>.<domain>` hostname across `serve` restarts,
+# rather than a fresh id (and a fresh DNS record) every time. ---
+def name_bindings_file() -> Path:
+    return config_dir() / "name_bindings.json"
+
+
 # --- Not yet backed by anything real ---
-# TODO: config_dir() / "account.json" — identity/session (`account status`),
-#       BYO-domain default domain + vault secret *names* (not values).
 # TODO: cache_dir() / "bin" / "cloudflared" — resolved/downloaded binary
 #       path override; real cloudflared use so far just shells out to PATH.
 # TODO: cache_dir() / "directory.json" — last-known cloud directory listing
@@ -84,5 +119,5 @@ def registry_file() -> Path:
 
 def ensure_dirs() -> None:
     """Create all XDG roots (0700) if missing. Safe to call repeatedly."""
-    for d in (config_dir(), cache_dir(), state_dir(), runtime_dir()):
+    for d in (config_dir(), cache_dir(), state_dir(), runtime_dir(), tunnels_dir()):
         d.mkdir(parents=True, exist_ok=True, mode=0o700)

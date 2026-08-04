@@ -21,6 +21,11 @@ v4 adds `--env <SECRET_NAME>` (repeatable): named, per-app injection of
 vault secrets (`sidepage.core.secrets_vault`, v4 §9) into the wrapped
 process's environment. Nothing blanket — each name is looked up
 individually and injection fails loud if a name isn't in the vault.
+
+`--domain` is real: routes through a BYO Cloudflare tunnel
+(`sidepage.core.tunnel_manager.open_byo_tunnel`) once configured via
+`sidepage account domain set`. Mutually exclusive with `--anon` — one
+tunnel mode at a time.
 """
 
 from __future__ import annotations
@@ -74,8 +79,9 @@ def serve(
         str | None,
         typer.Option(
             "--domain",
-            help="Bring-your-own-domain (premium). Default is a brokered tunnel under "
-            "Sidepage's own domain; see `sidepage account domain set`.",
+            help="Bring-your-own-domain. Must match the domain already configured via "
+            "`sidepage account domain set`; served at <app-name>-<id>.<domain>. Default with "
+            "neither --domain nor --anon is local-only (no brokered tunnel — no backend exists).",
         ),
     ] = None,
     auth: Annotated[

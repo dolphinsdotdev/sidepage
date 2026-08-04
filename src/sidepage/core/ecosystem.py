@@ -10,15 +10,31 @@ its own CLI surface.
   over. Trade-off, accepted: excludes poetry/pip-only users unless they
   also maintain a `uv.lock`.
 
-  Real implementation here goes one step further than "assume uv": if the
-  target already sits next to a working `.venv` (the common case for an
-  existing project — e.g. one built with `pip install -r requirements.txt`,
-  not necessarily uv-managed), that venv's own interpreter is used
-  directly rather than layering `uv run --with` on top of it. Absent a
-  venv, a sibling `requirements.txt` is preferred over a single
-  `--with <package>` guess — real apps often need more than one dependency
-  (e.g. a Streamlit app that also imports pandas/numpy), and a single
-  `--with` can't express that.
+  **Always goes through `uv run`, never reuses an existing `.venv`
+  directly.** An earlier version of this module preferred
+  `project_dir/.venv/bin/python` when present, on the theory that an
+  existing venv is already correctly set up. In practice, real project
+  folders routinely have a `.venv` that's missing something — most often a
+  framework package (e.g. Streamlit) installed by hand at some point and
+  never captured in `requirements.txt`. Trusting that venv silently
+  produced `ModuleNotFoundError` at launch with no attempt to recover.
+  `uv run` fixes this by construction: it always layers the *detected*
+  launcher requirement(s) (`extra_packages`, e.g. `["streamlit"]` for a
+  Streamlit target or `["fastapi", "uvicorn"]` for a FastAPI one — see
+  `sidepage.core.target.detect_code_launcher`) on top of whatever
+  `requirements.txt` declares, on every launch, so the dependencies
+  Sidepage itself knows the target needs are never silently missing
+  regardless of whether the project's own manifest is complete. uv's
+  caching keeps repeat launches cheap after the first resolve.
+
+  This does mean packages installed by hand into a project's `.venv` but
+  *not* captured in `requirements.txt`/`pyproject.toml` and *not* the
+  detected launcher package won't be picked up — there's no way to know
+  about those without either trusting the venv blindly (the failure mode
+  this fixes) or statically analyzing every import in the target, which
+  isn't implemented. Detected launcher packages are covered; anything else
+  undeclared is a gap in the target's own manifest, not something Sidepage
+  can paper over.
 - **JavaScript** — detect-and-defer across `package-lock.json` /
   `yarn.lock` / `pnpm-lock.yaml`; no canonical manager assumed the way
   Python now assumes uv. Not implemented — no JS target has been
@@ -27,6 +43,7 @@ its own CLI surface.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from enum import StrEnum
 from pathlib import Path
 
@@ -37,25 +54,28 @@ class JsPackageManager(StrEnum):
     PNPM = "pnpm"
 
 
-def resolve_python_runner(project_dir: Path, *, extra_package: str | None = None) -> list[str]:
-    """Build the command prefix used to run Python for a `code`/`notebook`
-    target rooted at `project_dir`.
+def resolve_python_runner(project_dir: Path, *, extra_packages: Sequence[str] = ()) -> list[str]:
+    """Build the `uv run` command prefix used to run Python for a
+    `code`/`notebook` target rooted at `project_dir`.
 
-    Prefers, in order: `project_dir/.venv/bin/python` (an existing
-    project's own environment); `uv run --with-requirements
-    requirements.txt` (a sibling requirements file, likely more complete
-    than a single guessed package); `uv run --with <extra_package>` (a
-    bare script with no project files at all).
+    Layers, combined rather than either/or:
+      - `--with-requirements requirements.txt`, if `project_dir` has one.
+      - `--with <package>` for each of `extra_packages` — the launcher's
+        own detected requirement(s) (e.g. `["streamlit"]`, or
+        `["fastapi", "uvicorn"]`). Applied on top of, not instead of,
+        `requirements.txt` — see this module's docstring for why that
+        matters: it's what keeps a stale/incomplete manifest from silently
+        producing a missing-module crash at launch.
+
+    Always returns a `["uv", "run", ...]` prefix — no existing `.venv` is
+    ever reused directly, deliberately (see module docstring).
     """
-    venv_python = project_dir / ".venv" / "bin" / "python"
-    if venv_python.is_file():
-        return [str(venv_python)]
+    cmd = ["uv", "run"]
     requirements = project_dir / "requirements.txt"
     if requirements.is_file():
-        return ["uv", "run", "--with-requirements", str(requirements)]
-    cmd = ["uv", "run"]
-    if extra_package:
-        cmd += ["--with", extra_package]
+        cmd += ["--with-requirements", str(requirements)]
+    for package in extra_packages:
+        cmd += ["--with", package]
     return cmd
 
 

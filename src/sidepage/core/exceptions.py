@@ -43,6 +43,22 @@ class CloudflaredResolutionError(TunnelError):
     """
 
 
+class TunnelProvisioningError(TunnelError):
+    """`sidepage account domain set` created a tunnel on Cloudflare but a
+    later step (almost always persisting its run-token to the vault)
+    failed. Carries `tunnel_id` and `internal_secret_name` so the CLI can
+    tell the user exactly what's now orphaned — the run-token is returned
+    by Cloudflare exactly once at creation time, so if it wasn't saved
+    there's no way to fetch it again; the tunnel has to be deleted (or the
+    token re-derived by recreating it) by hand.
+    """
+
+    def __init__(self, message: str, *, tunnel_id: str, internal_secret_name: str) -> None:
+        super().__init__(message)
+        self.tunnel_id = tunnel_id
+        self.internal_secret_name = internal_secret_name
+
+
 class AuthConfigError(SidepageError):
     """An `--auth` tier (§4) was misconfigured, e.g. `oauth` requested
     before that tier ships (parked pending §15's MCP auth model).

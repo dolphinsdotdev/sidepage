@@ -6,12 +6,13 @@ app-type list (streamlit/api/mcp) with a wrapping model that doesn't care
 what's inside the process:
 
   - **code**     — any HTTP-serving process. Real support here covers
-                   Streamlit specifically (detected by scanning the source
-                   for a `streamlit` import) plus a generic Python fallback
-                   that assumes the app reads `$PORT` — building a launcher
-                   for every possible framework is out of scope; this
-                   covers the prioritized Streamlit case and degrades
-                   honestly for anything else.
+                   Streamlit, FastAPI, and Python MCP servers specifically
+                   (detected by scanning the source for a recognizable
+                   import) plus a generic Python fallback that assumes the
+                   app reads `$PORT` — building a launcher for every
+                   possible framework is out of scope; this covers the
+                   frameworks actually asked for and degrades honestly for
+                   anything else.
   - **static**    — a directory, `index.html` as entry. See
                     `sidepage.core.static`.
   - **notebook**  — a `.ipynb`. Not implemented this round (not one of the
@@ -29,12 +30,45 @@ No manual port handling by the caller. Sidepage allocates a real OS-assigned
 port (`bind(0)`) and injects it into the wrapped process:
   - Streamlit: `--server.port <port> --server.headless true --server.address
     127.0.0.1` launcher flags.
+  - FastAPI: launched via `uvicorn <module>:<app> --host 127.0.0.1 --port
+    <port>` instead of running the script directly — this bypasses
+    whatever the script's own `if __name__ == "__main__":` block does
+    (many real FastAPI apps hardcode a port there, e.g. `uvicorn.run(app,
+    port=8000)`, which would silently ignore Sidepage's allocated port if
+    the script were just executed as-is). `<module>` is the target's own
+    filename stem (`app.py` → `app`), consistent with how the process is
+    launched with `cwd` set to the target's directory; `<app>` is
+    extracted by scanning for `<name> = FastAPI(...)`, defaulting to the
+    near-universal convention `app` when no assignment is found. FastAPI
+    serves its own OpenAPI docs at `/docs`/`/redoc`/`/openapi.json`
+    automatically — no Sidepage-side work needed there beyond making sure
+    the proxy passes those paths through like any other (it already does).
+  - MCP (Python): `uvicorn <module>:<var>.<app-method> --factory --host
+    127.0.0.1 --port <port>`, same bypass-the-entrypoint trick as FastAPI
+    and for the same reason — most real MCP servers call `<var>.run()` in
+    their own `if __name__ == "__main__":` block, which defaults to the
+    stdio transport (no HTTP at all) unless the script author explicitly
+    wired up `transport="streamable-http"` themselves. Calling
+    `.streamable_http_app()` / `.http_app()` directly and serving *that*
+    via `uvicorn --factory` sidesteps the script's own transport choice
+    entirely, so **a script authored only for stdio still becomes a real,
+    reverse-proxied HTTP MCP server** — the same way a FastAPI script that
+    hardcodes `uvicorn.run(app, port=8000)` in `__main__` still lands on
+    Sidepage's allocated port, because that block is never executed
+    either. Two Python MCP packages are recognized (see
+    `detect_mcp_package`): the official SDK (`mcp`, class `FastMCP` or
+    `MCPServer` depending on version — both expose the same
+    `.streamable_http_app()` method) and the popular third-party `fastmcp`
+    package (class `FastMCP`, method `.http_app()`). Both default to
+    mounting at `/mcp`, verified against the actually-resolvable current
+    releases of each package rather than assumed from memory.
   - Generic Python: `$PORT` env var, on the assumption the app reads
     `os.environ.get("PORT", ...)`.
 """
 
 from __future__ import annotations
 
+import re
 import socket
 from enum import StrEnum
 from pathlib import Path
@@ -53,7 +87,24 @@ class CodeLauncher(StrEnum):
     port is injected."""
 
     STREAMLIT = "streamlit"
+    FASTAPI = "fastapi"
+    MCP = "mcp"
     GENERIC_PYTHON = "generic_python"  # assumes $PORT
+
+
+class McpPackage(StrEnum):
+    """Which Python MCP package a detected `CodeLauncher.MCP` target uses
+    — determines the `uv run --with` package name and which method builds
+    the ASGI app (see `detect_mcp_package`, `MCP_APP_METHOD`)."""
+
+    OFFICIAL = "mcp"  # modelcontextprotocol/python-sdk — FastMCP or MCPServer
+    FASTMCP = "fastmcp"  # third-party jlowin/fastmcp — FastMCP
+
+
+MCP_APP_METHOD: dict[McpPackage, str] = {
+    McpPackage.OFFICIAL: "streamable_http_app",
+    McpPackage.FASTMCP: "http_app",
+}
 
 
 def detect_target_kind(target: Path, *, override: TargetKind | None = None) -> TargetKind:
@@ -83,10 +134,28 @@ def detect_target_kind(target: Path, *, override: TargetKind | None = None) -> T
     return target_kind
 
 
+def _has_mcp_import(source: str) -> bool:
+    return (
+        "from fastmcp import" in source
+        or "import fastmcp" in source
+        or "from mcp.server" in source
+        or "import mcp.server" in source
+    )
+
+
 def detect_code_launcher(target: Path) -> CodeLauncher:
     """Scan `target`'s source for a recognizable framework import.
-    Streamlit apps get real port-flag injection; everything else falls
-    back to the generic `$PORT` convention.
+    Streamlit, FastAPI, and MCP apps get real launcher-specific port
+    injection; everything else falls back to the generic `$PORT`
+    convention.
+
+    Checked in this order — Streamlit, then FastAPI, then MCP — so a
+    script that mounts an MCP server *inside* a FastAPI app (a common real
+    pattern, e.g. `app.mount("/mcp", mcp_server.streamable_http_app())`)
+    is still correctly detected as FASTAPI: the top-level ASGI app to
+    actually launch is the FastAPI one, and `uvicorn <module>:app` already
+    serves everything mounted on it, MCP sub-route included. Only a
+    standalone MCP script with no FastAPI import falls through to MCP.
     """
     try:
         source = target.read_text(errors="ignore")
@@ -94,7 +163,65 @@ def detect_code_launcher(target: Path) -> CodeLauncher:
         return CodeLauncher.GENERIC_PYTHON
     if "import streamlit" in source or "from streamlit" in source:
         return CodeLauncher.STREAMLIT
+    if "from fastapi import" in source or "import fastapi" in source:
+        return CodeLauncher.FASTAPI
+    if _has_mcp_import(source):
+        return CodeLauncher.MCP
     return CodeLauncher.GENERIC_PYTHON
+
+
+_FASTAPI_APP_ASSIGNMENT_RE = re.compile(r"^(\w+)\s*=\s*FastAPI\s*\(", re.MULTILINE)
+_MCP_APP_ASSIGNMENT_RE = re.compile(r"^(\w+)\s*=\s*(?:FastMCP|MCPServer)\s*\(", re.MULTILINE)
+
+
+def detect_asgi_app_variable(target: Path) -> str:
+    """Best-effort scan for `<name> = FastAPI(...)` to build the
+    `<module>:<name>` import string `uvicorn` needs. Defaults to `app` —
+    the near-universal convention in FastAPI's own docs and most real
+    apps — when no assignment is found."""
+    try:
+        source = target.read_text(errors="ignore")
+    except OSError:
+        return "app"
+    match = _FASTAPI_APP_ASSIGNMENT_RE.search(source)
+    return match.group(1) if match else "app"
+
+
+def detect_mcp_package(target: Path) -> McpPackage:
+    """Which of the two recognized Python MCP packages `target` uses —
+    determines both the `uv run --with` package name and which method
+    builds the ASGI app (`MCP_APP_METHOD`). Only called after
+    `detect_code_launcher` has already returned `CodeLauncher.MCP`, so a
+    bare `import` scan (not requiring a specific class name) is enough:
+    `fastmcp` is the third-party package (`from fastmcp import ...` /
+    `import fastmcp`); anything importing from `mcp.server` is treated as
+    the official SDK, whether the script uses the older `FastMCP` class or
+    the current `MCPServer` — both expose `.streamable_http_app()`,
+    verified against the actually-resolvable 1.x and 2.x releases rather
+    than assumed. Defaults to the official SDK if the source can't be
+    read at all (matches `detect_code_launcher`'s own fallback shape).
+    """
+    try:
+        source = target.read_text(errors="ignore")
+    except OSError:
+        return McpPackage.OFFICIAL
+    if "from fastmcp import" in source or "import fastmcp" in source:
+        return McpPackage.FASTMCP
+    return McpPackage.OFFICIAL
+
+
+def detect_mcp_app_variable(target: Path) -> str:
+    """Best-effort scan for `<name> = FastMCP(...)` / `<name> =
+    MCPServer(...)` to build the `<module>:<name>.<app-method>` import
+    string `uvicorn --factory` needs. Defaults to `mcp` — the convention
+    used throughout both the official SDK's docs/examples and the
+    third-party `fastmcp` package's — when no assignment is found."""
+    try:
+        source = target.read_text(errors="ignore")
+    except OSError:
+        return "mcp"
+    match = _MCP_APP_ASSIGNMENT_RE.search(source)
+    return match.group(1) if match else "mcp"
 
 
 def allocate_port() -> int:

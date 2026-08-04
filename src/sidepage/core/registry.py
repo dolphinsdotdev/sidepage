@@ -31,6 +31,13 @@ class RunningApp:
     url: str
     tunnel_url: str | None
     started_at: float
+    # BYO-domain zone apex this app is routed through (e.g. "example.com"),
+    # not the full per-app hostname — None for brokered/anonymous/no-tunnel
+    # apps. This is what `sidepage.core.tunnel_manager` reference-counts
+    # against to know whether it's safe to kill the shared `cloudflared`
+    # process for a domain: the process should live exactly as long as at
+    # least one running app is using it, never longer.
+    domain: str | None = None
 
 
 def _load() -> dict[str, dict]:
@@ -90,3 +97,11 @@ def list_running(*, prune_dead: bool = True) -> list[RunningApp]:
     if changed:
         _save(data)
     return apps
+
+
+def list_running_for_domain(domain: str) -> list[RunningApp]:
+    """Running apps currently routed through BYO `domain` (the zone apex,
+    matching `RunningApp.domain`) — the source of truth
+    `sidepage.core.tunnel_manager` reference-counts against to decide
+    whether the domain's shared `cloudflared` process is still in use."""
+    return [app for app in list_running() if app.domain == domain]

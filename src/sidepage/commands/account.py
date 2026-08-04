@@ -7,14 +7,21 @@ concerns, and sharing a name would collide confusingly.
 
 `account status` absorbs v1's `sidepage whoami` — see
 `sidepage.core.account` for why that command was folded in rather than kept
-standalone.
+standalone. Still unimplemented: there's no Sidepage account backend to
+authenticate against.
 
-v4 gives `domain set` two new required flags, `--zone-token-name` /
-`--tunnel-token-name` — vault secret names (v4 §9,
-`sidepage.core.secrets_vault`), not raw credential values. v3 left BYO-
-domain credential storage as "stored locally, no mechanism specified"; v4
-answers it by requiring both Cloudflare credentials to already be in the
-vault (via `sidepage secrets set`) before `domain set` can reference them.
+`domain set` is real. v4 delta: a **single** required flag,
+`--api-token-name` — a vault secret name (v4 §9,
+`sidepage.core.secrets_vault`), not a raw credential value. The earlier
+two-token design (`--zone-token-name` / `--tunnel-token-name`, requiring a
+tunnel already created out-of-band) is gone — this command now creates the
+tunnel itself via `sidepage.core.account.configure_domain`, and stores its
+run-token in the vault automatically. That storage always happens, but is
+never silent: success logs the internal vault name it landed under, and
+failure names it too (see `configure_domain`'s
+`TunnelProvisioningError` — the run-token is a one-time Cloudflare API
+response, so a failure to persist it leaves an orphaned tunnel behind that
+the user needs to know the ID of).
 """
 
 from __future__ import annotations
@@ -23,7 +30,9 @@ from typing import Annotated
 
 import typer
 
-from sidepage.output import not_implemented
+from sidepage.core import account as account_core
+from sidepage.core.exceptions import SecretNotFoundError, TunnelProvisioningError
+from sidepage.output import error, info, not_implemented, success
 
 account_app = typer.Typer(
     name="account",
@@ -54,28 +63,36 @@ def status() -> None:
 
 @domain_app.command("set")
 def domain_set(
-    domain: Annotated[str, typer.Argument(help="Domain to use as the persistent default.")],
-    zone_token_name: Annotated[
+    domain: Annotated[str, typer.Argument(help="Zone apex to use as the persistent default.")],
+    api_token_name: Annotated[
         str,
         typer.Option(
-            "--zone-token-name",
-            help="Vault secret name (see `sidepage secrets set`) holding the scoped "
-            "Zone:DNS:Edit Cloudflare token.",
-        ),
-    ],
-    tunnel_token_name: Annotated[
-        str,
-        typer.Option(
-            "--tunnel-token-name",
-            help="Vault secret name (see `sidepage secrets set`) holding the per-tunnel "
-            "Cloudflare token.",
+            "--api-token-name",
+            help="Vault secret name (see `sidepage secrets set`) holding a Cloudflare API "
+            "token scoped to Account -> Cloudflare Tunnel:Edit, Zone -> DNS:Edit, "
+            "Zone -> Zone:Read.",
         ),
     ],
 ) -> None:
-    """Set the persistent default BYO domain (premium), used by `serve`
-    when `--domain` isn't passed explicitly. Both Cloudflare credentials
-    must already be stored via `sidepage secrets set` — this command
-    references them by name, not by value."""
-    not_implemented(
-        "sidepage account domain set", implemented_by="sidepage.core.account.set_default_domain"
+    """Provision (or reuse) the persistent default BYO domain (premium):
+    creates one Cloudflare Tunnel meant to serve every app later run under
+    `domain` via `serve --domain`, and stores that tunnel's run-token in
+    the vault automatically — never typed by the user, but always
+    reported below by its vault name. `domain` should be the zone apex
+    (e.g. `example.com`), not a pre-built subdomain — served apps get
+    `<app-name>-<id>.<domain>`. Re-running for an already-configured
+    domain is a no-op, not a re-provision."""
+    try:
+        config = account_core.configure_domain(domain, api_token_name=api_token_name)
+    except SecretNotFoundError as exc:
+        error(str(exc))
+        raise typer.Exit(1) from exc
+    except TunnelProvisioningError as exc:
+        error(str(exc))
+        raise typer.Exit(1) from exc
+
+    success(f"default BYO domain set: {domain} (tunnel {config.tunnel_id})")
+    info(
+        f"tunnel run-token stored in vault as {config.tunnel_token_name!r} "
+        "(see `sidepage secrets list`)"
     )
