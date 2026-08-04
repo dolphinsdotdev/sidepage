@@ -5,6 +5,18 @@ left open and v3 has since resolved. Each item is also referenced from the
 docstring of the `core`/`commands` module it affects — this file exists so
 they're visible in one place without going back to the spec docs.
 
+A v4 delta (secrets vault, `serve --env`, BYO-domain credentials routed
+through the vault, a §8 clarifying note) was applied from a 4-point summary
+the user gave directly in chat, not a full v4 spec document. Items 9 and 10
+below are specific to that: gaps the summary didn't cover, flagged rather
+than guessed at.
+
+A later pass turned `serve` and `secrets` from documented placeholders
+into real, working code (see `docs/CHECKLIST.md` for the full breakdown).
+Items 11–13 are engineering decisions and a verification limit that came
+out of that pass — not spec ambiguities, but calls made without stopping
+to ask, flagged here on the same principle.
+
 ---
 
 ## Resolved in v3
@@ -127,3 +139,79 @@ domain set` covers credential replacement. Not confirmed by the spec text —
 flagged as an assumption made during migration, not a resolved question.
 
 **Affects:** `sidepage.core.tunnel_manager`, `sidepage.commands.account`
+
+---
+
+### 9. Did v4 renumber §9, or does the vault sit alongside the reverse proxy at the same number?
+
+v3 §9 is "local reverse proxy." The user's own v4 delta summary labels the
+secrets vault "v4 §9" too. Since the summary was explicitly "the complete
+delta" (nothing else changed), it's unclear whether v4 actually inserted a
+new §9 and pushed the reverse proxy (and everything after it — inspection,
+static, notebook, account, ecosystem, parked, out-of-scope) up by one, or
+whether the summary's "§9" was shorthand not meant to be read literally
+against v3's numbering. Docstrings in this codebase cite the reverse proxy
+as "§9 (v3)" and the vault as "v4 §9" side by side rather than picking one.
+
+**Affects:** `sidepage.core.secrets_vault`, `sidepage.core.reverse_proxy`
+
+---
+
+### 10. Vault namespace: flat, or scoped somehow?
+
+`sidepage secrets set/list/remove` and `serve --env <SECRET_NAME>` were
+described with no app-scoping — implemented here as one flat namespace per
+identity (any `serve` call can reference any stored secret by name). Not
+confirmed: whether secrets should instead be scoped per-app, per-project,
+or otherwise namespaced. A flat namespace was the simpler reading of the
+delta as given, not a stated design decision.
+
+**Affects:** `sidepage.core.secrets_vault`, `sidepage.commands.secrets`
+
+---
+
+### 11. Secrets vault: encrypted-file only, OS keychain deferred
+
+The spec's design is OS keychain as the *primary* backend with an
+encrypted-file *fallback*. This build implements the encrypted-file
+backend only, and it's the only backend in practice — not a fallback that
+sits behind something more commonly used. Reasoning: the `keyring` package
+triggers an interactive macOS Keychain-access permission prompt on first
+use, which isn't safe to depend on in an automated CLI tool or test suite.
+The public API (`set_secret`/`get_secret`/`list_secrets`/`remove_secret`)
+doesn't change shape if keychain support is added later, so this isn't a
+design commitment against it — just a scope decision for this pass.
+
+**Affects:** `sidepage.core.secrets_vault`
+
+---
+
+### 12. Brokered/BYO-domain tunneling: not implemented because no backend exists
+
+Distinguishing this from the rest of the "not implemented" surface: v3's
+default tunnel mode (brokered, under Sidepage's own domain) requires a
+Sidepage cloud backend to issue scoped tunnel tokens, and BYO-domain
+requires real DNS automation against a user's Cloudflare zone. Neither can
+be built by writing more `sidepage` code — they need a backend service
+that doesn't exist yet, which is a different kind of gap than "not
+implemented yet" (e.g. `sidepage inspect`, which could be built today).
+`serve` without `--anon`/`--domain` falls back to serving on `127.0.0.1`
+only rather than either failing or silently pretending brokered mode ran.
+
+**Affects:** `sidepage.core.tunnel_manager`, `sidepage.core.process`
+
+---
+
+### 13. `--anon` tunnel: verified up to the sandbox's network boundary, not fully
+
+`sidepage.core.tunnel_manager.open_anon_tunnel` was tested directly: it
+spawns a real `cloudflared tunnel --url` subprocess, which successfully
+connected to Cloudflare's edge and returned a genuine assigned
+`*.trycloudflare.com` URL. A follow-up HTTP request to that URL from
+within the sandboxed dev environment this was built in failed with a DNS
+resolution error, consistent with that environment's network policy
+blocking arbitrary outbound domains rather than a bug in the tunnel code.
+Whether the URL is actually reachable from the open internet (i.e. from a
+real browser, outside this sandbox) was not verified end-to-end.
+
+**Affects:** `sidepage.core.tunnel_manager`

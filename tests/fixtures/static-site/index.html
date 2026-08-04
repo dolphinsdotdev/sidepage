@@ -1,0 +1,794 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PrintStudio — Professional 3D Printing & Design</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --navy: #0a1628;
+            --cyan: #00d9ff;
+            --white: #f8f9fa;
+            --text-light: #e8eaed;
+            --accent-orange: #ff6b35;
+            --accent-orange-hover: #ff5520;
+            --gray-600: #6b7280;
+            --grid-size: 8px;
+        }
+
+        html {
+            scroll-behavior: smooth;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif;
+            background: var(--navy);
+            color: var(--text-light);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+
+        /* Navigation */
+        nav {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            background: rgba(10, 22, 40, 0.95);
+            backdrop-filter: blur(8px);
+            border-bottom: 1px solid rgba(0, 217, 255, 0.1);
+            padding: 0 calc(var(--grid-size) * 6);
+            height: 80px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            z-index: 1000;
+        }
+
+        .logo {
+            font-size: 20px;
+            font-weight: 700;
+            letter-spacing: -0.5px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .logo-accent {
+            color: var(--cyan);
+        }
+
+        .nav-links {
+            display: flex;
+            gap: calc(var(--grid-size) * 4);
+            list-style: none;
+            align-items: center;
+        }
+
+        .nav-links a {
+            color: var(--text-light);
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 500;
+            transition: color 0.3s ease;
+            position: relative;
+        }
+
+        .nav-links a:hover {
+            color: var(--cyan);
+        }
+
+        .nav-links a::after {
+            content: '';
+            position: absolute;
+            bottom: -4px;
+            left: 0;
+            width: 0;
+            height: 2px;
+            background: var(--cyan);
+            transition: width 0.3s ease;
+        }
+
+        .nav-links a:hover::after {
+            width: 100%;
+        }
+
+        .cta-btn {
+            background: var(--accent-orange);
+            color: var(--navy) !important;
+            padding: calc(var(--grid-size) * 2) calc(var(--grid-size) * 3);
+            border-radius: 4px;
+            font-weight: 600;
+            font-size: 13px;
+            border: none;
+            cursor: pointer;
+            transition: background 0.3s ease;
+        }
+
+        .cta-btn:hover {
+            background: var(--accent-orange-hover);
+        }
+
+        .cta-btn::after {
+            display: none;
+        }
+
+        /* Hero Section */
+        .hero {
+            margin-top: 80px;
+            padding: calc(var(--grid-size) * 12) calc(var(--grid-size) * 6);
+            min-height: calc(100vh - 80px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: relative;
+            background: linear-gradient(135deg, #0a1628 0%, #0f2a47 100%);
+            overflow: hidden;
+        }
+
+        .hero::before {
+            content: '';
+            position: absolute;
+            width: 600px;
+            height: 600px;
+            background: radial-gradient(circle, rgba(0, 217, 255, 0.1) 0%, transparent 70%);
+            top: -200px;
+            right: -150px;
+            border-radius: 50%;
+            animation: float 8s ease-in-out infinite;
+        }
+
+        @keyframes float {
+            0%, 100% { transform: translateY(0px) translateX(0px); }
+            50% { transform: translateY(-30px) translateX(20px); }
+        }
+
+        .hero-content {
+            max-width: 700px;
+            position: relative;
+            z-index: 1;
+            text-align: left;
+            animation: fadeInUp 1s ease-out;
+        }
+
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .hero h1 {
+            font-size: clamp(36px, 8vw, 72px);
+            font-weight: 700;
+            line-height: 1.15;
+            margin-bottom: calc(var(--grid-size) * 3);
+            letter-spacing: -1px;
+        }
+
+        .hero h1 span {
+            color: var(--cyan);
+            position: relative;
+        }
+
+        .hero h1 span::before {
+            content: '';
+            position: absolute;
+            bottom: -8px;
+            left: 0;
+            right: 0;
+            height: 4px;
+            background: var(--accent-orange);
+            opacity: 0;
+            animation: underlineReveal 0.8s ease-out 0.5s forwards;
+        }
+
+        @keyframes underlineReveal {
+            to {
+                opacity: 1;
+            }
+        }
+
+        .hero p {
+            font-size: 18px;
+            color: var(--gray-600);
+            margin-bottom: calc(var(--grid-size) * 6);
+            max-width: 500px;
+            line-height: 1.7;
+        }
+
+        .hero-cta {
+            display: flex;
+            gap: calc(var(--grid-size) * 3);
+            align-items: center;
+        }
+
+        .primary-cta {
+            background: var(--accent-orange);
+            color: var(--navy);
+            padding: calc(var(--grid-size) * 3) calc(var(--grid-size) * 5);
+            border-radius: 4px;
+            font-weight: 600;
+            font-size: 16px;
+            border: none;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-decoration: none;
+            display: inline-block;
+        }
+
+        .primary-cta:hover {
+            background: var(--accent-orange-hover);
+            transform: translateY(-2px);
+            box-shadow: 0 12px 30px rgba(255, 107, 53, 0.3);
+        }
+
+        .secondary-cta {
+            color: var(--cyan);
+            text-decoration: none;
+            font-weight: 500;
+            font-size: 16px;
+            border: 2px solid rgba(0, 217, 255, 0.3);
+            padding: calc(var(--grid-size) * 3 - 2px) calc(var(--grid-size) * 5 - 2px);
+            border-radius: 4px;
+            transition: all 0.3s ease;
+            display: inline-block;
+        }
+
+        .secondary-cta:hover {
+            border-color: var(--cyan);
+            background: rgba(0, 217, 255, 0.05);
+        }
+
+        /* Services Section */
+        .services {
+            padding: calc(var(--grid-size) * 12) calc(var(--grid-size) * 6);
+            background: var(--navy);
+        }
+
+        .section-title {
+            font-size: clamp(28px, 6vw, 48px);
+            font-weight: 700;
+            margin-bottom: calc(var(--grid-size) * 3);
+            display: flex;
+            align-items: center;
+            gap: calc(var(--grid-size) * 2);
+        }
+
+        .section-title::before {
+            content: '';
+            width: 40px;
+            height: 3px;
+            background: var(--cyan);
+            border-radius: 2px;
+        }
+
+        .section-subtitle {
+            color: var(--gray-600);
+            font-size: 16px;
+            margin-bottom: calc(var(--grid-size) * 8);
+            max-width: 500px;
+        }
+
+        .services-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: calc(var(--grid-size) * 6);
+            margin-top: calc(var(--grid-size) * 6);
+        }
+
+        .service-card {
+            background: linear-gradient(135deg, rgba(15, 42, 71, 0.5) 0%, rgba(15, 42, 71, 0.2) 100%);
+            border: 1px solid rgba(0, 217, 255, 0.2);
+            padding: calc(var(--grid-size) * 6);
+            border-radius: 8px;
+            transition: all 0.4s ease;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .service-card::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, var(--cyan), var(--accent-orange));
+            opacity: 0;
+            transition: opacity 0.4s ease;
+        }
+
+        .service-card:hover {
+            background: linear-gradient(135deg, rgba(0, 217, 255, 0.1) 0%, rgba(15, 42, 71, 0.3) 100%);
+            border-color: rgba(0, 217, 255, 0.5);
+            transform: translateY(-8px);
+        }
+
+        .service-card:hover::before {
+            opacity: 1;
+        }
+
+        .service-icon {
+            font-size: 40px;
+            margin-bottom: calc(var(--grid-size) * 3);
+            display: inline-block;
+        }
+
+        .service-card h3 {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: calc(var(--grid-size) * 2);
+            color: var(--white);
+        }
+
+        .service-card p {
+            color: var(--gray-600);
+            font-size: 15px;
+            line-height: 1.7;
+        }
+
+        /* Portfolio Section */
+        .portfolio {
+            padding: calc(var(--grid-size) * 12) calc(var(--grid-size) * 6);
+            background: linear-gradient(180deg, #0a1628 0%, #0f2a47 100%);
+        }
+
+        .portfolio-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: calc(var(--grid-size) * 5);
+            margin-top: calc(var(--grid-size) * 6);
+        }
+
+        .portfolio-item {
+            background: rgba(15, 42, 71, 0.4);
+            border: 1px solid rgba(0, 217, 255, 0.15);
+            border-radius: 8px;
+            overflow: hidden;
+            transition: all 0.4s ease;
+            cursor: pointer;
+        }
+
+        .portfolio-item:hover {
+            border-color: var(--cyan);
+            box-shadow: 0 20px 40px rgba(0, 217, 255, 0.15);
+            transform: translateY(-4px);
+        }
+
+        .portfolio-image {
+            width: 100%;
+            height: 200px;
+            background: linear-gradient(135deg, #1a3a52 0%, #0f2a47 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 60px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .portfolio-image::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: conic-gradient(from 0deg, var(--cyan), transparent 25%, transparent 75%, var(--cyan));
+            animation: spin 3s linear infinite;
+            opacity: 0;
+            transition: opacity 0.4s ease;
+        }
+
+        .portfolio-item:hover .portfolio-image::before {
+            opacity: 0.15;
+        }
+
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+
+        .portfolio-item:hover .portfolio-image {
+            background: linear-gradient(135deg, #2a5a72 0%, #1a3a52 100%);
+        }
+
+        .portfolio-info {
+            padding: calc(var(--grid-size) * 4);
+        }
+
+        .portfolio-info h3 {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: calc(var(--grid-size) * 1);
+            color: var(--white);
+        }
+
+        .portfolio-info p {
+            color: var(--gray-600);
+            font-size: 14px;
+        }
+
+        /* Stats Section */
+        .stats {
+            padding: calc(var(--grid-size) * 10) calc(var(--grid-size) * 6);
+            background: var(--navy);
+            border-top: 1px solid rgba(0, 217, 255, 0.1);
+            border-bottom: 1px solid rgba(0, 217, 255, 0.1);
+        }
+
+        .stats-container {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: calc(var(--grid-size) * 6);
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .stat {
+            text-align: center;
+        }
+
+        .stat-number {
+            font-size: clamp(32px, 6vw, 56px);
+            font-weight: 700;
+            color: var(--cyan);
+            margin-bottom: calc(var(--grid-size) * 1);
+        }
+
+        .stat-label {
+            color: var(--gray-600);
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            font-weight: 500;
+        }
+
+        /* CTA Section */
+        .cta-section {
+            padding: calc(var(--grid-size) * 12) calc(var(--grid-size) * 6);
+            background: linear-gradient(135deg, rgba(255, 107, 53, 0.1) 0%, rgba(0, 217, 255, 0.05) 100%);
+            text-align: center;
+            border-top: 1px solid rgba(0, 217, 255, 0.1);
+        }
+
+        .cta-section h2 {
+            font-size: clamp(32px, 6vw, 48px);
+            font-weight: 700;
+            margin-bottom: calc(var(--grid-size) * 2);
+        }
+
+        .cta-section p {
+            font-size: 18px;
+            color: var(--gray-600);
+            margin-bottom: calc(var(--grid-size) * 5);
+            max-width: 500px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+
+        .cta-buttons {
+            display: flex;
+            gap: calc(var(--grid-size) * 3);
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        /* Footer */
+        footer {
+            background: rgba(10, 22, 40, 0.95);
+            border-top: 1px solid rgba(0, 217, 255, 0.1);
+            padding: calc(var(--grid-size) * 8) calc(var(--grid-size) * 6);
+        }
+
+        .footer-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: calc(var(--grid-size) * 6);
+            margin-bottom: calc(var(--grid-size) * 6);
+        }
+
+        .footer-section h4 {
+            font-size: 14px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: calc(var(--grid-size) * 3);
+            color: var(--cyan);
+        }
+
+        .footer-section ul {
+            list-style: none;
+        }
+
+        .footer-section li {
+            margin-bottom: calc(var(--grid-size) * 2);
+        }
+
+        .footer-section a {
+            color: var(--gray-600);
+            text-decoration: none;
+            font-size: 14px;
+            transition: color 0.3s ease;
+        }
+
+        .footer-section a:hover {
+            color: var(--cyan);
+        }
+
+        .footer-bottom {
+            border-top: 1px solid rgba(0, 217, 255, 0.1);
+            padding-top: calc(var(--grid-size) * 6);
+            text-align: center;
+            color: var(--gray-600);
+            font-size: 14px;
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            nav {
+                padding: 0 calc(var(--grid-size) * 4);
+            }
+
+            .nav-links {
+                display: none;
+            }
+
+            .hero,
+            .services,
+            .portfolio,
+            .stats,
+            .cta-section,
+            footer {
+                padding-left: calc(var(--grid-size) * 4);
+                padding-right: calc(var(--grid-size) * 4);
+            }
+
+            .services-grid,
+            .portfolio-grid {
+                grid-template-columns: 1fr;
+            }
+
+            .hero-cta {
+                flex-direction: column;
+                width: 100%;
+            }
+
+            .primary-cta,
+            .secondary-cta {
+                width: 100%;
+                text-align: center;
+            }
+
+            .cta-buttons {
+                flex-direction: column;
+            }
+
+            .cta-buttons button,
+            .cta-buttons a {
+                width: 100%;
+            }
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            * {
+                animation-duration: 0.01ms !important;
+                animation-iteration-count: 1 !important;
+                transition-duration: 0.01ms !important;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav>
+        <div class="logo">
+            Print<span class="logo-accent">Studio</span>
+        </div>
+        <ul class="nav-links">
+            <li><a href="#services">Services</a></li>
+            <li><a href="#portfolio">Portfolio</a></li>
+            <li><a href="#contact">Contact</a></li>
+            <li><button class="cta-btn">Get Started</button></li>
+        </ul>
+    </nav>
+
+    <!-- Hero Section -->
+    <section class="hero">
+        <div class="hero-content">
+            <h1>Transform Ideas Into <span>Physical Reality</span></h1>
+            <p>Professional 3D printing services for designers, engineers, and innovators. From rapid prototyping to production-grade parts, we bring your vision to life with precision and care.</p>
+            <div class="hero-cta">
+                <a href="#contact" class="primary-cta">Start Your Project</a>
+                <a href="#services" class="secondary-cta">Explore Services</a>
+            </div>
+        </div>
+    </section>
+
+    <!-- Services Section -->
+    <section class="services" id="services">
+        <h2 class="section-title">What We Offer</h2>
+        <p class="section-subtitle">Comprehensive 3D printing solutions tailored to your needs</p>
+        
+        <div class="services-grid">
+            <div class="service-card">
+                <div class="service-icon">🏗️</div>
+                <h3>Rapid Prototyping</h3>
+                <p>Fast-track your design iterations. Go from concept to physical prototype in days, not weeks. Validate designs early and refine with confidence.</p>
+            </div>
+
+            <div class="service-card">
+                <div class="service-icon">🎯</div>
+                <h3>Precision Engineering</h3>
+                <p>High-tolerance parts for industrial applications. Multi-material options and post-processing services ensure production-grade quality.</p>
+            </div>
+
+            <div class="service-card">
+                <div class="service-icon">🎨</div>
+                <h3>Custom Design Services</h3>
+                <p>Our design team optimizes your models for 3D printing. We handle CAD work, file preparation, and material selection guidance.</p>
+            </div>
+
+            <div class="service-card">
+                <div class="service-icon">♻️</div>
+                <h3>Materials & Finishes</h3>
+                <p>Resin, nylon, metal-filled, flexible polymers—and more. Choose the perfect material for your project. Professional finishing available.</p>
+            </div>
+
+            <div class="service-card">
+                <div class="service-icon">🚀</div>
+                <h3>Volume Production</h3>
+                <p>Scale from prototype to thousands of units. Optimized workflows and competitive pricing for mid to high-volume runs.</p>
+            </div>
+
+            <div class="service-card">
+                <div class="service-icon">📋</div>
+                <h3>Technical Consultation</h3>
+                <p>Expert guidance on material selection, design optimization, and manufacturability. Our engineers work with you every step of the way.</p>
+            </div>
+        </div>
+    </section>
+
+    <!-- Portfolio Section -->
+    <section class="portfolio" id="portfolio">
+        <h2 class="section-title">Recent Projects</h2>
+        <p class="section-subtitle">See what we've brought to life</p>
+
+        <div class="portfolio-grid">
+            <div class="portfolio-item">
+                <div class="portfolio-image">🤖</div>
+                <div class="portfolio-info">
+                    <h3>Robotic Components</h3>
+                    <p>Mechanical parts for robotics startup</p>
+                </div>
+            </div>
+
+            <div class="portfolio-item">
+                <div class="portfolio-image">⌚</div>
+                <div class="portfolio-info">
+                    <h3>Product Prototypes</h3>
+                    <p>Consumer electronics housings</p>
+                </div>
+            </div>
+
+            <div class="portfolio-item">
+                <div class="portfolio-image">🏥</div>
+                <div class="portfolio-info">
+                    <h3>Medical Devices</h3>
+                    <p>Custom surgical tool handles</p>
+                </div>
+            </div>
+
+            <div class="portfolio-item">
+                <div class="portfolio-image">🎮</div>
+                <div class="portfolio-info">
+                    <h3>Gaming Models</h3>
+                    <p>Collectible figurines & terrain</p>
+                </div>
+            </div>
+
+            <div class="portfolio-item">
+                <div class="portfolio-image">🏗️</div>
+                <div class="portfolio-info">
+                    <h3>Architecture Models</h3>
+                    <p>Scale buildings & site planning</p>
+                </div>
+            </div>
+
+            <div class="portfolio-item">
+                <div class="portfolio-image">⚙️</div>
+                <div class="portfolio-info">
+                    <h3>Custom Fixtures</h3>
+                    <p>Manufacturing tooling & jigs</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Stats Section -->
+    <section class="stats">
+        <div class="stats-container">
+            <div class="stat">
+                <div class="stat-number">500+</div>
+                <div class="stat-label">Projects Completed</div>
+            </div>
+            <div class="stat">
+                <div class="stat-number">48hr</div>
+                <div class="stat-label">Average Turnaround</div>
+            </div>
+            <div class="stat">
+                <div class="stat-number">12</div>
+                <div class="stat-label">Material Options</div>
+            </div>
+            <div class="stat">
+                <div class="stat-number">99%</div>
+                <div class="stat-label">Customer Satisfaction</div>
+            </div>
+        </div>
+    </section>
+
+    <!-- CTA Section -->
+    <section class="cta-section" id="contact">
+        <h2>Ready to Bring Your Ideas to Life?</h2>
+        <p>Get started with PrintStudio today. Upload your design or request a consultation with our team of printing specialists.</p>
+        <div class="cta-buttons">
+            <button class="primary-cta">Upload Design</button>
+            <button class="secondary-cta">Schedule Call</button>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer>
+        <div class="footer-content">
+            <div class="footer-section">
+                <h4>Services</h4>
+                <ul>
+                    <li><a href="#services">Rapid Prototyping</a></li>
+                    <li><a href="#services">Custom Design</a></li>
+                    <li><a href="#services">Volume Production</a></li>
+                </ul>
+            </div>
+            <div class="footer-section">
+                <h4>Company</h4>
+                <ul>
+                    <li><a href="#">About Us</a></li>
+                    <li><a href="#">Blog</a></li>
+                    <li><a href="#">Careers</a></li>
+                </ul>
+            </div>
+            <div class="footer-section">
+                <h4>Support</h4>
+                <ul>
+                    <li><a href="#">Help Center</a></li>
+                    <li><a href="#">Material Guide</a></li>
+                    <li><a href="#">Status Page</a></li>
+                </ul>
+            </div>
+            <div class="footer-section">
+                <h4>Connect</h4>
+                <ul>
+                    <li><a href="#">Twitter</a></li>
+                    <li><a href="#">LinkedIn</a></li>
+                    <li><a href="#">Instagram</a></li>
+                </ul>
+            </div>
+        </div>
+        <div class="footer-bottom">
+            <p>&copy; 2024 PrintStudio. All rights reserved.</p>
+        </div>
+    </footer>
+</body>
+</html>

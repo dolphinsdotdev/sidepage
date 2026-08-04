@@ -60,3 +60,16 @@ class StaticServeError(SidepageError):
     """A static target (§11) failed to validate — e.g. no `index.html` at
     the directory root. A hard error by design, not a directory listing.
     """
+
+
+class VaultError(SidepageError):
+    """The secrets vault (v4 §9) — OS keychain or its encrypted-file
+    fallback — was unreachable or failed to read/write.
+    """
+
+
+class SecretNotFoundError(VaultError):
+    """`serve --env <SECRET_NAME>` or a BYO-domain `--*-token-name` flag
+    referenced a name that isn't in the vault. Fails loud by design — no
+    silent skip, no blanket passthrough.
+    """

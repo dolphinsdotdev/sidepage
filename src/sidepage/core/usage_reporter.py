@@ -21,7 +21,13 @@ Two counters, not one — HTTP and WebSocket targets don't share a shape:
 
 from __future__ import annotations
 
+import json
+import time
 from dataclasses import dataclass
+
+from sidepage.core import registry
+from sidepage.core.exceptions import DirectoryError
+from sidepage.core.reverse_proxy import counts_path
 
 
 @dataclass(frozen=True)
@@ -36,9 +42,29 @@ class UsageReport:
 
 def get_usage(app_name: str) -> UsageReport:
     """Backs `sidepage usage <app-name>` and the counts panel in `sidepage
-    inspect` — same counters, two read paths, both sourced from
-    `sidepage.core.reverse_proxy`.
+    inspect` — same counters, two read paths, both sourced from the counts
+    file `sidepage.core.reverse_proxy` writes on every request/message.
 
-    Not implemented.
+    Raises `sidepage.core.exceptions.DirectoryError` if `app_name` isn't a
+    currently-running app.
     """
-    raise NotImplementedError
+    app = registry.get(app_name)
+    if app is None:
+        raise DirectoryError(f"no running app named {app_name!r}")
+
+    counts_file = counts_path(app_name)
+    counts: dict[str, int] = {}
+    if counts_file.exists():
+        try:
+            counts = json.loads(counts_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            counts = {}
+
+    return UsageReport(
+        app_name=app_name,
+        http_request_count=counts.get("http_requests", 0),
+        http_response_count=counts.get("http_responses", 0),
+        ws_connection_count=counts.get("ws_connections", 0),
+        ws_message_count=counts.get("ws_messages", 0),
+        uptime_seconds=int(time.time() - app.started_at),
+    )

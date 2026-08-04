@@ -17,11 +17,17 @@ Three modes, selected by what `serve` was given:
     anything there, so abuse monitoring is a backend concern, not this
     module's.
   - **BYO-domain (premium, or explicit `serve --domain`)** — the user
-    supplies a scoped Zone:DNS:Edit token plus a per-tunnel token (never
-    the global account key). Liability shifts to the user's own domain.
-    Credentials are set via `sidepage.core.account.set_default_domain` or
-    an equivalent per-serve override — never stored in the directory,
-    always local (see `sidepage.config.settings`).
+    supplies a scoped Zone:DNS:Edit token plus a separate per-tunnel token
+    (never the global account key). Liability shifts to the user's own
+    domain. v3 left credential storage unspecified ("stored locally, no
+    mechanism given"); v4 answers it: both tokens are stored in
+    `sidepage.core.secrets_vault` and referenced *by name*, not by value —
+    `sidepage.core.account.set_default_domain` takes `zone_token_name` /
+    `tunnel_token_name` (see `sidepage account domain set
+    --zone-token-name / --tunnel-token-name`), and this module resolves
+    those names to actual values only at tunnel-open time. Never stored in
+    the directory, never in the auth-token runtime file (see
+    `sidepage.core.token_runtime` for that boundary).
   - **Anonymous (`serve --anon`)** — Cloudflare Quick Tunnel. No broker
     call, no directory entry at all, `*.trycloudflare.com`. Orthogonal to
     `--auth`: an anonymous tunnel can still require a token
@@ -31,9 +37,19 @@ Three modes, selected by what `serve` was given:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import queue
+import re
+import shutil
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+
+from sidepage.core.exceptions import CloudflaredResolutionError, TunnelError
+
+_TRYCLOUDFLARE_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 
 
 class TunnelMode(StrEnum):
@@ -42,12 +58,13 @@ class TunnelMode(StrEnum):
     ANONYMOUS = "anonymous"  # --anon, Cloudflare Quick Tunnel
 
 
-@dataclass(frozen=True)
+@dataclass
 class TunnelHandle:
     app_name: str | None  # None for anonymous (no directory entry)
     mode: TunnelMode
     url: str
     domain: str | None  # None for brokered/anonymous
+    process: subprocess.Popen | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -66,24 +83,74 @@ def open_brokered_tunnel(app_name: str) -> TunnelHandle:
     raise NotImplementedError
 
 
-def open_byo_tunnel(app_name: str, domain: str) -> TunnelHandle:
+def open_byo_tunnel(
+    app_name: str, domain: str, *, zone_token_name: str, tunnel_token_name: str
+) -> TunnelHandle:
     """Bring up a tunnel on `domain` using the user's own scoped Cloudflare
-    credentials (see `sidepage.core.account` for where those are set).
+    credentials, resolved from the vault by name (v4 §9):
+    `zone_token_name` for the Zone:DNS:Edit token, `tunnel_token_name` for
+    the per-tunnel token — see `sidepage.core.secrets_vault.get_secret`.
     Requires `domain` already on Cloudflare-managed DNS (Tunnel binds via
     CNAME).
 
-    Not implemented.
-    """
-    raise NotImplementedError
-
-
-def open_anon_tunnel() -> TunnelHandle:
-    """Bring up a Cloudflare Quick Tunnel (`*.trycloudflare.com`) — no
-    broker call, no directory entry. Backs `serve --anon`.
+    Once implemented, raises `sidepage.core.exceptions.SecretNotFoundError`
+    if either name isn't in the vault.
 
     Not implemented.
     """
     raise NotImplementedError
+
+
+def open_anon_tunnel(listen_port: int, *, timeout: float = 20.0) -> TunnelHandle:
+    """Bring up a Cloudflare Quick Tunnel (`*.trycloudflare.com`) pointed at
+    `127.0.0.1:listen_port` — no broker call, no directory entry, no
+    credentials needed. Backs `serve --anon`.
+
+    Spawns `cloudflared tunnel --url http://127.0.0.1:<listen_port>` and
+    parses the assigned URL from its output. Raises `TunnelError` if
+    `cloudflared` exits early or no URL appears within `timeout`.
+    """
+    binary = resolve_cloudflared_binary()
+    proc = subprocess.Popen(
+        [str(binary), "tunnel", "--url", f"http://127.0.0.1:{listen_port}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    # Read output on a background thread so a stall in cloudflared's output
+    # can't make `readline()` block past `timeout` — a plain read loop on
+    # the main thread would ignore the deadline entirely while blocked.
+    lines: queue.Queue[str] = queue.Queue()
+
+    def _pump() -> None:
+        if proc.stdout is not None:
+            for line in proc.stdout:
+                lines.put(line)
+
+    threading.Thread(target=_pump, daemon=True).start()
+
+    deadline = time.monotonic() + timeout
+    url: str | None = None
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise TunnelError(f"cloudflared exited early (code {proc.returncode})")
+        try:
+            line = lines.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        match = _TRYCLOUDFLARE_RE.search(line)
+        if match:
+            url = match.group(0)
+            break
+    if url is None:
+        proc.terminate()
+        raise TunnelError(f"cloudflared did not report a tunnel URL within {timeout}s")
+
+    return TunnelHandle(
+        app_name=None, mode=TunnelMode.ANONYMOUS, url=url, domain=None, process=proc
+    )
 
 
 def status(app_name: str) -> TunnelStatus:
@@ -100,30 +167,46 @@ def close_tunnel(handle: TunnelHandle) -> None:
     """Tear down a tunnel opened by any of the three `open_*` functions
     above. Called on `serve`'s Ctrl+C / `stop` path — immediate, no grace
     period (confirmed default; graceful drain is a deferred open question,
-    see `sidepage.core.reverse_proxy`).
-
-    Not implemented.
-    """
-    raise NotImplementedError
+    see `sidepage.core.reverse_proxy`)."""
+    if handle.process is not None and handle.process.poll() is None:
+        handle.process.terminate()
+        try:
+            handle.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            handle.process.kill()
 
 
 def resolve_cloudflared_binary(*, override_path: Path | None = None) -> Path:
-    """Locate a usable `cloudflared` binary, in order:
+    """Locate a usable `cloudflared` binary.
 
-    1. `--cloudflared-path` / `SIDEPAGE_CLOUDFLARED_PATH` (`override_path`).
-    2. `PATH`, version-verified; fall through (not hard-fail) on mismatch.
-    3. Local cache (`~/.cache/sidepage/bin/cloudflared` — see
-       `sidepage.config.settings`).
-    4. Download-on-first-run, checksum-verified against Cloudflare's
-       published hashes.
+    Implements the first two of the spec's four resolution steps for real:
 
-    No Python port of `cloudflared` exists or should be assumed — the real
-    binary is a hard dependency; this function's job is finding or fetching
-    it, not reimplementing it.
+    1. `override_path` (`--cloudflared-path` / `SIDEPAGE_CLOUDFLARED_PATH`
+       — reading the env var itself is `serve`'s job, this function just
+       takes the resolved value).
+    2. `PATH` lookup (`shutil.which`).
 
-    Raises `sidepage.core.exceptions.CloudflaredResolutionError` if none of
-    the four steps produce a usable binary.
+    Steps 3 (local cache download) and 4 (download-on-first-run, checksum
+    verified) are **not implemented** — they require fetching and verifying
+    a real binary from Cloudflare's release infrastructure, out of scope
+    for this round. Not a practical gap today: `cloudflared` installed via
+    a system package manager (as this environment has it) satisfies step 2
+    every time.
 
-    Not implemented.
+    Raises `sidepage.core.exceptions.CloudflaredResolutionError` if neither
+    step finds a usable binary.
     """
-    raise NotImplementedError
+    if override_path is not None:
+        if override_path.is_file():
+            return override_path
+        raise CloudflaredResolutionError(f"--cloudflared-path {override_path} does not exist")
+
+    found = shutil.which("cloudflared")
+    if found is not None:
+        return Path(found)
+
+    raise CloudflaredResolutionError(
+        "cloudflared not found on PATH, and no override given. "
+        "Local-cache / download-on-first-run resolution isn't implemented "
+        "— install cloudflared (e.g. `brew install cloudflared`) for now."
+    )

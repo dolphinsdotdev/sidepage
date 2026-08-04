@@ -23,6 +23,8 @@ class AccountStatus:
     label: str | None
     plan: str  # e.g. "free", "premium"
     default_domain: str | None  # premium only, set via set_default_domain
+    default_zone_token_name: str | None  # vault secret name, v4 §9 — not the token value
+    default_tunnel_token_name: str | None  # vault secret name, v4 §9 — not the token value
 
 
 def login() -> None:
@@ -42,11 +44,19 @@ def current_account() -> AccountStatus:
     raise NotImplementedError
 
 
-def set_default_domain(domain: str) -> None:
-    """Backs `sidepage account domain set <domain>` — premium: a persistent
-    default BYO domain used by `serve` when `--domain` isn't passed
-    explicitly. Credentials for `domain` are stored locally, never in the
-    directory (see `sidepage.core.tunnel_manager`, `sidepage.config.settings`).
+def set_default_domain(domain: str, *, zone_token_name: str, tunnel_token_name: str) -> None:
+    """Backs `sidepage account domain set <domain> --zone-token-name
+    --tunnel-token-name` — premium: a persistent default BYO domain used by
+    `serve` when `--domain` isn't passed explicitly.
+
+    Stores `domain` plus the two vault secret *names* (v4 §9,
+    `sidepage.core.secrets_vault`) — not the credential values themselves.
+    `zone_token_name` names the Zone:DNS:Edit token, `tunnel_token_name`
+    the per-tunnel token; both are resolved from the vault only when
+    `sidepage.core.tunnel_manager.open_byo_tunnel` actually opens a tunnel,
+    not eagerly here. This is v4's concrete answer to a gap v3 §6 left
+    open ("stored locally," no mechanism specified) — never stored in the
+    directory (see `sidepage.config.settings`).
 
     Not implemented.
     """

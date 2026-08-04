@@ -16,6 +16,11 @@ in-flight requests/open WS connections is deferred, not designed yet). `--backgr
 is explicitly ruled out in v3: the orchestrator (out of scope for this
 binary, §16) owns all multi-process concerns; this binary stays
 single-process/foreground by contract.
+
+v4 adds `--env <SECRET_NAME>` (repeatable): named, per-app injection of
+vault secrets (`sidepage.core.secrets_vault`, v4 §9) into the wrapped
+process's environment. Nothing blanket — each name is looked up
+individually and injection fails loud if a name isn't in the vault.
 """
 
 from __future__ import annotations
@@ -28,7 +33,11 @@ import typer
 
 from sidepage.core.auth import AuthTier
 from sidepage.core.directory_client import Scope
-from sidepage.output import not_implemented
+from sidepage.core.process import ServeConfig
+from sidepage.core.process import serve as core_serve
+from sidepage.core.process import stop as core_stop
+from sidepage.core.target import TargetKind
+from sidepage.output import error, not_implemented
 
 
 class ServeTargetType(StrEnum):
@@ -95,6 +104,14 @@ def serve(
             "(shell history / `ps aux` exposure). Auto-generated and printed once if omitted.",
         ),
     ] = None,
+    env: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--env",
+            help="Inject a named secret from the vault (`sidepage secrets set`) as an env var "
+            "in the wrapped process. Repeatable. Fails loud if the name isn't in the vault.",
+        ),
+    ] = None,
     guardrail: Annotated[
         Path | None,
         typer.Option(
@@ -105,13 +122,27 @@ def serve(
 ) -> None:
     """Serve a target and expose it through a tunnel. Blocks the terminal;
     Ctrl+C tears the tunnel down immediately."""
-    if guardrail is not None:
-        not_implemented(
-            "sidepage serve --guardrail",
-            implemented_by="sidepage.core.guardrail.load_guardrail_config",
-        )
-        return
-    not_implemented("sidepage serve", implemented_by="sidepage.core.process.serve")
+    target_kind = None if target_type == ServeTargetType.AUTO else TargetKind(target_type.value)
+    config = ServeConfig(
+        target=target,
+        target_kind=target_kind,
+        name=name,
+        domain=domain,
+        auth=auth,
+        scope=scope,
+        anon=anon,
+        token=token,
+        env_secrets=tuple(env or ()),
+        guardrail=guardrail,
+    )
+    try:
+        core_serve(config)
+    except NotImplementedError as exc:
+        not_implemented(f"sidepage serve — {exc}", implemented_by="sidepage.core.process.serve")
+    except Exception as exc:
+        # Top-level CLI boundary — report and exit cleanly instead of a raw traceback.
+        error(str(exc))
+        raise typer.Exit(1) from exc
 
 
 def stop(
@@ -119,4 +150,4 @@ def stop(
 ) -> None:
     """Explicit, non-interactive teardown of a running app — same immediate
     (no grace period) semantics as Ctrl+C."""
-    not_implemented("sidepage stop", implemented_by="sidepage.core.process.stop")
+    core_stop(app_name)

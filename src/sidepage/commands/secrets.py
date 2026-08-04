@@ -3,7 +3,8 @@
 The major new piece in v4: v3 had no concept of standing, persistent,
 user-supplied secrets — only the ephemeral auth-token runtime file (§8).
 See `sidepage.core.secrets_vault` for the lifecycle/direction distinction
-that keeps this genuinely separate from that file, not just a rename.
+that keeps this genuinely separate from that file, not just a rename, and
+for why this build's backend is encrypted-file only (OS keychain deferred).
 
 `set` prompts for the value with hidden input rather than taking it as a
 CLI argument or `--value` flag — the vault holds standing credentials, so
@@ -17,7 +18,8 @@ from typing import Annotated
 
 import typer
 
-from sidepage.output import not_implemented
+from sidepage.core import secrets_vault
+from sidepage.output import stdout, success
 
 secrets_app = typer.Typer(
     name="secrets",
@@ -41,17 +43,20 @@ def set_(
         ),
     ],
 ) -> None:
-    """Store a secret in the vault (OS keychain, or the encrypted-file
-    fallback)."""
-    not_implemented("sidepage secrets set", implemented_by="sidepage.core.secrets_vault.set_secret")
+    """Store a secret in the vault (encrypted local file)."""
+    secrets_vault.set_secret(name, value)
+    success(f"stored secret {name!r}")
 
 
 @secrets_app.command("list")
 def list_() -> None:
     """List stored secret names — values are never displayed."""
-    not_implemented(
-        "sidepage secrets list", implemented_by="sidepage.core.secrets_vault.list_secrets"
-    )
+    names = secrets_vault.list_secrets()
+    if not names:
+        stdout.print("[dim]no secrets stored[/dim]")
+        return
+    for name in names:
+        stdout.print(name)
 
 
 @secrets_app.command("remove")
@@ -59,6 +64,5 @@ def remove(
     name: Annotated[str, typer.Argument(help="Secret name to delete.")],
 ) -> None:
     """Delete a stored secret."""
-    not_implemented(
-        "sidepage secrets remove", implemented_by="sidepage.core.secrets_vault.remove_secret"
-    )
+    secrets_vault.remove_secret(name)
+    success(f"removed secret {name!r}")

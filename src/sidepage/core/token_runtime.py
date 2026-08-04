@@ -21,47 +21,69 @@ lifetime of one `serve` process.
 Enforcement itself (gate page, header/query-param check, WS auth riding on
 the session cookie) lives in `sidepage.core.reverse_proxy` (§9) — this
 module only owns generating and persisting the value, not checking it.
+
+**v4 clarification, not new behavior:** the runtime file holds both the
+`--auth token` value *and* any broker-issued tunnel token from
+`sidepage.core.tunnel_manager.open_brokered_tunnel` — v3 implied this but
+never said so explicitly. Both live here because they share the same
+ephemeral lifecycle (die with the process), not because they're the same
+kind of thing — the auth token gates inbound access to this app, the
+broker tunnel token is Sidepage's own credential for keeping the tunnel
+open. This line exists specifically to draw the boundary against
+`sidepage.core.secrets_vault` (v4 §9): standing, user-supplied, outbound
+credentials belong in the vault; anything that dies with the `serve`
+process — no matter what it's for — belongs here instead.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+import secrets
+from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from sidepage.config.settings import ensure_dirs, runtime_dir
 
 
 @dataclass(frozen=True)
 class RuntimeToken:
     app_name: str
     pid: int
-    value: str
+    value: str  # the --auth token value
+    broker_tunnel_token: str | None = None  # set when the tunnel mode is brokered
 
 
 def resolve_token(*, explicit: str | None, env_value: str | None) -> str:
     """Pick the token value for a `serve` invocation: `explicit` (`--token`)
     if given, else `env_value` (`SIDEPAGE_TOKEN`) if set, else generate a
-    new one.
+    new one."""
+    if explicit:
+        return explicit
+    if env_value:
+        return env_value
+    return secrets.token_urlsafe(24)
 
-    Not implemented.
-    """
-    raise NotImplementedError
+
+def _runtime_path(app_name: str, pid: int) -> Path:
+    return runtime_dir() / f"{app_name}-{pid}.json"
 
 
 def write_runtime_file(token: RuntimeToken) -> Path:
     """Write `token` to
     `~/.local/state/sidepage/runtime/<app-name>-<pid>.json` with mode
-    `0600`. Returns the written path.
-
-    Not implemented.
-    """
-    raise NotImplementedError
+    `0600`. Returns the written path."""
+    ensure_dirs()
+    path = _runtime_path(token.app_name, token.pid)
+    path.write_text(json.dumps(asdict(token)))
+    path.chmod(0o600)
+    return path
 
 
 def read_runtime_file(app_name: str, pid: int) -> RuntimeToken:
     """Read back a previously written runtime token file — used by
     `sidepage status` / `sidepage inspect` to retrieve the value for
     display, and by `sidepage.core.inspector` to auto-source credentials
-    when inspecting one's own app.
-
-    Not implemented.
-    """
-    raise NotImplementedError
+    when inspecting one's own app."""
+    path = _runtime_path(app_name, pid)
+    data = json.loads(path.read_text())
+    return RuntimeToken(**data)

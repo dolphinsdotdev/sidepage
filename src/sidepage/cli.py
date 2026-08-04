@@ -10,8 +10,9 @@ Command tree:
   sidepage promote <app-name>                              §5
   sidepage login                                           §13
   sidepage account status                                  §13
-  sidepage account domain set <domain>                     §13
+  sidepage account domain set <domain>                     §13 (v4: + --zone/tunnel-token-name)
   sidepage usage <app-name>                                §7
+  sidepage secrets set|list|remove                         v4 §9
   sidepage inspect [<app-name-or-url>]                     §10
   sidepage ls                                              (no v3 section — see note below)
   sidepage status <app-name>                               (no v3 section — see note below)
@@ -34,6 +35,14 @@ sidepage.core.tunnel_manager without a dedicated command group).
 (§8, token handling, has no standalone command — it's `serve --token` /
 `SIDEPAGE_TOKEN`. Guardrails, still parked though absent from v3, remain
 `serve --guardrail`; see sidepage.commands.serve and sidepage.core.guardrail.)
+
+v4 adds `sidepage secrets set|list|remove` — the secrets vault, cited by
+the user's own summary as "v4 §9." v3 §9 was "local reverse proxy"; the
+migration to v4 was done from a 4-point delta summary, not the full v4
+document, so whether v4 actually renumbered the reverse proxy section is
+unconfirmed — see `docs/OPEN_QUESTIONS.md` for the flagged collision.
+`sidepage.core.secrets_vault` is genuinely new, not a replacement for
+`sidepage.core.reverse_proxy`, regardless of how the numbering shakes out.
 """
 
 from __future__ import annotations
@@ -41,7 +50,7 @@ from __future__ import annotations
 import typer
 
 from sidepage import __version__
-from sidepage.commands import account, directory, inspect, new, scope, serve, usage
+from sidepage.commands import account, directory, inspect, new, scope, secrets, serve, usage
 
 app = typer.Typer(
     name="sidepage",
@@ -86,6 +95,9 @@ app.command("promote")(scope.promote)
 
 # §7 — metering
 app.command("usage")(usage.usage)
+
+# v4 §9 — secrets vault
+app.add_typer(secrets.secrets_app)
 
 # §10 — inspection & directory queries
 app.command("inspect")(inspect.inspect)
