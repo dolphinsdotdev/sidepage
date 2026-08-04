@@ -194,8 +194,8 @@ sidepage usage <app-name>
 counts — tracked separately, since a WS session has no request/response
 pairing. Observed by the local reverse proxy (persisted to a small JSON
 file per app), not self-reported by the app. Resolved as the permanent
-billing boundary, forever. The same counters are read by `sidepage usage`;
-`sidepage inspect` (not implemented) would be the second, live read path.
+billing boundary, forever. The same counters are read by `sidepage usage`
+and, live, by `sidepage inspect`'s `usage` command.
 
 ### Token handling (§8)
 
@@ -262,10 +262,22 @@ grace period gets added later is a deferred, unresolved design question).
 ```bash
 sidepage inspect [<app-name-or-url>]
 ```
-**Not implemented.** Interactive "Postman-for-MCP" console: browse tools,
-inspect schemas, invoke calls, replay requests, view live usage counts.
-Wasn't one of the two prioritized targets (static site, Streamlit app),
-and MCP tool introspection is a meaningfully separate build from serving.
+**Real, for generic HTTP/static targets — MCP tool browsing deferred.**
+An interactive REPL against anything `serve` wraps: `get`/`post`/`put`/
+`patch`/`delete`/`head <path> [json body]`, `header <name> <value>` to set
+a session header, `replay` the last request, `info`, and live `usage`
+counts. With no argument, lists this machine's running apps to pick from.
+No auth bypass for the local operator — same credential as any caller,
+auto-sourced from the token runtime file when inspecting an app registered
+on this machine (falls back to none for `--auth open` apps or a raw URL).
+
+The spec's actual "Postman-for-MCP" framing — browsing MCP tool schemas,
+`tools/list`/`tools/call` over MCP's JSON-RPC transport — isn't built yet.
+Neither of the two prioritized fixtures (static site, Streamlit app) is an
+MCP server, so there was nothing real to build that piece against; see
+[Open questions](#open-questions) item 14 for what's still undecided
+(client library choice, whether to add an MCP fixture) when it's picked
+back up.
 
 ```bash
 sidepage ls [--scope <scope>] [--mine]
@@ -340,7 +352,7 @@ src/sidepage/
 │   ├── scope.py                 §5  ○ sidepage promote
 │   ├── usage.py                  §7  ● sidepage usage
 │   ├── secrets.py                 v4 §9  ● sidepage secrets set|list|remove
-│   ├── inspect.py                  §10 ○ sidepage inspect
+│   ├── inspect.py                  §10 ● sidepage inspect (HTTP/static; MCP tool browsing deferred)
 │   ├── directory.py                 ● sidepage ls, sidepage status (no v3 section, see above)
 │   └── account.py                    §13 ○ sidepage login, sidepage account status|domain set
 ├── core/                     The SDK
@@ -356,7 +368,7 @@ src/sidepage/
 │   ├── reverse_proxy.py                   §9 (v3)  ● Starlette/httpx/websockets proxy, auth gate, usage counting
 │   ├── registry.py                         ● local running-app registry (new — not a spec section, backs ls/status/stop)
 │   ├── static.py                            §11 ● StaticFiles validation + mount
-│   ├── inspector.py                          §10 ○ MCP inspection console
+│   ├── inspector.py                          §10 ● generic HTTP/static console; ○ MCP tool browsing
 │   ├── notebook.py                            §12 ○ Jupyter Lab launch + safety check
 │   ├── account.py                              §13 ○ login/status/domain
 │   ├── ecosystem.py                             §14 ● Python runner resolution (venv/uv); ○ JS
@@ -370,7 +382,8 @@ tests/
 │   ├── static-site/index.html   an actual marketing site (not a toy fixture)
 │   └── streamlit-app/app.py     a real Streamlit + pandas/numpy app
 ├── test_cli_smoke.py         Argument parsing, help text, command wiring — fast, in-process
-└── test_serve_integration.py Real end-to-end: launches the CLI as a subprocess against both fixtures
+├── test_serve_integration.py Real end-to-end: launches the CLI as a subprocess against both fixtures
+└── test_inspector.py         Real: target resolution, auth auto-sourcing, request execution
 
 docs/
 ├── OPEN_QUESTIONS.md    Resolved-in-v3 and still-open design decisions
@@ -392,6 +405,7 @@ uv sync                                          # installs runtime + dev deps
 uv run ruff check .                              # lint
 uv run pytest tests/test_cli_smoke.py            # fast, in-process — argument parsing & wiring
 uv run pytest tests/test_serve_integration.py    # slower — real subprocess, real HTTP/WS
+uv run pytest tests/test_inspector.py            # real target resolution + request execution
 uv run pytest                                    # everything (~45s, mostly Streamlit's first boot)
 uv run sidepage --help                           # try the CLI
 ```
@@ -432,7 +446,8 @@ renumbered §9 (reverse proxy) to make room for the vault, and whether
 prioritized — are **real, working code**, verified end to end against two
 actual apps (not synthetic fixtures): a marketing site
 (`tests/fixtures/static-site`) and a Streamlit + pandas/numpy app
-(`tests/fixtures/streamlit-app`).
+(`tests/fixtures/streamlit-app`). `sidepage inspect` followed the same
+bar, scoped to what those two fixtures could actually verify.
 
 **What actually works today:**
 - `sidepage serve <static-dir>` — real Starlette `StaticFiles`, reachable over HTTP.
@@ -442,10 +457,12 @@ actual apps (not synthetic fixtures): a marketing site
 - `--anon` — a real `*.trycloudflare.com` URL via a `cloudflared` subprocess. (Verified that `cloudflared` itself successfully connects and gets a real assigned URL; verifying an actual browser could reach that URL from the public internet wasn't possible from this sandboxed dev environment's network policy — the mechanism is implemented and tested up to that boundary.)
 - `sidepage secrets set|list|remove` — a real encrypted local vault (Fernet, not just a stub).
 - `sidepage stop` / `sidepage ls` / `sidepage status` / `sidepage usage` — real, backed by a local running-app registry (this machine only, see [Project layout](#project-layout)) and the proxy's persisted usage counters.
+- `sidepage inspect` — real interactive console for HTTP/static targets: ad-hoc requests, header overrides, replay, live usage, auth auto-sourcing. Directory-aware picker when no target is given.
 
 **What's still a documented placeholder, and why:**
 - Anything needing a Sidepage cloud backend — brokered/BYO-domain tunneling, the directory service beyond `--scope local`, `login`/`account status` — because that backend doesn't exist to build against. `serve` reports these clearly rather than silently ignoring the flag or pretending to work.
-- `notebook` targets, `--guardrail`, `--auth network`/`oauth`, `sidepage inspect` — real, but not among the two prioritized features, so left as placeholders with the same documented-intent style as the rest of this package.
+- `notebook` targets, `--guardrail`, `--auth network`/`oauth` — not among the prioritized features, left as placeholders with the same documented-intent style as the rest of this package.
+- MCP tool browsing within `sidepage inspect` (schemas, `tools/list`, `tools/call`) — the spec's actual "Postman-for-MCP" framing. Deferred because neither prioritized fixture is an MCP server; see [Open questions](#open-questions) item 14 for the client-library decision still pending when this gets picked up.
 - OS keychain backend for the secrets vault — deferred in favor of the encrypted-file backend, which doesn't need an interactive permission prompt (see Secrets vault, v4 §9, above).
 
 Every placeholder still calls `sidepage.output.not_implemented()` (or, in

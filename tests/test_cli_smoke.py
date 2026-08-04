@@ -37,12 +37,11 @@ def _isolated_sidepage_home(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SIDEPAGE_HOME", str(tmp_path))
 
 # Every leaf command that's still a pure placeholder, with enough
-# placeholder args to satisfy required parameters.
+# placeholder args to satisfy required parameters. `inspect` is real now
+# (see test_inspect_* below and tests/test_inspector.py) — not listed here.
 LEAF_INVOCATIONS = [
     ["new", "myapp"],
     ["promote", "myapp"],
-    ["inspect"],
-    ["inspect", "myapp"],
     ["login"],
 ]
 
@@ -181,6 +180,20 @@ def test_stop_unknown_app() -> None:
     result = runner.invoke(app, ["stop", "no-such-app-registered"])
     assert result.exit_code != 0
     assert "no running app" in result.output
+
+
+def test_inspect_no_apps_running_exits_cleanly() -> None:
+    """With no target and nothing registered, `_pick_target` errors and
+    returns before ever calling `input()` — safe to run in-process."""
+    result = runner.invoke(app, ["inspect"])
+    assert result.exit_code == 0, result.output
+    assert "no apps running" in result.output
+
+
+def test_inspect_unknown_target_fails() -> None:
+    result = runner.invoke(app, ["inspect", "not-a-running-app"])
+    assert result.exit_code != 0
+    assert "not-a-running-app" in result.output
 
 
 def test_account_domain_set_requires_both_token_names() -> None:

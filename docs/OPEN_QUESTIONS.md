@@ -17,6 +17,10 @@ Items 11–13 are engineering decisions and a verification limit that came
 out of that pass — not spec ambiguities, but calls made without stopping
 to ask, flagged here on the same principle.
 
+A further pass turned `inspect` real for generic HTTP/static targets,
+deliberately scoped short of the spec's actual "Postman-for-MCP" framing.
+Item 14 covers what's still open there.
+
 ---
 
 ## Resolved in v3
@@ -194,9 +198,12 @@ Sidepage cloud backend to issue scoped tunnel tokens, and BYO-domain
 requires real DNS automation against a user's Cloudflare zone. Neither can
 be built by writing more `sidepage` code — they need a backend service
 that doesn't exist yet, which is a different kind of gap than "not
-implemented yet" (e.g. `sidepage inspect`, which could be built today).
-`serve` without `--anon`/`--domain` falls back to serving on `127.0.0.1`
-only rather than either failing or silently pretending brokered mode ran.
+implemented yet" (e.g. `sidepage inspect`'s generic-HTTP mode, which
+*was* buildable and is now real — see item 14 for the one piece of
+`inspect` that has the same "needs something else first" shape as this
+item). `serve` without `--anon`/`--domain` falls back to serving on
+`127.0.0.1` only rather than either failing or silently pretending
+brokered mode ran.
 
 **Affects:** `sidepage.core.tunnel_manager`, `sidepage.core.process`
 
@@ -215,3 +222,24 @@ Whether the URL is actually reachable from the open internet (i.e. from a
 real browser, outside this sandbox) was not verified end-to-end.
 
 **Affects:** `sidepage.core.tunnel_manager`
+
+---
+
+### 14. `sidepage inspect`: MCP tool browsing deferred, client library choice not made
+
+The spec frames `inspect` as "Postman-for-MCP" — browsing MCP tools,
+schemas, invoking calls over the MCP JSON-RPC/streamable-HTTP transport.
+Deliberately scoped down for this pass to generic HTTP/static request
+inspection instead (real, see `docs/CHECKLIST.md` §10), on the reasoning
+that neither prioritized fixture (static site, Streamlit app) is an MCP
+server, so there was nothing real to build the MCP piece against.
+
+When MCP support is added, the client implementation is still an open
+choice: the official `mcp` Python SDK (correct, spec-compliant, but a new
+`sidepage` runtime dependency) vs. a hand-rolled JSON-RPC client over the
+already-present `httpx` (no new dependency, more protocol-maintenance
+risk). Also still open: whether to add a real MCP server test fixture
+(`tests/fixtures/mcp-server/`, matching how static-site/streamlit-app were
+verified) before or alongside that build.
+
+**Affects:** `sidepage.core.inspector`, `sidepage.commands.inspect`

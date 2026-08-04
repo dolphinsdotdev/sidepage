@@ -119,9 +119,14 @@ Legend: `[x]` done · `[ ]` not done · `[~]` real but scoped (see the note on t
 
 - [x] CLI: `sidepage inspect [<app-name-or-url>]`
 - [x] Resolved: no auth bypass for the local operator
-- [ ] Core: `sidepage.core.inspector.open_console` — not implemented, not one of the two prioritized features
-- [ ] Core: auto-source credentials from token runtime file
-- [ ] Core: surface live usage counts
+- [x] Core: `sidepage.core.inspector.open_console` — real, generic HTTP/static console (REPL: get/post/put/patch/delete/head, header, replay, info, usage, help, quit)
+- [x] Core: `resolve_target` — real, app name via `sidepage.core.registry` or raw `http(s)://` URL, `InspectorTargetError` otherwise
+- [x] Core: auto-source credentials from token runtime file — real (`_auto_token`, falls back to none when no runtime file exists, i.e. `--auth open`)
+- [x] Core: surface live usage counts — real, via `sidepage.core.usage_reporter.get_usage`
+- [x] Core: replay the last request — real (`session.last_request`)
+- [x] Directory-aware picker with no argument — real, lists `sidepage.core.registry.list_running()`
+- [x] Verified end to end against the static-site fixture, including auth auto-sourcing (`tests/test_inspector.py`)
+- [ ] **MCP tool browsing — deliberately parked, not built this pass.** Schemas, `tools/list`, `tools/call` over the MCP JSON-RPC/streamable-HTTP transport. Needs a real MCP client (decision pending: official `mcp` SDK vs. hand-rolled JSON-RPC — see `docs/OPEN_QUESTIONS.md` #14) and a real MCP server test fixture (neither existing fixture is an MCP server). The "Postman-for-MCP" framing in the spec is this piece specifically, not the generic HTTP console above.
 
 ### (no v3 section — see `docs/OPEN_QUESTIONS.md` #7)
 
@@ -182,6 +187,7 @@ Legend: `[x]` done · `[ ]` not done · `[~]` real but scoped (see the note on t
 - [x] Shared output helpers (`sidepage.output`)
 - [x] Fast in-process smoke tests (`tests/test_cli_smoke.py`) — argument parsing, help text, wiring
 - [x] Real subprocess integration tests (`tests/test_serve_integration.py`) — static site + Streamlit fixtures, auth gate, `--env` injection, stop/teardown
+- [x] Real integration tests for `inspect` (`tests/test_inspector.py`) — target resolution, auth auto-sourcing, request execution against the static-site fixture
 - [x] Real runtime dependencies: Starlette, uvicorn, httpx, `websockets`, `cryptography` (not just named-but-uninstalled)
 - [x] README with full command reference, architecture note, real-vs-stubbed project status, and project layout
 - [x] Open questions doc (`docs/OPEN_QUESTIONS.md`), split into resolved (v3) / still open, plus v4-specific gaps

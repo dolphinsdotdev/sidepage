@@ -73,3 +73,9 @@ class SecretNotFoundError(VaultError):
     referenced a name that isn't in the vault. Fails loud by design — no
     silent skip, no blanket passthrough.
     """
+
+
+class InspectorTargetError(SidepageError):
+    """`sidepage inspect <target>` was given something that's neither a
+    locally-registered app name nor an `http(s)://` URL.
+    """
