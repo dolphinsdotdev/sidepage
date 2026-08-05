@@ -26,6 +26,18 @@ individually and injection fails loud if a name isn't in the vault.
 (`sidepage.core.tunnel_manager.open_byo_tunnel`) once configured via
 `sidepage account domain set`. Mutually exclusive with `--anon` — one
 tunnel mode at a time.
+
+**`serve <target>` also accepts a registered app name** (registry spec
+v2, `sidepage.core.app_registry`, `sidepage.commands.app_registry`): if
+the positional argument matches something `sidepage app register`d, its
+saved config is the base and any flags passed *this* invocation override
+it field-by-field — see `sidepage.commands.app_registry.merge_with_registered`
+for exactly how "was this flag explicitly passed this time" is
+determined (`ctx.get_parameter_source`, not a `None`-default sentinel, so
+every flag's natural default — e.g. `--auth open`, `--scope local` —
+keeps working as a real default rather than colliding with "was it
+passed"). An argument that doesn't match any registered name falls back
+to the existing behavior unchanged: a literal target path.
 """
 
 from __future__ import annotations
@@ -36,6 +48,8 @@ from typing import Annotated
 
 import typer
 
+from sidepage.commands.app_registry import merge_with_registered
+from sidepage.core import app_registry
 from sidepage.core.auth import AuthTier
 from sidepage.core.directory_client import Scope
 from sidepage.core.process import ServeConfig
@@ -58,8 +72,9 @@ class ServeTargetType(StrEnum):
 
 
 def serve(
+    ctx: typer.Context,
     target: Annotated[
-        Path, typer.Argument(help="Script, directory, or .ipynb to serve.")
+        Path, typer.Argument(help="Script, directory, .ipynb, or a name from `sidepage app list`.")
     ],
     target_type: Annotated[
         ServeTargetType,
@@ -128,19 +143,43 @@ def serve(
 ) -> None:
     """Serve a target and expose it through a tunnel. Blocks the terminal;
     Ctrl+C tears the tunnel down immediately."""
-    target_kind = None if target_type == ServeTargetType.AUTO else TargetKind(target_type.value)
-    config = ServeConfig(
-        target=target,
-        target_kind=target_kind,
-        name=name,
-        domain=domain,
-        auth=auth,
-        scope=scope,
-        anon=anon,
-        token=token,
-        env_secrets=tuple(env or ()),
-        guardrail=guardrail,
-    )
+    registered = app_registry.get(str(target))
+    if registered is None:
+        target_kind = None if target_type == ServeTargetType.AUTO else TargetKind(target_type.value)
+        config = ServeConfig(
+            target=target,
+            target_kind=target_kind,
+            name=name,
+            domain=domain,
+            auth=auth,
+            scope=scope,
+            anon=anon,
+            token=token,
+            env_secrets=tuple(env or ()),
+            guardrail=guardrail,
+        )
+    else:
+        merged = merge_with_registered(
+            ctx,
+            registered,
+            target_type=target_type,
+            name=name,
+            domain=domain,
+            auth=auth,
+            scope=scope,
+            anon=anon,
+            env=list(env or ()),
+            guardrail=guardrail,
+        )
+        if merged["name"] is None:
+            # Registered but no explicit --name at registration time, and
+            # none passed this invocation either: the registry key itself
+            # is the natural default identity — closer to what a user
+            # typing `sidepage serve abc-app` expects than falling through
+            # to the underlying file's stem (ServeConfig's own default),
+            # which could be a completely different, less meaningful name.
+            merged["name"] = str(target)
+        config = ServeConfig(target=registered.target, token=token, **merged)
     try:
         core_serve(config)
     except NotImplementedError as exc:

@@ -332,16 +332,18 @@ installed by hand at some point and never captured — so trusting that venv
 produced `ModuleNotFoundError: No module named 'streamlit'` at launch, no
 attempt to recover. Fixed: every launch now goes through `uv run`, layering
 `--with <package>` for each package `sidepage.core.target.detect_code_launcher`
-detected (Streamlit → `streamlit`; FastAPI → `fastapi` and `uvicorn`, added
-when FastAPI support was built) on top of `--with-requirements
+detected (Streamlit → `streamlit`; FastAPI → `fastapi` and `uvicorn`; MCP →
+`mcp` or `fastmcp` plus `uvicorn`, depending on which package the target
+imports; notebook → `jupyterlab`) on top of `--with-requirements
 requirements.txt`, so the dependencies Sidepage itself knows about are
 never silently missing.
 
 What's still open: this only covers the *detected launcher's* package(s).
 `detect_code_launcher` doesn't do full static-import analysis — it
-recognizes exactly two frameworks (Streamlit, FastAPI) via a source scan.
-If a target imports some *other* undeclared package (not Streamlit or
-FastAPI's own deps, not in `requirements.txt`/`pyproject.toml`, not
+recognizes a fixed, growing set of frameworks (Streamlit, FastAPI, two MCP
+packages) via a source scan, plus notebook detection by file extension. If
+a target imports some *other* undeclared package (not one of those
+frameworks' own deps, not in `requirements.txt`/`pyproject.toml`, not
 something Sidepage's own detection knows to look for), it'll still fail
 the same way, just for a dependency Sidepage has no way to know it needs.
 Broader fixes would mean either scanning all imports in the target (real
@@ -350,3 +352,86 @@ a time as they come up (the pattern so far), or just accepting this as a
 documented limitation of a heuristic-based approach — not decided.
 
 **Affects:** `sidepage.core.ecosystem`, `sidepage.core.target`, `sidepage.core.process`
+
+---
+
+### 16. Notebook serving: real now, and Jupyter's default origin/XSRF rejection behind a reverse proxy was a real, non-obvious blocker
+
+Previously parked (not one of the two originally-prioritized targets,
+alongside stdio MCP servers under "everything is a port"). Now real —
+`sidepage.core.notebook.build_jupyter_launch_command` launches `jupyter
+lab` bound to loopback with its own token/password auth disabled (the
+reverse proxy is the auth boundary, same as every other launcher).
+
+Worth recording because it wasn't obvious going in and would have been an
+easy thing to ship broken: Jupyter Server's `check_origin` rejects
+cross-origin HTTP requests and WebSocket upgrades by default, comparing
+the request's `Origin` header against its own `Host`. Through *any*
+reverse proxy — not specific to Sidepage's — the browser's `Origin` is the
+proxy's own address, while Jupyter's real upstream port is different by
+construction (the proxy fronts one port, the wrapped process listens on
+another). That mismatch gets rejected out of the box, which would have
+meant the Lab UI's own API/WebSocket calls silently failing once actually
+opened in a browser, despite the initial page load looking fine. Confirmed
+by reproducing the rejection directly (a real kernel start plus a real
+`execute_request` over a WebSocket carrying a deliberately-mismatched
+`Origin` header) before adding `--ServerApp.allow_origin=*
+--ServerApp.disable_check_xsrf=True` to the launch command and confirming
+that fixes it — not assumed from documentation. `tests/test_serve_notebook.py`
+reproduces the same shape of check (proxy port, proxy's own origin, real
+kernel execution) as a regression guard.
+
+**Affects:** `sidepage.core.notebook`, `sidepage.core.process`, `sidepage.core.reverse_proxy`
+
+---
+
+### 17. Local app registry (registry spec v2): real, and a Typer internals finding worth recording
+
+Separate document from the v3/v4 spec (`sidepage-registry-spec.md`), now
+real: `sidepage app register|list|show|unregister` plus `sidepage serve
+<app-name>` (`sidepage.core.app_registry`, `sidepage.commands.app_registry`).
+
+**A few judgment calls the spec left implicit, resolved here:**
+- `target` is stored as an absolute, resolved path (the spec's own
+  illustrative example shows a bare relative `"target": "abc.py"`, which
+  reads as illustrative rather than a deliberate relative-path decision)
+  — so `serve <app-name>` works from any shell's cwd later, not just the
+  one it was registered from.
+- Re-registering an already-registered name is rejected, not a silent
+  overwrite — matching `sidepage.core.process.serve`'s existing
+  "already registered" stance for the separate *running*-apps registry.
+  `unregister`ing an unknown name is likewise rejected rather than the
+  vault's idempotent-removal stance (`sidepage.core.secrets_vault.remove_secret`)
+  — a judgment call that a small, user-named registry is typo-prone
+  enough that silent success on a typo'd name would hide the mistake.
+- A registered app's runtime `--name` (what shows up in `sidepage
+  ls`/`stop`) defaults to the registry key itself when neither the
+  registration nor the serving invocation set one explicitly, not the
+  served file's basename stem (`sidepage.core.process.serve`'s own
+  default for a literal-path invocation) — `serve abc-app` producing a
+  running app confusingly named `abc` (from `abc.py`'s stem) would be a
+  worse default than the name the user actually typed.
+- `--env`'s merge semantics (an explicit `--env` at `serve <app-name>`
+  time replaces the registered list rather than appending to it) — the
+  spec's own merge example only exercises a scalar flag (`--scope`), so
+  list-valued-flag semantics were genuinely unspecified; replace was
+  chosen for consistency with every other field rather than inventing a
+  separate accumulate rule for the one repeatable flag.
+
+**A real finding, not a design call:** this installed Typer version
+(0.27.1) fully vendors its own fork of Click (`typer._click`) rather than
+depending on the separately-installed, genuine `click` package (8.4.2,
+also present) for command/context internals. `click.Command.make_context`
+reuse — the mechanism that makes "a new `serve` flag is automatically
+registry-compatible" true rather than aspirational — works fine against
+Typer's `typer.core.TyperCommand` objects, but exceptions raised during
+parsing are `typer._click.exceptions.*` instances, unrelated to the real
+`click.exceptions.*` hierarchy (confirmed live: `except click.ClickException`
+did not catch a bad-flag `BadParameter` raised this way). There's no
+public Typer symbol for that private exception base to catch instead, so
+`sidepage.commands.app_registry` catches a broad `Exception` scoped
+tightly around the one `make_context` call rather than depending on a
+private, underscore-prefixed module path that could change across Typer
+releases.
+
+**Affects:** `sidepage.core.app_registry`, `sidepage.commands.app_registry`, `sidepage.commands.serve`

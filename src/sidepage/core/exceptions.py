@@ -95,3 +95,29 @@ class InspectorTargetError(SidepageError):
     """`sidepage inspect <target>` was given something that's neither a
     locally-registered app name nor an `http(s)://` URL.
     """
+
+
+class AppRegistryError(SidepageError):
+    """The local app registry (`sidepage app register|list|show|unregister`,
+    `sidepage.core.app_registry`) — a saved `serve` invocation under a
+    short name — failed. Distinct from `sidepage.core.registry`, which
+    tracks apps *currently running*, not saved configs.
+    """
+
+
+class AppRegistrationError(AppRegistryError):
+    """`sidepage app register` was given an invocation string that failed
+    to parse against `serve`'s own flags, pointed at a target that doesn't
+    exist, or contained a literal `--token <value>` — rejected outright
+    per the registry spec's hard rule that auth tokens (process-scoped,
+    regenerated per `serve` call) never persist outside the runtime file.
+    """
+
+
+class AppNotRegisteredError(AppRegistryError):
+    """`sidepage app show|unregister <app-name>` referenced a name that
+    isn't in the registry. (`sidepage serve <app-name>` deliberately does
+    *not* raise this for an unknown name — it falls back to treating the
+    argument as a literal target path instead, see
+    `sidepage.commands.serve`.)
+    """

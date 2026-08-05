@@ -20,7 +20,7 @@ Legend: `[x]` done · `[ ]` not done · `[~]` real but scoped (see the note on t
 
 - [x] CLI: `sidepage new <name> --type static`
 - [ ] Core: `sidepage.core.scaffold.scaffold_project`
-- [x] Core: `sidepage.core.target.detect_target_kind` (static/code/notebook — notebook recognized but not servable)
+- [x] Core: `sidepage.core.target.detect_target_kind` (static/code/notebook — all three servable now)
 - [x] Core: `sidepage.core.target.detect_code_launcher` — Streamlit, FastAPI, and Python MCP servers via import scan, else generic `$PORT`
 - [x] Core: `sidepage.core.target.allocate_port`
 
@@ -33,7 +33,7 @@ Legend: `[x]` done · `[ ]` not done · `[~]` real but scoped (see the note on t
 - [x] Core: port injection — `--server.port` flag for Streamlit, `uvicorn <module>:<app> --port` for FastAPI (bypasses a script's own `__main__` block, which real FastAPI apps often use to hardcode a port), `uvicorn <module>:<var>.<app-method> --factory --port` for MCP (bypasses the script's own `.run()` call too — see below), `$PORT` env var for the generic fallback
 - [x] Core: immediate tunnel/proxy/subprocess teardown on Ctrl+C / `stop` (via a SIGTERM handler that raises `KeyboardInterrupt`)
 - [x] Core: `--domain` (real, once configured — see §6/§13), non-`local` `--scope`, `--auth network`/`oauth`, `--guardrail` (the latter three still rejected up front with a clear message via `_validate_supported`, not silently ignored)
-- [x] Core: `notebook` targets rejected with a clear message (detected but not servable)
+- [x] Core: `notebook` targets — real, see §12 below
 - [x] CLI (v4): `--env <SECRET_NAME>` repeatable, vault injection
 - [x] Core (v4): `serve` resolving each `env_secrets` name via `secrets_vault.get_secret`, fail loud (`SecretNotFoundError`) on miss
 - [x] Verified end to end: static-site fixture and Streamlit fixture, both via real subprocess CLI invocation (`tests/test_serve_integration.py`)
@@ -154,9 +154,11 @@ Legend: `[x]` done · `[ ]` not done · `[~]` real but scoped (see the note on t
 
 - [x] CLI: `sidepage serve notebook.ipynb --auth token` (via generic `serve`, no dedicated flag)
 - [x] Core: `.ipynb` recognized by `detect_target_kind` (so `--type` reporting stays honest)
-- [ ] Core: `sidepage.core.notebook.build_jupyter_launch_command` — not implemented, not one of the two prioritized targets
-- [ ] Core: `sidepage.core.notebook.verify_proxy_fronted` (safety check, not yet designed)
-- [ ] Design: `juv` for standalone `.ipynb` dependency resolution — evaluation only, not committed
+- [x] Core: `sidepage.core.notebook.build_jupyter_launch_command` — real: `uv run --with jupyterlab jupyter lab <notebook> --port <port> --no-browser --ip=127.0.0.1`, Jupyter's own token/password auth disabled (the reverse proxy is the auth boundary, same as every other launcher), plus `--ServerApp.allow_origin=* --ServerApp.disable_check_xsrf=True`
+- [x] Resolved (verified live, not assumed): Jupyter Server rejects cross-origin requests/WebSocket upgrades by default, comparing `Origin` against its own `Host` — through the proxy, the browser's `Origin` is the *proxy's* address, not Jupyter's real (different) upstream port, so this rejects out of the box without the `allow_origin`/`disable_check_xsrf` flags above. Reproduced the rejection and confirmed the fix with a real kernel + a real `execute_request` over a WebSocket carrying a deliberately-mismatched origin before committing to the launch command
+- [x] Resolved: `sidepage.core.notebook.verify_proxy_fronted` placeholder removed — the flagged risk ("what if this launch command runs outside the proxy") is mitigated by `--ip=127.0.0.1` in the launch command itself, which is fully sidepage-controlled by construction; no separate runtime check adds anything beyond that, same guarantee every other code launcher already has
+- [x] Resolved: no standalone-vs-project dependency distinction needed — `sidepage.core.ecosystem.resolve_python_runner` already degrades to a bare `uv run --with jupyterlab` with no `requirements.txt` present, same as any other code target; the `juv` evaluation this line used to flag is moot
+- [x] Verified end to end: `tests/fixtures/notebook-app` (real subprocess, `tests/test_serve_notebook.py`) — Lab UI reachable, a genuine kernel-execution round trip (start kernel, open its WebSocket, run code, get real stdout back) driven entirely through the actual sidepage proxy port with the proxy's own origin, and the auth gate covering the Lab UI too
 
 ## §13 Account & login
 
@@ -184,6 +186,26 @@ Legend: `[x]` done · `[ ]` not done · `[~]` real but scoped (see the note on t
 
 - [ ] Orchestrator (fleet/process management) — separate product by design, not tracked here beyond noting it's not started
 
+## Registry spec v2: local app registry
+
+*(Not part of the v3/v4 spec numbering — a separate document,
+`sidepage-registry-spec.md`.)*
+
+- [x] CLI: `sidepage app register "<invocation>" <app-name>`
+- [x] CLI: `sidepage app list`
+- [x] CLI: `sidepage app show <app-name> [--with "<preview flags>"]`
+- [x] CLI: `sidepage app unregister <app-name>`
+- [x] CLI: `sidepage serve <app-name> [overrides...]` — `serve`'s existing positional `target` argument, extended: resolves against the registry first, falls back to a literal path unchanged if no such name is registered
+- [x] Core: `sidepage.core.app_registry` — register/get/list_registered/unregister backed by `registry.json` (`sidepage.config.settings.app_registry_file`), distinct from `sidepage.core.registry`'s *running*-apps tracking
+- [x] Resolved (spec's core design goal, verified working): registration is parsed with `serve`'s own real Click command (`sidepage.commands.app_registry._make_serve_context`, `Command.make_context`), not a hand-maintained second parser — a new `serve` flag needs zero changes here to become registerable
+- [x] Resolved (hard rule, enforced at register time): a literal `--token <value>` in a registration invocation is rejected outright, before `sidepage.core.app_registry.register` is ever called; `--env <NAME>` is stored (a vault reference, not a value)
+- [x] Resolved: merge semantics — an explicit command-line flag at `serve <app-name>` time overrides the registered value for that one invocation only (`sidepage.commands.app_registry.merge_with_registered`, using `ctx.get_parameter_source` to distinguish "explicitly passed" from "just the flag's natural default" — not a `None`-sentinel restructure of every flag); the stored registration itself is never mutated by a one-off override
+- [x] Resolved (own design decision, beyond what the spec pinned down): the registered app's runtime `--name` defaults to the registry key itself when neither the registration nor the serving invocation set one explicitly — not the served file's stem, which could be a much less meaningful name for `sidepage ls`/`sidepage stop`
+- [x] Resolved (own design decision): `target` is stored as an absolute, resolved path, not whatever relative string was typed at registration — so `serve <app-name>` works regardless of the shell's cwd later
+- [x] Resolved (own design decision): re-registering an already-registered name is rejected (matching `sidepage.core.process.serve`'s own "already registered" stance for the *running*-apps registry), not a silent overwrite; `unregister`ing an unknown name is likewise rejected, not a no-op — both deliberately stricter than `sidepage.core.secrets_vault`'s idempotent-removal stance, since a small registry of user-chosen names is typo-prone enough that silent success would hide a mistake
+- [x] Found and recorded (not assumed): this installed Typer version (0.27.1) fully vendors its own fork of Click (`typer._click`) rather than using the separately-installed real `click` package for command/context internals — `Command.make_context(...)` errors are `typer._click.exceptions.*`, unrelated to `click.exceptions.*`. See `sidepage.commands.app_registry`'s module docstring for why parsing failures are caught as a broad `Exception` rather than a specific Click exception type as a result
+- [x] Verified end to end: `tests/test_app_registry.py` (fast, in-process — registry round trip, CLI wiring, `--token` rejection, auto-detected `--type` at registration, `show --with` preview not mutating the base) and `tests/test_serve_registry.py` (real subprocess — a registered app's stored `--auth token` actually gates it, a CLI override actually overrides it for one run and leaves the registration untouched, an unregistered name falls back to the pre-registry literal-path behavior unchanged)
+
 ## Parked / unclear status (not numbered in v3)
 
 - [ ] Guardrails & pre/post-processing — kept as a placeholder (`serve --guardrail`,
@@ -200,6 +222,9 @@ Legend: `[x]` done · `[ ]` not done · `[~]` real but scoped (see the note on t
 - [x] Real subprocess integration tests (`tests/test_serve_integration.py`) — static site + Streamlit fixtures, auth gate, `--env` injection, stop/teardown
 - [x] Real subprocess integration tests for FastAPI (`tests/test_serve_fastapi.py`) — port override, `/docs`, `/openapi.json`, POST endpoint, auth gate on docs
 - [x] Real subprocess integration tests for MCP (`tests/test_serve_mcp.py`) — real `initialize` handshake and `tools/call` round trip over Streamable HTTP through the actual proxy, against a fixture deliberately left stdio-only in its own `__main__`; auth gate on `/mcp`
+- [x] Real subprocess integration tests for notebooks (`tests/test_serve_notebook.py`) — Lab UI reachable, a real kernel-execution round trip driven through the actual proxy port with the proxy's own (mismatched-vs-upstream) origin, auth gate on the Lab UI
+- [x] Real subprocess integration tests for the app registry (`tests/test_serve_registry.py`) — a registered app's stored auth tier actually gates it, a CLI override actually overrides it for one run without mutating the registration, an unregistered name falls back to the pre-registry literal-path error
+- [x] Fast in-process tests for the app registry (`tests/test_app_registry.py`) — `sidepage.core.app_registry` round trip (register/get/list/unregister, duplicate rejection, missing-name rejection), the stored JSON shape matching the registry spec's field names, the CLI's `--token` rejection and nonexistent-target rejection, `--type` auto-detection at registration, and `show --with` previewing without mutating the base
 - [x] Real integration tests for `inspect` (`tests/test_inspector.py`) — target resolution, auth auto-sourcing, request execution against the static-site fixture
 - [x] Fast unit tests for dependency resolution (`tests/test_ecosystem.py`) — pins the `.venv`-trust regression fix
 - [x] Fast unit tests for code-launcher detection (`tests/test_target.py`) — Streamlit/FastAPI/MCP import-scan detection for every recognized MCP import style, FastAPI-over-MCP precedence when MCP is mounted inside a FastAPI app, generic-`$PORT` fallback, app-variable extraction and its defaults

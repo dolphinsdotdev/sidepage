@@ -9,9 +9,9 @@ the wrapped process, starts the local reverse proxy
 until interrupted.
 
 **What's real vs. not**, since this orchestrates every other module: static,
-Streamlit-flavored, FastAPI-flavored, and MCP-flavored (Python) code
-targets, `open`/`token` auth, `--env` secret injection, `--anon`
-tunneling, and `--domain` BYO tunneling (see
+Streamlit-flavored, FastAPI-flavored, MCP-flavored (Python), and notebook
+(Jupyter Lab) targets, `open`/`token` auth, `--env` secret injection,
+`--anon` tunneling, and `--domain` BYO tunneling (see
 `sidepage.core.tunnel_manager.open_byo_tunnel`) all actually work.
 Non-local `--scope`, `network`/`oauth` auth, and
 `--guardrail` are rejected up front with a clear `NotImplementedError`
@@ -40,7 +40,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from sidepage.core import account, ecosystem, registry, secrets_vault, tunnel_manager
+from sidepage.core import account, ecosystem, notebook, registry, secrets_vault, tunnel_manager
 from sidepage.core.auth import AuthTier
 from sidepage.core.directory_client import Scope
 from sidepage.core.reverse_proxy import ProxyHandle, start_proxy, stop_proxy
@@ -271,9 +271,21 @@ def serve(config: ServeConfig) -> None:
             auth=config.auth.value,
             token=token,
         )
+    elif target_kind is TargetKind.NOTEBOOK:
+        upstream_port = allocate_port()
+        argv = notebook.build_jupyter_launch_command(target, port=upstream_port)
+        env = {**os.environ, **injected_env}
+        proc = subprocess.Popen(argv, cwd=target.parent, env=env)
+        proxy = start_proxy(
+            app_name,
+            listen_port=listen_port,
+            upstream_port=upstream_port,
+            auth=config.auth.value,
+            token=token,
+        )
     else:
         raise NotImplementedError(
-            f"--type {target_kind} isn't implemented — only code and static are built."
+            f"--type {target_kind} isn't implemented — only code, static, and notebook are built."
         )
 
     if token is not None:

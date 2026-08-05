@@ -110,6 +110,19 @@ def name_bindings_file() -> Path:
     return config_dir() / "name_bindings.json"
 
 
+# --- Local app registry (registry spec v2) — real, used by
+# sidepage.core.app_registry for `sidepage app register|list|show|unregister`
+# and `sidepage serve <app-name>`. Distinct from registry_file() above:
+# that one tracks apps *currently running* on this machine (ephemeral,
+# pruned on process death); this one is a *saved config* a user chose to
+# keep around, with no relationship to whether anything is running right
+# now. Deliberately at state_dir()'s root as `registry.json`, matching the
+# spec's storage note that it's "the same tier as the runtime file (§8)
+# and ports table (§13)" — a small local KV store, not a new subsystem. ---
+def app_registry_file() -> Path:
+    return state_dir() / "registry.json"
+
+
 # --- Not yet backed by anything real ---
 # TODO: cache_dir() / "bin" / "cloudflared" — resolved/downloaded binary
 #       path override; real cloudflared use so far just shells out to PATH.

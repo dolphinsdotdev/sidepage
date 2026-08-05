@@ -2,9 +2,9 @@
 
 Local-first hosting and tunneling for code, static sites, and notebooks.
 `sidepage serve` wraps almost anything — a script, a static site, a
-Streamlit or FastAPI app, a Python MCP server — behind a local reverse
-proxy and hands you a URL. `sidepage new` scaffolds a static site to get
-started.
+Streamlit or FastAPI app, a Python MCP server, a Jupyter notebook —
+behind a local reverse proxy and hands you a URL. `sidepage new`
+scaffolds a static site to get started.
 
 **Status:** `serve`, `secrets`, `inspect`, and bring-your-own-domain
 tunneling are real and tested end to end. Features that need a Sidepage
@@ -43,6 +43,10 @@ uv run sidepage serve tests/fixtures/fastapi-app/app.py --name demo
 # entrypoint, so it's reachable at /mcp regardless
 uv run sidepage serve tests/fixtures/mcp-app/app.py --name demo
 
+# Serve a Jupyter notebook — a full, editable Lab instance with a live
+# kernel, reachable through the proxy like anything else
+uv run sidepage serve tests/fixtures/notebook-app/notebook.ipynb --name demo
+
 # Inject a secret and expose it over a real public tunnel
 uv run sidepage secrets set MY_KEY
 uv run sidepage serve some_app.py --env MY_KEY --anon
@@ -77,6 +81,8 @@ Two things sit between "just run a script" and what `serve` does:
 | `sidepage secrets set\|list\|remove` | Encrypted local vault for standing credentials. |
 | `sidepage account domain set` | Provision a BYO Cloudflare domain — see below. |
 | `sidepage new <name>` | Scaffold a static site. |
+| `sidepage app register "<invocation>" <name>` | Save a `serve` invocation under a short name. |
+| `sidepage app list` / `show <name>` / `unregister <name>` | Manage saved apps — see below. |
 | `sidepage promote <app-name>` | Widen an app's discovery scope. Not yet meaningful — only `local` scope exists today. |
 | `sidepage login` / `sidepage account status` | Not implemented — no Sidepage account backend to talk to yet. |
 
@@ -93,7 +99,8 @@ sidepage serve <target> [--type auto|code|static|notebook] [--name <app-name>]
   third-party `fastmcp` package) and launched with their real launcher
   (`streamlit run`, `uvicorn <module>:<app>`, or `uvicorn --factory
   <module>:<mcp-var>.<app-method>`); anything else falls back to a
-  generic `$PORT`-reading launch. `notebook` isn't implemented yet.
+  generic `$PORT`-reading launch. `notebook` (`.ipynb`) targets get a
+  full, editable Jupyter Lab instance with a live kernel.
   MCP servers are launched by bypassing their own entrypoint entirely
   (same trick as FastAPI) — a script whose `__main__` only calls
   `mcp.run()` (stdio, the default) still ends up served over real
@@ -109,6 +116,41 @@ sidepage serve <target> [--type auto|code|static|notebook] [--name <app-name>]
 Run `sidepage <command> --help` for the full flag list, including ones
 that parse but aren't implemented yet (they report that clearly rather
 than silently doing nothing).
+
+## Saved apps (the local registry)
+
+Save a `serve` invocation under a short name and re-run it without
+retyping flags:
+
+```bash
+sidepage app register "abc.py --auth token" abc-app
+sidepage serve abc-app
+```
+
+Any flag passed at `serve` time overrides the registered one **for that
+one run only** — the saved registration itself is never changed:
+
+```bash
+sidepage serve abc-app --scope web   # runs with --auth token (registered)
+                                      # but --scope web for just this run
+```
+
+`sidepage app show abc-app` prints the saved config; add `--with "<flags>"`
+to preview the effective merged config before actually running it, e.g.
+`sidepage app show abc-app --with "--scope web"`.
+
+A registered app's target is resolved once, at registration time — so
+`--type` is stored as a concrete value (`code`, `static`, `notebook`),
+never "auto." `sidepage app register` **refuses** a literal `--token
+<value>`: auth tokens are per-process and regenerate on every `serve`
+call, so storing one would defeat the point of them being ephemeral.
+`--env <SECRET_NAME>` is fine to save — it's a reference to a vault entry,
+never the secret value itself.
+
+```bash
+sidepage app list
+sidepage app unregister abc-app
+```
 
 ## Bring your own domain
 
@@ -144,11 +186,11 @@ starts with the first app on a domain and stops with the last.
 src/sidepage/
 ├── cli.py           Root Typer app
 ├── commands/        Argument parsing & help text — one module per command group
-├── core/            The SDK: serve/tunnel/proxy orchestration, secrets vault, local registry
+├── core/            The SDK: serve/tunnel/proxy orchestration, secrets vault, running-app registry, saved-app registry
 └── config/          Local config paths (XDG-style, overridable via SIDEPAGE_HOME)
 
 tests/
-├── fixtures/        Real apps used as test targets (static site, Streamlit, FastAPI, MCP)
+├── fixtures/        Real apps used as test targets (static site, Streamlit, FastAPI, MCP, notebook)
 └── test_*.py        Unit and integration tests
 
 docs/
@@ -161,7 +203,7 @@ docs/
 ```bash
 uv sync                 # install runtime + dev deps
 uv run ruff check .     # lint
-uv run pytest           # full suite (~2.5 min; mostly first-run dependency resolves)
+uv run pytest           # full suite (~4 min; mostly first-run dependency resolves)
 ```
 
 Runtime dependencies are real, not stubs: Starlette, uvicorn, httpx, and
@@ -171,17 +213,20 @@ apps' dependencies) are expected to be available wherever tests run.
 
 ## Project status
 
-**Real and tested end to end:** `serve` for static and code targets
-(Streamlit/FastAPI/Python-MCP auto-detected, generic `$PORT` fallback),
-`open`/`token` auth, `--env` secret injection, `--anon` tunneling,
-BYO-domain tunneling (`account domain set` + `serve --domain`), `secrets`,
-`stop`/`ls`/`status`/`usage`, and `inspect` for HTTP/static targets.
+**Real and tested end to end:** `serve` for static, code, and notebook
+targets (Streamlit/FastAPI/Python-MCP auto-detected, generic `$PORT`
+fallback, full Jupyter Lab for `.ipynb`), `open`/`token` auth, `--env`
+secret injection, `--anon` tunneling, BYO-domain tunneling (`account
+domain set` + `serve --domain`), `secrets`, `stop`/`ls`/`status`/`usage`,
+`inspect` for HTTP/static targets, and the local app registry (`app
+register|list|show|unregister` + `serve <app-name>`, with real one-off
+override merging).
 
 **Not implemented, and reports that clearly rather than silently
 no-op'ing:** brokered (default) tunneling, `login`/`account status`, the
-discovery directory beyond this machine, `notebook` targets,
-`--guardrail`, `--auth network`/`oauth`, MCP tool browsing in `inspect`,
-and the OS-keychain backend for the secrets vault (encrypted-file only for
+discovery directory beyond this machine, `--guardrail`, `--auth
+network`/`oauth`, MCP tool browsing in `inspect`, and the OS-keychain
+backend for the secrets vault (encrypted-file only for
 now).
 
 See [`docs/CHECKLIST.md`](docs/CHECKLIST.md) for the full per-feature

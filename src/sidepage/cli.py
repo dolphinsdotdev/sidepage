@@ -10,12 +10,15 @@ Command tree:
   sidepage promote <app-name>                              §5
   sidepage login                                           §13
   sidepage account status                                  §13
-  sidepage account domain set <domain>                     §13 (v4: + --zone/tunnel-token-name)
+  sidepage account domain set <domain>                     §13 (v4: + --api-token-name)
   sidepage usage <app-name>                                §7
   sidepage secrets set|list|remove                         v4 §9
   sidepage inspect [<app-name-or-url>]                     §10
   sidepage ls                                              (no v3 section — see note below)
   sidepage status <app-name>                               (no v3 section — see note below)
+  sidepage app register|list|show|unregister               (registry spec v2, no v3 section)
+  sidepage serve <app-name>                                (registry spec v2 — serve's <target>
+                                                             also accepts a registered app name)
 
 Note: v3 has no "Directory queries" section (v1's §10) — it doesn't
 mention `ls`/`status` at all, jumping from §9 (local reverse proxy) to §10
@@ -50,7 +53,17 @@ from __future__ import annotations
 import typer
 
 from sidepage import __version__
-from sidepage.commands import account, directory, inspect, new, scope, secrets, serve, usage
+from sidepage.commands import (
+    account,
+    app_registry,
+    directory,
+    inspect,
+    new,
+    scope,
+    secrets,
+    serve,
+    usage,
+)
 
 app = typer.Typer(
     name="sidepage",
@@ -107,6 +120,9 @@ app.command("status")(directory.status)
 # §13 — account & login
 app.command("login")(account.login)
 app.add_typer(account.account_app)
+
+# Local app registry (registry spec v2) — sidepage app register|list|show|unregister
+app.add_typer(app_registry.app_app)
 
 
 if __name__ == "__main__":

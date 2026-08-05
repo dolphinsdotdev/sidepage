@@ -15,10 +15,11 @@ what's inside the process:
                    anything else.
   - **static**    — a directory, `index.html` as entry. See
                     `sidepage.core.static`.
-  - **notebook**  — a `.ipynb`. Not implemented this round (not one of the
-                    two prioritized targets); `detect_target_kind` still
-                    recognizes it so `--type` reporting stays honest, but
-                    `sidepage.core.notebook` remains a placeholder.
+  - **notebook**  — a `.ipynb`, served as a full, editable Jupyter Lab
+                    instance with a live kernel. Real — see
+                    `sidepage.core.notebook` for the launch command and
+                    why Jupyter's own origin/XSRF checks need relaxing to
+                    work behind a reverse proxy at all.
 
 `serve` infers the target kind from the path and does not require `--type`
 for these three — `--type` stays as an explicit override for when
