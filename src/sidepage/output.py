@@ -8,7 +8,22 @@ each module rolling its own `print()` calls.
 
 from __future__ import annotations
 
+import sys
+
 from rich.console import Console
+
+# Windows' default console/pipe encoding is the system codepage (cp1252 and
+# friends), not UTF-8 — `success()`'s ✓ (and anything else non-ASCII) would
+# otherwise raise UnicodeEncodeError the first time output actually reaches
+# a real Windows stdout/stderr instead of a UTF-8 pytest/CI capture. `sys.std*`
+# are real `TextIOWrapper`s in that case, so reconfiguring in place fixes it
+# for every print through them, Rich or not.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except ValueError:
+            pass
 
 # Two consoles, mirroring the stdout/stderr split most CLIs need: `stdout`
 # for data a user might pipe (`sidepage ls | jq ...`), `stderr` for status,

@@ -68,6 +68,18 @@ def runtime_dir() -> Path:
     return state_dir() / "runtime"  # <app-name>-<pid>.json, mode 0600
 
 
+# --- Stop-request flag — real, used by sidepage.core.process. `stop`
+# can't rely on OS signals to ask a `serve` process (a separate,
+# unrelated OS process) to run its own graceful teardown: POSIX signal
+# delivery works for that, but there's no cross-console equivalent on
+# Windows (a delivered SIGTERM there just hard-kills via TerminateProcess,
+# skipping the target's cleanup). A flag file `serve`'s own poll loop
+# checks works identically on both, so it's the primary mechanism; the
+# POSIX SIGTERM handler stays too as a bonus path for direct `kill`. ---
+def stop_flag_file(app_name: str) -> Path:
+    return runtime_dir() / f"{app_name}.stop"
+
+
 # --- Local running-app registry — real, used by sidepage.core.process /
 # directory_client for `ls`/`status`/`stop`. Not a cloud directory (there
 # isn't one to talk to) — just what's actually running on this machine.

@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -168,7 +169,7 @@ class _FakeProcess:
     """Stands in for subprocess.Popen for the shared cloudflared process.
     `pid` is synthetic (not a real OS pid) — tests that need liveness
     checks to behave monkeypatch `tunnel_manager._is_pid_alive` /
-    `tunnel_manager.os.kill` rather than relying on a real process, since
+    `tunnel_manager.procutil` rather than relying on a real process, since
     signaling a *real* pid from a test would be unsafe."""
 
     _next_pid = 90001
@@ -211,8 +212,8 @@ def _patch_cloudflare(
 
 class _PidTracker:
     """Backs a fake replacement for tunnel_manager's `_is_pid_alive` and
-    `os.kill` so shared-process lifecycle tests can simulate a process
-    dying on SIGTERM without ever touching a real OS process."""
+    `procutil.terminate` so shared-process lifecycle tests can simulate a
+    process dying on termination without ever touching a real OS process."""
 
     def __init__(self) -> None:
         self.alive: set[int] = set()
@@ -226,28 +227,35 @@ class _PidTracker:
         self.alive.discard(pid)
 
 
-class _FakeOsModule:
-    """Stands in for the `os` name inside `tunnel_manager`'s own module
-    namespace — swapped in via `monkeypatch.setattr(tunnel_manager, "os",
-    ...)`, which rebinds the name *tunnel_manager.py itself* looks up,
-    not the real `os` module object. Mutating the real module's `kill`
-    attribute instead (`tunnel_manager.os.kill = ...`) would be a global
-    change: `sidepage.core.registry` does its own real `os.kill(pid, 0)`
-    liveness checks, and those must keep working normally in these tests
-    — this scoping is what keeps the fake from leaking into it."""
+class _FakeProcutilModule:
+    """Stands in for the `procutil` name inside `tunnel_manager`'s own
+    module namespace — swapped in via `monkeypatch.setattr(tunnel_manager,
+    "procutil", ...)`, which rebinds the name *tunnel_manager.py itself*
+    looks up, not the real `sidepage.core.procutil` module object.
+    Mutating the real module's `terminate` attribute instead
+    (`tunnel_manager.procutil.terminate = ...`) would be a global change:
+    `sidepage.core.process` does its own real `procutil.terminate` calls,
+    and those must keep working normally in these tests — this scoping is
+    what keeps the fake from leaking into it."""
 
     def __init__(self, tracker: _PidTracker) -> None:
         self._tracker = tracker
 
-    def kill(self, pid: int, sig: int) -> None:
-        self._tracker.kill(pid, sig)
+    def terminate(self, pid: int, *, force: bool = False) -> None:
+        # Numeric SIGKILL/SIGTERM values, not the `signal` constants — the
+        # latter's SIGKILL doesn't exist on Windows, and only the fact
+        # *some* signal was recorded is ever asserted on.
+        self._tracker.kill(pid, 9 if force else signal.SIGTERM)
+
+    def popen_detached_kwargs(self) -> dict:
+        return {}
 
 
 @pytest.fixture
 def pid_tracker(monkeypatch: pytest.MonkeyPatch) -> _PidTracker:
     tracker = _PidTracker()
     monkeypatch.setattr(tunnel_manager, "_is_pid_alive", tracker.is_alive)
-    monkeypatch.setattr(tunnel_manager, "os", _FakeOsModule(tracker))
+    monkeypatch.setattr(tunnel_manager, "procutil", _FakeProcutilModule(tracker))
     return tracker
 
 

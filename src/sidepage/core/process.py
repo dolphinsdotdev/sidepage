@@ -40,7 +40,16 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from sidepage.core import account, ecosystem, notebook, registry, secrets_vault, tunnel_manager
+from sidepage.config.settings import stop_flag_file
+from sidepage.core import (
+    account,
+    ecosystem,
+    notebook,
+    procutil,
+    registry,
+    secrets_vault,
+    tunnel_manager,
+)
 from sidepage.core.auth import AuthTier
 from sidepage.core.directory_client import Scope
 from sidepage.core.reverse_proxy import ProxyHandle, start_proxy, stop_proxy
@@ -241,6 +250,7 @@ def serve(config: ServeConfig) -> None:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        stop_flag_file(app_name).unlink(missing_ok=True)
         stdout.print()
         info(f"{app_name} stopped")
 
@@ -336,8 +346,11 @@ def serve(config: ServeConfig) -> None:
         info(f"access token: {token}")
     info("Ctrl+C to stop")
 
+    flag = stop_flag_file(app_name)
     try:
         while True:
+            if flag.exists():
+                break
             time.sleep(1)
     except KeyboardInterrupt:
         pass
@@ -347,39 +360,26 @@ def serve(config: ServeConfig) -> None:
 
 def stop(app_name: str) -> None:
     """Explicit teardown of a running app by name — distinct from Ctrl+C
-    but routed through the same clean-teardown path in `serve` via SIGTERM.
-
-    Checks `registry.is_alive` up front, before ever sending a signal:
-    `os.kill(pid, 0)`/`ProcessLookupError` alone can't tell a genuinely
-    dead pid from a *zombie* one (exited, not yet reaped by whatever
-    spawned it) — POSIX allows signaling a zombie without error. Without
-    this check, a zombie app would fall through to the SIGTERM branch,
-    which also can't detect it died, and `stop` would misreport "didn't
-    stop within 10s" for an app that was already gone — actively
-    misleading, since it implies the app is alive and unresponsive rather
-    than already dead. Both "fully gone" and "zombie" now take the same,
-    already-correct stale-entry path below.
+    but routed through the same clean-teardown path in `serve`, via the
+    stop-request flag file its loop polls (see `stop_flag_file`'s
+    docstring for why not just an OS signal — TerminateProcess on Windows
+    would skip `serve`'s own tunnel/proxy cleanup entirely).
     """
     app = registry.get(app_name)
     if app is None:
         error(f"no running app named {app_name!r}")
         raise SystemExit(1)
 
-    if not registry.is_alive(app.pid):
+    if not procutil.pid_alive(app.pid):
         registry.unregister(app_name)
         info(f"{app_name} wasn't actually running (stale registry entry removed)")
         return
 
-    try:
-        os.kill(app.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        registry.unregister(app_name)
-        info(f"{app_name} wasn't actually running (stale registry entry removed)")
-        return
+    stop_flag_file(app_name).touch()
 
     deadline = time.time() + 10
     while time.time() < deadline:
-        if not registry.is_alive(app.pid):
+        if not procutil.pid_alive(app.pid):
             break
         time.sleep(0.2)
     else:

@@ -57,13 +57,11 @@ Three modes, selected by what `serve` was given:
 from __future__ import annotations
 
 import base64
-import fcntl
 import json
 import os
 import queue
 import re
 import shutil
-import signal
 import subprocess
 import threading
 import time
@@ -81,9 +79,18 @@ from sidepage.config.settings import (
     tunnel_pid_file,
     tunnels_dir,
 )
-from sidepage.core import registry, secrets_vault
+from sidepage.core import procutil, registry, secrets_vault
 from sidepage.core.directory_client import check_name
 from sidepage.core.exceptions import CloudflaredResolutionError, TunnelError
+
+_IS_WINDOWS = os.name == "nt"  # resolved once, not via `os.name` at call time — tests
+# monkeypatch the module-local `os` name for pid-liveness faking, and a live lookup would
+# break against that fake (it doesn't carry `.name`).
+
+if _IS_WINDOWS:
+    import msvcrt
+else:
+    import fcntl
 
 _TRYCLOUDFLARE_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 # Same precedented "eyeball the log for an obvious failure word" pattern
@@ -308,20 +315,35 @@ def _domain_lock(domain: str):
     """
     tunnels_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
     lock_path = tunnel_lock_file(domain)
-    with open(lock_path, "w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+    # "a+b" on Windows, never "w": `msvcrt.locking` locks a byte *of existing
+    # content*, and Windows enforces that lock against every handle, not just
+    # the one that took it — a contender's own `open(..., "w")` truncating
+    # the file out from under the lock holder would make its later write
+    # into that now-reallocated byte raise PermissionError instead of
+    # blocking. Append mode never truncates, so the byte both sides lock
+    # stays put across the whole race.
+    mode = "a+b" if _IS_WINDOWS else "w"
+    with open(lock_path, mode) as fh:
+        if _IS_WINDOWS:
+            fh.seek(0, 2)  # SEEK_END
+            if fh.tell() == 0:
+                fh.write(b"0")
+                fh.flush()
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(fh, fcntl.LOCK_EX)
         try:
             yield
         finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+            if _IS_WINDOWS:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fh, fcntl.LOCK_UN)
 
 
-def _is_pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+_is_pid_alive = procutil.pid_alive
 
 
 def _ensure_shared_tunnel_running(domain: str, tunnel_token: str) -> None:
@@ -353,19 +375,14 @@ def _ensure_shared_tunnel_running(domain: str, tunnel_token: str) -> None:
         pid_file.unlink()  # stale: process died without going through _stop_shared_tunnel_if_unused
 
     binary = resolve_cloudflared_binary()
-    tunnels_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
     log_file = tunnel_log_file(domain)
-    log_handle = log_file.open("w")
-    try:
+    with open(log_file, "a") as log_fh:
         proc = subprocess.Popen(
             [str(binary), "tunnel", "run", "--token", tunnel_token],
-            stdout=log_handle,
+            stdout=log_fh,
             stderr=subprocess.STDOUT,
-            start_new_session=True,
+            **procutil.popen_detached_kwargs(),
         )
-    finally:
-        log_handle.close()  # child has its own duped fd — ours would just leak otherwise
-
     # cloudflared fails fast on a bad token/auth error — give it a moment
     # before declaring success and detaching from it. Also checks the log
     # for an obvious failure marker, not just "did the process crash yet"
@@ -408,17 +425,14 @@ def _stop_shared_tunnel_if_unused(domain: str) -> None:
     if not _is_pid_alive(pid):
         return
     try:
-        os.kill(pid, signal.SIGTERM)
+        procutil.terminate(pid)
     except OSError:
         return
     deadline = time.monotonic() + 5.0
     while time.monotonic() < deadline and _is_pid_alive(pid):
         time.sleep(0.1)
     if _is_pid_alive(pid):
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
+        procutil.terminate(pid, force=True)
 
 
 def provision_byo_domain(domain: str, api_token: str) -> ProvisionedTunnel:

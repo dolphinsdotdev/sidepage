@@ -90,7 +90,18 @@ def _make_serve_context(invocation: str, *, placeholder_target: bool = False):
     `serve`'s positional `target` argument is required, so a harmless
     placeholder is prepended and never read back out.
     """
-    args = shlex.split(invocation)
+    # Not plain `shlex.split`: its posix mode treats `\` as an escape
+    # character, silently eating every backslash in a Windows path
+    # (`C:\apps\foo.py` -> `C:appsfoo.py`) before `serve`'s own parser ever
+    # sees it. `escape = ""` keeps whitespace-splitting and quote-stripping
+    # (so `--name "my app"` still works) without that POSIX-shell behavior,
+    # which nothing here actually wants — this string is a stored
+    # invocation, not a real shell command line.
+    lexer = shlex.shlex(invocation, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    lexer.escape = ""
+    args = list(lexer)
     if placeholder_target:
         args = ["__sidepage_placeholder_target__", *args]
     try:

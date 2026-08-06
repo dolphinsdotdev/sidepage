@@ -68,6 +68,43 @@ Two things sit between "just run a script" and what `serve` does:
   `*.trycloudflare.com` URL, or `--domain <domain>` for your own
   Cloudflare domain (see [Bring your own domain](#bring-your-own-domain)
   below). Without either flag, `serve` just listens on `127.0.0.1`.
+  Both modes shell out to a real `cloudflared` binary — see [Installing
+  cloudflared](#installing-cloudflared).
+
+## Installing cloudflared
+
+`--anon` and `--domain` both need a real `cloudflared` binary on `PATH`.
+Sidepage doesn't download or bundle one — it looks it up with
+`shutil.which("cloudflared")`, or at an explicit path via
+`--cloudflared-path` / `SIDEPAGE_CLOUDFLARED_PATH` if PATH isn't where you
+keep it.
+
+**macOS** (Homebrew):
+```bash
+brew install cloudflare/cloudflare/cloudflared
+```
+
+**Linux** (Debian/Ubuntu, via Cloudflare's apt repo):
+```bash
+sudo mkdir -p --mode=0755 /usr/share/keyrings
+curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main' | sudo tee /etc/apt/sources.list.d/cloudflared.list
+sudo apt-get update && sudo apt-get install cloudflared
+```
+Other distros: grab a binary from the [releases
+page](https://github.com/cloudflare/cloudflared/releases) and put it on
+`PATH`.
+
+**Windows**:
+```powershell
+winget install --id Cloudflare.cloudflared
+```
+(or `scoop install cloudflared` / `choco install cloudflared`)
+
+Verify on any platform:
+```bash
+cloudflared --version
+```
 
 ## Commands
 
@@ -208,8 +245,9 @@ uv run pytest           # full suite (~4 min; mostly first-run dependency resolv
 
 Runtime dependencies are real, not stubs: Starlette, uvicorn, httpx, and
 `websockets` back the reverse proxy; `cryptography` backs the secrets
-vault. `cloudflared` and network access (for `uv run` to resolve wrapped
-apps' dependencies) are expected to be available wherever tests run.
+vault. `cloudflared` ([install instructions](#installing-cloudflared)) and
+network access (for `uv run` to resolve wrapped apps' dependencies) are
+expected to be available wherever tests run.
 
 ## Project status
 
