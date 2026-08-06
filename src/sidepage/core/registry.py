@@ -16,9 +16,19 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from dataclasses import asdict, dataclass
 
 from sidepage.config.settings import ensure_dirs, registry_file
+
+# Captured at import time, before any test can monkeypatch `subprocess.Popen`
+# — `is_alive`'s `ps` shell-out must stay real even when a test fakes Popen
+# process-wide to simulate an unrelated subprocess (e.g. `cloudflared` in
+# `tests/test_tunnel_byo.py`). Calling `subprocess.run`/`subprocess.Popen`
+# directly would still resolve to the monkeypatched name at call time; this
+# doesn't, for the same reason `test_tunnel_byo.py` itself captures
+# `_RealHttpxClient = httpx.Client` before patching `httpx.Client`.
+_real_popen = subprocess.Popen
 
 
 @dataclass
@@ -67,12 +77,41 @@ def unregister(name: str) -> None:
     _save(data)
 
 
-def _is_alive(pid: int) -> bool:
+def is_alive(pid: int) -> bool:
+    """True if `pid` refers to a live, non-zombie process.
+
+    `os.kill(pid, 0)` alone isn't enough: POSIX lets you signal a zombie
+    (a process that has exited but whose parent hasn't reaped it yet)
+    without error, so a dead-but-unreaped process would otherwise be
+    reported as still running indefinitely — which is exactly what let a
+    dead app keep showing up in `sidepage ls` and made `sidepage stop`
+    report a false "didn't stop within 10s" instead of recognizing it was
+    already gone. Shelling out to `ps` is what actually distinguishes a
+    zombie from a live process — there's no `/proc` on macOS, and this
+    project already assumes a POSIX `ps` is available (same assumption
+    `fcntl`-based locking in `sidepage.core.tunnel_manager` makes).
+
+    Public — also used by `sidepage.core.process.stop()`, not just
+    `list_running` below.
+    """
     try:
         os.kill(pid, 0)
     except OSError:
         return False
-    return True
+    try:
+        with _real_popen(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ) as proc:
+            stdout, _ = proc.communicate(timeout=5)
+    except OSError:
+        return True  # `ps` itself unavailable — fall back to the kill(0) result
+    state = stdout.strip()
+    if not state:
+        return False  # ps found nothing — pid was reaped between the two checks
+    return not state.startswith("Z")
 
 
 def get(name: str) -> RunningApp | None:
@@ -89,7 +128,7 @@ def list_running(*, prune_dead: bool = True) -> list[RunningApp]:
     changed = False
     for name, raw in list(data.items()):
         app = RunningApp(**raw)
-        if prune_dead and not _is_alive(app.pid):
+        if prune_dead and not is_alive(app.pid):
             del data[name]
             changed = True
             continue

@@ -348,11 +348,27 @@ def serve(config: ServeConfig) -> None:
 def stop(app_name: str) -> None:
     """Explicit teardown of a running app by name — distinct from Ctrl+C
     but routed through the same clean-teardown path in `serve` via SIGTERM.
+
+    Checks `registry.is_alive` up front, before ever sending a signal:
+    `os.kill(pid, 0)`/`ProcessLookupError` alone can't tell a genuinely
+    dead pid from a *zombie* one (exited, not yet reaped by whatever
+    spawned it) — POSIX allows signaling a zombie without error. Without
+    this check, a zombie app would fall through to the SIGTERM branch,
+    which also can't detect it died, and `stop` would misreport "didn't
+    stop within 10s" for an app that was already gone — actively
+    misleading, since it implies the app is alive and unresponsive rather
+    than already dead. Both "fully gone" and "zombie" now take the same,
+    already-correct stale-entry path below.
     """
     app = registry.get(app_name)
     if app is None:
         error(f"no running app named {app_name!r}")
         raise SystemExit(1)
+
+    if not registry.is_alive(app.pid):
+        registry.unregister(app_name)
+        info(f"{app_name} wasn't actually running (stale registry entry removed)")
+        return
 
     try:
         os.kill(app.pid, signal.SIGTERM)
@@ -363,9 +379,7 @@ def stop(app_name: str) -> None:
 
     deadline = time.time() + 10
     while time.time() < deadline:
-        try:
-            os.kill(app.pid, 0)
-        except ProcessLookupError:
+        if not registry.is_alive(app.pid):
             break
         time.sleep(0.2)
     else:

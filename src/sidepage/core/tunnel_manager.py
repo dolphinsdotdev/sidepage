@@ -77,6 +77,7 @@ import httpx
 from sidepage.config.settings import (
     cloudflared_binary_path,
     tunnel_lock_file,
+    tunnel_log_file,
     tunnel_pid_file,
     tunnels_dir,
 )
@@ -85,6 +86,10 @@ from sidepage.core.directory_client import check_name
 from sidepage.core.exceptions import CloudflaredResolutionError, TunnelError
 
 _TRYCLOUDFLARE_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+# Same precedented "eyeball the log for an obvious failure word" pattern
+# tests/fixtures/mcp-control-app and the sidepage-serve skill's
+# scripts/start_site.sh already use for this exact purpose.
+_CF_STARTUP_ERROR_RE = re.compile(r"error|failed|fatal", re.IGNORECASE)
 _CF_API_BASE = "https://api.cloudflare.com/client/v4"
 _CATCH_ALL_RULE = {"service": "http_status:404"}
 
@@ -331,6 +336,14 @@ def _ensure_shared_tunnel_running(domain: str, tunnel_token: str) -> None:
     exits. Tracked by pid file rather than by any in-memory handle, since
     a later `serve`/`stop` call — a different OS process — is what needs
     to find or kill it.
+
+    stdout/stderr go to `tunnel_log_file(domain)`, never an unread
+    `subprocess.PIPE` — this process can live for hours across many
+    `serve`/`stop` cycles on the same domain, and nothing here ever reads
+    a `PIPE`'s buffer, so an unread one would eventually fill (~64KB) and
+    make `cloudflared` block on its own `write()` — silently, no crash,
+    no further output, indistinguishable from the outside from "the
+    tunnel just stopped working." See `tunnel_log_file`'s docstring.
     """
     pid_file = tunnel_pid_file(domain)
     if pid_file.exists():
@@ -340,20 +353,35 @@ def _ensure_shared_tunnel_running(domain: str, tunnel_token: str) -> None:
         pid_file.unlink()  # stale: process died without going through _stop_shared_tunnel_if_unused
 
     binary = resolve_cloudflared_binary()
-    proc = subprocess.Popen(
-        [str(binary), "tunnel", "run", "--token", tunnel_token],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        start_new_session=True,
-    )
+    tunnels_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
+    log_file = tunnel_log_file(domain)
+    log_handle = log_file.open("w")
+    try:
+        proc = subprocess.Popen(
+            [str(binary), "tunnel", "run", "--token", tunnel_token],
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        log_handle.close()  # child has its own duped fd — ours would just leak otherwise
+
     # cloudflared fails fast on a bad token/auth error — give it a moment
-    # before declaring success and detaching from it.
+    # before declaring success and detaching from it. Also checks the log
+    # for an obvious failure marker, not just "did the process crash yet"
+    # — a weak signal on its own, now backed by a real log to fall back on.
     time.sleep(1.5)
     if proc.poll() is not None:
         raise TunnelError(
             f"cloudflared exited early (code {proc.returncode}) starting the shared "
-            f"tunnel for {domain}"
+            f"tunnel for {domain} — see {log_file}"
+        )
+    text = log_file.read_text(errors="replace") if log_file.exists() else ""
+    if _CF_STARTUP_ERROR_RE.search(text):
+        proc.terminate()
+        raise TunnelError(
+            f"cloudflared reported a failure starting the shared tunnel for {domain} "
+            f"— see {log_file}"
         )
     pid_file.write_text(str(proc.pid))
 

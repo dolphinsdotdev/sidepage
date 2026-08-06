@@ -98,6 +98,19 @@ def tunnel_lock_file(domain: str) -> Path:
     return tunnels_dir() / f"{domain}.lock"
 
 
+def tunnel_log_file(domain: str) -> Path:
+    """Where the shared `cloudflared` process's stdout/stderr are
+    redirected — never left as an unread `subprocess.PIPE`, since that
+    process lives far longer than any single `serve` call (reused across
+    every app on `domain`) and can accumulate enough output over that
+    lifetime to fill the OS pipe buffer, at which point `cloudflared`
+    blocks on its own `write()` — silently, with no crash and no further
+    output, exactly mimicking "the tunnel stopped working." A real file
+    both avoids that and gives something to actually inspect when
+    `cloudflared` fails to connect."""
+    return tunnels_dir() / f"{domain}.log"
+
+
 def tunnel_pid_file(domain: str) -> Path:
     return tunnels_dir() / f"{domain}.pid"
 

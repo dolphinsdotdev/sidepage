@@ -31,6 +31,7 @@ import os
 import re
 import shlex
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -64,6 +65,21 @@ def _run_direct(argv: list[str]) -> dict:
     return {"exit_code": proc.returncode, "output": output.strip()}
 
 
+def _reap(proc: subprocess.Popen, log_file: Path) -> None:
+    """Waits on a detached `serve` subprocess in the background so it
+    never sits as a zombie under this long-running MCP server — nothing
+    else ever calls `.wait()`/`.poll()` on it again once `_start_background`
+    returns, and a zombie PID defeats `sidepage stop`'s own liveness check
+    (POSIX lets you signal a zombie without error, so `sidepage stop`
+    can't tell it's already dead — see `sidepage.core.registry.is_alive`).
+    Also surfaces a crash that happens *after* `_start_background` already
+    reported "running"/"starting", which would otherwise be silent."""
+    returncode = proc.wait()
+    if returncode != 0:
+        with log_file.open("a") as fh:
+            fh.write(f"[mcp-control-app] process exited with code {returncode}\n")
+
+
 def _start_background(serve_args: list[str], *, app_name: str) -> dict:
     """Launch `sidepage serve <serve_args>` detached and poll its log for a
     URL or an error, same algorithm as `scripts/start_site.sh`."""
@@ -77,6 +93,8 @@ def _start_background(serve_args: list[str], *, app_name: str) -> dict:
         stderr=subprocess.STDOUT,
         start_new_session=True,
     )
+    log_handle.close()  # the child already has its own duped fd; ours would just leak
+    threading.Thread(target=_reap, args=(proc, log_file), daemon=True).start()
 
     status = "starting"
     url = ""

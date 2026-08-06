@@ -181,6 +181,9 @@ class _FakeProcess:
     def poll(self) -> int | None:
         return self.returncode
 
+    def terminate(self) -> None:
+        self.returncode = -15  # SIGTERM, mirroring what a real Popen would end up with
+
 
 def _patch_cloudflare(
     monkeypatch: pytest.MonkeyPatch, *, popen_exits_early: bool = False
@@ -417,10 +420,11 @@ def test_shared_tunnel_process_killed_only_when_last_app_stops(
     h2 = _open(transport, provisioned, "app-two", 7002, domain="example.com")
 
     # registry.list_running prunes entries whose pid isn't alive (see
-    # sidepage.core.registry._is_alive) — that's a *real*, unpatched
-    # os.kill(pid, 0) check, so these entries need a genuinely-alive pid,
-    # not an arbitrary placeholder. The test process's own pid qualifies
-    # and is guaranteed alive for the duration of the test.
+    # sidepage.core.registry.is_alive) — that's a *real*, unpatched
+    # liveness check (os.kill(pid, 0) plus a `ps` zombie check), so these
+    # entries need a genuinely-alive pid, not an arbitrary placeholder.
+    # The test process's own pid qualifies and is guaranteed alive for
+    # the duration of the test.
     this_pid = os.getpid()
     registry.register(
         registry.RunningApp(
@@ -475,6 +479,54 @@ def test_shared_tunnel_process_start_failure_raises(
 
     with pytest.raises(TunnelError, match="cloudflared exited early"):
         _open(transport, provisioned, "doomed-app", 8000, domain="example.com")
+
+
+def test_shared_tunnel_output_goes_to_log_file_not_pipe(
+    sidepage_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression check: stdout/stderr must never be an unread
+    `subprocess.PIPE` — this process outlives any single `serve` call, so
+    an unread PIPE would eventually fill its OS buffer and make
+    `cloudflared` block on its own `write()`, silently. Must go to
+    `tunnel_log_file(domain)` instead — a real file, never fills up."""
+    from sidepage.config.settings import tunnel_log_file
+
+    transport, provisioned = _provision(monkeypatch)
+    captured_kwargs: dict = {}
+
+    def inspecting_popen(*a, **k):
+        captured_kwargs.update(k)
+        return _FakeProcess()
+
+    monkeypatch.setattr(subprocess, "Popen", inspecting_popen)
+
+    _open(transport, provisioned, "app-one", 9001, domain="example.com")
+
+    assert captured_kwargs["stdout"] != subprocess.PIPE
+    assert tunnel_log_file("example.com").exists()
+
+
+def test_shared_tunnel_error_marker_in_log_raises(
+    sidepage_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """cloudflared doesn't always crash immediately on a bad token/config
+    — it can log an error while `proc.poll()` still reports it as alive.
+    `_ensure_shared_tunnel_running` must catch that from the log instead
+    of optimistically declaring success just because the process hasn't
+    exited yet (same precedented "grep the log for an error word"
+    pattern `scripts/start_site.sh` and `tests/fixtures/mcp-control-app`
+    already use)."""
+    transport, provisioned = _provision(monkeypatch)
+
+    def error_logging_popen(*a, **k):
+        k["stdout"].write("failed to register connection: bad token\n")
+        k["stdout"].flush()
+        return _FakeProcess()  # stays "alive" — returncode is None
+
+    monkeypatch.setattr(subprocess, "Popen", error_logging_popen)
+
+    with pytest.raises(TunnelError, match="reported a failure"):
+        _open(transport, provisioned, "doomed-app", 8100, domain="example.com")
 
 
 def test_stale_pidfile_from_dead_process_is_replaced(
