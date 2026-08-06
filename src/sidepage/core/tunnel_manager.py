@@ -74,7 +74,12 @@ from pathlib import Path
 
 import httpx
 
-from sidepage.config.settings import tunnel_lock_file, tunnel_pid_file, tunnels_dir
+from sidepage.config.settings import (
+    cloudflared_binary_path,
+    tunnel_lock_file,
+    tunnel_pid_file,
+    tunnels_dir,
+)
 from sidepage.core import registry, secrets_vault
 from sidepage.core.directory_client import check_name
 from sidepage.core.exceptions import CloudflaredResolutionError, TunnelError
@@ -608,22 +613,31 @@ def close_tunnel(handle: TunnelHandle) -> None:
 def resolve_cloudflared_binary(*, override_path: Path | None = None) -> Path:
     """Locate a usable `cloudflared` binary.
 
-    Implements the first two of the spec's four resolution steps for real:
+    Implements three of the spec's four resolution steps for real:
 
     1. `override_path` (`--cloudflared-path` / `SIDEPAGE_CLOUDFLARED_PATH`
        — reading the env var itself is `serve`'s job, this function just
        takes the resolved value).
-    2. `PATH` lookup (`shutil.which`).
+    2. `PATH` lookup (`shutil.which`) — covers a system package manager
+       install (`brew install cloudflared`, etc.) same as before.
+    3. Sidepage's own managed cache
+       (`sidepage.config.settings.cloudflared_binary_path`, what
+       `sidepage setup` / `sidepage.core.cloudflared_installer` installs
+       into). Checked directly rather than only via `PATH`, since the
+       PATH-discoverable symlink `setup` also places in a user-local or
+       venv bin dir may not be on *this* process's `PATH` (e.g. a fresh
+       shell that hasn't picked up a `~/.local/bin` addition yet) even
+       though the binary itself is right there.
 
-    Steps 3 (local cache download) and 4 (download-on-first-run, checksum
-    verified) are **not implemented** — they require fetching and verifying
-    a real binary from Cloudflare's release infrastructure, out of scope
-    for this round. Not a practical gap today: `cloudflared` installed via
-    a system package manager (as this environment has it) satisfies step 2
-    every time.
+    Step 4 (silent download-on-first-run) is **not implemented**,
+    deliberately: `sidepage setup` is meant to be the one explicit,
+    opt-in place this package reaches the network for a binary — doing it
+    silently from inside a `serve` call would be a surprise this project's
+    "explicit about unfinished features, not a silent no-op" stance
+    doesn't allow.
 
-    Raises `sidepage.core.exceptions.CloudflaredResolutionError` if neither
-    step finds a usable binary.
+    Raises `sidepage.core.exceptions.CloudflaredResolutionError` if none of
+    the three implemented steps finds a usable binary.
     """
     if override_path is not None:
         if override_path.is_file():
@@ -634,8 +648,11 @@ def resolve_cloudflared_binary(*, override_path: Path | None = None) -> Path:
     if found is not None:
         return Path(found)
 
+    managed = cloudflared_binary_path()
+    if managed.is_file():
+        return managed
+
     raise CloudflaredResolutionError(
-        "cloudflared not found on PATH, and no override given. "
-        "Local-cache / download-on-first-run resolution isn't implemented "
-        "— install cloudflared (e.g. `brew install cloudflared`) for now."
+        "cloudflared is not installed, which restricts tunnel functionality "
+        "(`serve --anon` / `serve --domain`). Run `sidepage setup` to install it."
     )

@@ -123,9 +123,22 @@ def app_registry_file() -> Path:
     return state_dir() / "registry.json"
 
 
+# --- `cloudflared` managed install (sidepage setup /
+# sidepage.core.cloudflared_installer) — real. `sidepage setup` downloads
+# into this fixed, sidepage-managed location regardless of where (or
+# whether) it also places a PATH-discoverable symlink/copy, so
+# `sidepage.core.tunnel_manager.resolve_cloudflared_binary` always has a
+# non-PATH-dependent fallback to check. ---
+def cloudflared_bin_dir() -> Path:
+    return cache_dir() / "bin"
+
+
+def cloudflared_binary_path() -> Path:
+    name = "cloudflared.exe" if os.name == "nt" else "cloudflared"
+    return cloudflared_bin_dir() / name
+
+
 # --- Not yet backed by anything real ---
-# TODO: cache_dir() / "bin" / "cloudflared" — resolved/downloaded binary
-#       path override; real cloudflared use so far just shells out to PATH.
 # TODO: cache_dir() / "directory.json" — last-known cloud directory listing
 #       for offline `ls`/`status` — moot until a cloud directory exists.
 

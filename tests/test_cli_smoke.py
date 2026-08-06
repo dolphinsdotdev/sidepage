@@ -51,6 +51,7 @@ LEAF_INVOCATIONS = [
 
 HELP_TARGETS = [
     [],
+    ["setup", "--help"],
     ["new", "--help"],
     ["serve", "--help"],
     ["stop", "--help"],

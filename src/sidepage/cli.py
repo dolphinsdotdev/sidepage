@@ -4,6 +4,7 @@ only; see each `sidepage.commands.*` module for the spec section it
 implements.
 
 Command tree:
+  sidepage setup                                           (not in spec — see note below)
   sidepage new <name>                                     §1
   sidepage serve <target>                                  §2
   sidepage stop <app-name>                                 §2
@@ -19,6 +20,12 @@ Command tree:
   sidepage app register|list|show|unregister               (registry spec v2, no v3 section)
   sidepage serve <app-name>                                (registry spec v2 — serve's <target>
                                                              also accepts a registered app name)
+
+Note: `sidepage setup` isn't a v1/v3/v4 spec command at all — it's a
+`pip install sidepage` packaging concern (installing the `cloudflared`
+binary tunnel functionality needs without making it a Python dependency
+or vendoring it into the wheel). See `sidepage.core.cloudflared_installer`
+and `sidepage.commands.setup`.
 
 Note: v3 has no "Directory queries" section (v1's §10) — it doesn't
 mention `ls`/`status` at all, jumping from §9 (local reverse proxy) to §10
@@ -62,6 +69,7 @@ from sidepage.commands import (
     scope,
     secrets,
     serve,
+    setup,
     usage,
 )
 
@@ -95,6 +103,12 @@ def main(
 ) -> None:
     """sidepage — local-first hosting, tunneling, and directory."""
 
+
+# Not a numbered spec section — `pip install sidepage` packaging concern,
+# not a v1/v3/v4 feature. Installs `cloudflared` (see
+# sidepage.core.cloudflared_installer) without making it a Python
+# dependency or vendoring it into the wheel.
+app.command("setup")(setup.setup)
 
 # §1 — targets / scaffolding
 app.command("new")(new.new)

@@ -43,6 +43,13 @@ class CloudflaredResolutionError(TunnelError):
     """
 
 
+class CloudflaredInstallError(TunnelError):
+    """`sidepage setup` (`sidepage.core.cloudflared_installer`) could not
+    detect the platform, find a matching release asset, download it,
+    unpack it, or get a working `--version` out of the result.
+    """
+
+
 class TunnelProvisioningError(TunnelError):
     """`sidepage account domain set` created a tunnel on Cloudflare but a
     later step (almost always persisting its run-token to the vault)
