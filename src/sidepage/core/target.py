@@ -6,13 +6,13 @@ app-type list (streamlit/api/mcp) with a wrapping model that doesn't care
 what's inside the process:
 
   - **code**     — any HTTP-serving process. Real support here covers
-                   Streamlit, FastAPI, and Python MCP servers specifically
-                   (detected by scanning the source for a recognizable
-                   import) plus a generic Python fallback that assumes the
-                   app reads `$PORT` — building a launcher for every
-                   possible framework is out of scope; this covers the
-                   frameworks actually asked for and degrades honestly for
-                   anything else.
+                   Streamlit, Mxlit, FastAPI, and Python MCP servers
+                   specifically (detected by scanning the source for a
+                   recognizable import) plus a generic Python fallback that
+                   assumes the app reads `$PORT` — building a launcher for
+                   every possible framework is out of scope; this covers
+                   the frameworks actually asked for and degrades honestly
+                   for anything else.
   - **static**    — a directory, `index.html` as entry. See
                     `sidepage.core.static`.
   - **notebook**  — a `.ipynb`, served as a full, editable Jupyter Lab
@@ -31,6 +31,9 @@ No manual port handling by the caller. Sidepage allocates a real OS-assigned
 port (`bind(0)`) and injects it into the wrapped process:
   - Streamlit: `--server.port <port> --server.headless true --server.address
     127.0.0.1` launcher flags.
+  - Mxlit (a Streamlit-alternative built on FastAPI/HTMX — detected by
+    `import mxlit`): `mxlit run <target> --host 127.0.0.1 --port <port>`,
+    its own CLI's equivalent of `streamlit run`.
   - FastAPI: launched via `uvicorn <module>:<app> --host 127.0.0.1 --port
     <port>` instead of running the script directly — this bypasses
     whatever the script's own `if __name__ == "__main__":` block does
@@ -88,6 +91,7 @@ class CodeLauncher(StrEnum):
     port is injected."""
 
     STREAMLIT = "streamlit"
+    MXLIT = "mxlit"
     FASTAPI = "fastapi"
     MCP = "mcp"
     GENERIC_PYTHON = "generic_python"  # assumes $PORT
@@ -146,17 +150,22 @@ def _has_mcp_import(source: str) -> bool:
 
 def detect_code_launcher(target: Path) -> CodeLauncher:
     """Scan `target`'s source for a recognizable framework import.
-    Streamlit, FastAPI, and MCP apps get real launcher-specific port
-    injection; everything else falls back to the generic `$PORT`
+    Streamlit, Mxlit, FastAPI, and MCP apps get real launcher-specific
+    port injection; everything else falls back to the generic `$PORT`
     convention.
 
-    Checked in this order — Streamlit, then FastAPI, then MCP — so a
-    script that mounts an MCP server *inside* a FastAPI app (a common real
-    pattern, e.g. `app.mount("/mcp", mcp_server.streamable_http_app())`)
-    is still correctly detected as FASTAPI: the top-level ASGI app to
-    actually launch is the FastAPI one, and `uvicorn <module>:app` already
-    serves everything mounted on it, MCP sub-route included. Only a
-    standalone MCP script with no FastAPI import falls through to MCP.
+    Checked in this order — Streamlit, then Mxlit, then FastAPI, then MCP
+    — so a script that mounts an MCP server *inside* a FastAPI app (a
+    common real pattern, e.g. `app.mount("/mcp",
+    mcp_server.streamable_http_app())`) is still correctly detected as
+    FASTAPI: the top-level ASGI app to actually launch is the FastAPI one,
+    and `uvicorn <module>:app` already serves everything mounted on it,
+    MCP sub-route included. Only a standalone MCP script with no FastAPI
+    import falls through to MCP. Mxlit is checked before FastAPI even
+    though Mxlit itself is FastAPI-backed internally, because a target
+    script imports `mxlit`, not `fastapi`, directly — no ordering conflict
+    in practice, but Mxlit is checked first regardless since it's the more
+    specific match.
     """
     try:
         source = target.read_text(errors="ignore")
@@ -164,6 +173,8 @@ def detect_code_launcher(target: Path) -> CodeLauncher:
         return CodeLauncher.GENERIC_PYTHON
     if "import streamlit" in source or "from streamlit" in source:
         return CodeLauncher.STREAMLIT
+    if "import mxlit" in source or "from mxlit" in source:
+        return CodeLauncher.MXLIT
     if "from fastapi import" in source or "import fastapi" in source:
         return CodeLauncher.FASTAPI
     if _has_mcp_import(source):

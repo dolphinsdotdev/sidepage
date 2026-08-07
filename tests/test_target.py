@@ -40,6 +40,11 @@ def test_detects_streamlit(tmp_path: Path) -> None:
     assert detect_code_launcher(target) is CodeLauncher.STREAMLIT
 
 
+def test_detects_mxlit(tmp_path: Path) -> None:
+    target = _write(tmp_path, "app.py", "import mxlit as mt\nmt.title('hi')\n")
+    assert detect_code_launcher(target) is CodeLauncher.MXLIT
+
+
 def test_detects_fastapi(tmp_path: Path) -> None:
     target = _write(tmp_path, "app.py", "from fastapi import FastAPI\napp = FastAPI()\n")
     assert detect_code_launcher(target) is CodeLauncher.FASTAPI

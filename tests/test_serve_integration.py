@@ -1,5 +1,6 @@
-"""Integration tests for `sidepage serve` and `sidepage secrets` against the
-two prioritized real fixtures: a static HTML site and a Streamlit app.
+"""Integration tests for `sidepage serve` and `sidepage secrets` against
+prioritized real fixtures: a static HTML site, a Streamlit app, and a
+Mxlit app.
 
 These launch the actual CLI as a subprocess and talk to it over real HTTP/
 WebSocket — slower than the unit-style tests in `test_cli_smoke.py`, but
@@ -192,6 +193,27 @@ def test_serve_missing_secret_fails_loud(sidepage_home: Path, tmp_path: Path) ->
     )
     assert result.returncode != 0
     assert "NOPE" in result.stdout + result.stderr
+
+
+def test_serve_mxlit_app(sidepage_home: Path) -> None:
+    """Mirrors test_serve_streamlit_app: mxlit is a Streamlit alternative
+    (FastAPI/HTMX under the hood) launched via its own `mxlit run` CLI —
+    first run resolves it via `uv run --with-requirements`."""
+    env = {**os.environ, "SIDEPAGE_HOME": str(sidepage_home)}
+    proc = _run_serve([str(FIXTURES / "mxlit-app" / "app.py"), "--name", "it-mxlit"], env=env)
+    try:
+        app = _wait_for_registry_entry(sidepage_home, "it-mxlit", timeout=60)
+        resp = _poll_until_ready(app["url"], timeout=30)
+        assert resp.status_code == 200
+        assert "Mxlit" in resp.text
+
+        usage = subprocess.run(
+            [SIDEPAGE_BIN, "usage", "it-mxlit"], env=env, capture_output=True, text=True
+        )
+        assert "http requests" in usage.stdout
+    finally:
+        _stop("it-mxlit", env)
+        proc.wait(timeout=20)
 
 
 def test_serve_streamlit_app(sidepage_home: Path) -> None:

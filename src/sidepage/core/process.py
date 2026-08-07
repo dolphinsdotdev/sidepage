@@ -9,8 +9,9 @@ the wrapped process, starts the local reverse proxy
 until interrupted.
 
 **What's real vs. not**, since this orchestrates every other module: static,
-Streamlit-flavored, FastAPI-flavored, MCP-flavored (Python), and notebook
-(Jupyter Lab) targets, `open`/`token` auth, `--env` secret injection,
+Streamlit-flavored, Mxlit-flavored, FastAPI-flavored, MCP-flavored
+(Python), and notebook (Jupyter Lab) targets, `open`/`token` auth, `--env`
+secret injection,
 `--anon` tunneling, and `--domain` BYO tunneling (see
 `sidepage.core.tunnel_manager.open_byo_tunnel`) all actually work.
 Non-local `--scope`, `network`/`oauth` auth, and
@@ -100,6 +101,23 @@ def _build_code_launch_argv(target: Path, launcher: CodeLauncher, port: int) -> 
             "true",
             "--server.address",
             "127.0.0.1",
+        ]
+
+    if launcher is CodeLauncher.MXLIT:
+        # Mirrors the STREAMLIT branch above — mxlit is a Streamlit
+        # alternative (FastAPI/HTMX under the hood) with its own `mxlit
+        # run` CLI entrypoint and --host/--port flags, so the same
+        # extra_packages guarantee applies: the target's own
+        # requirements.txt doesn't need to declare `mxlit` itself.
+        runner = ecosystem.resolve_python_runner(target.parent, extra_packages=["mxlit"])
+        return runner + [
+            "mxlit",
+            "run",
+            str(target),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
         ]
 
     if launcher is CodeLauncher.FASTAPI:

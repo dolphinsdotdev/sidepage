@@ -77,6 +77,20 @@ at all) on this machine — most likely missing optional runtime deps
 (`streamlit`, `jupyterlab`) in `.venv`, or a slower/blocked port-bind on
 Windows. Pre-existing, unrelated to any fix made this session.
 
+`test_serve_mxlit_app` (added alongside Mxlit launcher support) joins
+this list with a specific, confirmed root cause rather than a generic
+timeout: `mxlit run` itself raises `UnicodeEncodeError` on this machine —
+its CLI (`mxlit/cli.py`, `_build_css`) `print()`s a `✓` checkmark
+during CSS build, which fails under the `cp1252` console codepage Python
+defaults to on Windows when stdout isn't explicitly UTF-8. The subprocess
+dies before ever binding its port, so `check_upstream_ready` never
+succeeds and the test times out on the proxy's holding page. This is a
+bug in the `mxlit` package's own CLI, not in Sidepage's launcher wrapping
+(`_build_code_launch_argv` builds the correct `mxlit run <target> --host
+127.0.0.1 --port <port>` invocation) — fixable there by setting
+`PYTHONUTF8=1`/`PYTHONIOENCODING=utf-8` before printing, or avoiding
+non-ASCII output.
+
 ---
 
 **Bottom line:** categories 1–2 are a real design fork (tests assume

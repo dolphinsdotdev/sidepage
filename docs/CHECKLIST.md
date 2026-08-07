@@ -21,7 +21,7 @@ Legend: `[x]` done · `[ ]` not done · `[~]` real but scoped (see the note on t
 - [x] CLI: `sidepage new <name> --type static`
 - [ ] Core: `sidepage.core.scaffold.scaffold_project`
 - [x] Core: `sidepage.core.target.detect_target_kind` (static/code/notebook — all three servable now)
-- [x] Core: `sidepage.core.target.detect_code_launcher` — Streamlit, FastAPI, and Python MCP servers via import scan, else generic `$PORT`
+- [x] Core: `sidepage.core.target.detect_code_launcher` — Streamlit, Mxlit, FastAPI, and Python MCP servers via import scan, else generic `$PORT`
 - [x] Core: `sidepage.core.target.allocate_port`
 
 ## §2 Serving
@@ -30,13 +30,13 @@ Legend: `[x]` done · `[ ]` not done · `[~]` real but scoped (see the note on t
 - [x] CLI: `sidepage stop <app-name>`
 - [x] Core: `sidepage.core.process.serve` — the biggest real module; orchestrates target detection, port allocation, subprocess launch, proxy, tunnel, registry
 - [x] Core: `sidepage.core.process.stop` — SIGTERM to the registered pid, routed through the same clean teardown as Ctrl+C
-- [x] Core: port injection — `--server.port` flag for Streamlit, `uvicorn <module>:<app> --port` for FastAPI (bypasses a script's own `__main__` block, which real FastAPI apps often use to hardcode a port), `uvicorn <module>:<var>.<app-method> --factory --port` for MCP (bypasses the script's own `.run()` call too — see below), `$PORT` env var for the generic fallback
+- [x] Core: port injection — `--server.port` flag for Streamlit, `mxlit run <target> --host --port` for Mxlit (mirrors Streamlit's own CLI shape), `uvicorn <module>:<app> --port` for FastAPI (bypasses a script's own `__main__` block, which real FastAPI apps often use to hardcode a port), `uvicorn <module>:<var>.<app-method> --factory --port` for MCP (bypasses the script's own `.run()` call too — see below), `$PORT` env var for the generic fallback
 - [x] Core: immediate tunnel/proxy/subprocess teardown on Ctrl+C / `stop` (via a SIGTERM handler that raises `KeyboardInterrupt`)
 - [x] Core: `--domain` (real, once configured — see §6/§13), non-`local` `--scope`, `--auth network`/`oauth`, `--guardrail` (the latter three still rejected up front with a clear message via `_validate_supported`, not silently ignored)
 - [x] Core: `notebook` targets — real, see §12 below
 - [x] CLI (v4): `--env <SECRET_NAME>` repeatable, vault injection
 - [x] Core (v4): `serve` resolving each `env_secrets` name via `secrets_vault.get_secret`, fail loud (`SecretNotFoundError`) on miss
-- [x] Verified end to end: static-site fixture and Streamlit fixture, both via real subprocess CLI invocation (`tests/test_serve_integration.py`)
+- [x] Verified end to end: static-site, Streamlit, and Mxlit fixtures, all via real subprocess CLI invocation (`tests/test_serve_integration.py`)
 - [x] Core: FastAPI launcher — `sidepage.core.target.detect_asgi_app_variable` (scans for `<name> = FastAPI(...)`, defaults to `app`), launched via real `uvicorn` CLI, not by running the script directly
 - [x] Verified end to end: `tests/fixtures/fastapi-app` (real subprocess, `tests/test_serve_fastapi.py`) — port override, `/docs`, `/openapi.json`, a real POST endpoint, and the auth gate covering `/docs` too. Also manually verified against a real, non-fixture FastAPI app (local MLX LLM inference server) — real chat completion request succeeded through the proxy.
 - [x] FastAPI `/docs`/`/redoc`/`/openapi.json` — no extra work needed, the generic HTTP proxy passthrough already covers them; `serve` prints the `/docs` URL when a FastAPI target is detected
@@ -227,7 +227,7 @@ Legend: `[x]` done · `[ ]` not done · `[~]` real but scoped (see the note on t
 - [x] Fast in-process tests for the app registry (`tests/test_app_registry.py`) — `sidepage.core.app_registry` round trip (register/get/list/unregister, duplicate rejection, missing-name rejection), the stored JSON shape matching the registry spec's field names, the CLI's `--token` rejection and nonexistent-target rejection, `--type` auto-detection at registration, and `show --with` previewing without mutating the base
 - [x] Real integration tests for `inspect` (`tests/test_inspector.py`) — target resolution, auth auto-sourcing, request execution against the static-site fixture
 - [x] Fast unit tests for dependency resolution (`tests/test_ecosystem.py`) — pins the `.venv`-trust regression fix
-- [x] Fast unit tests for code-launcher detection (`tests/test_target.py`) — Streamlit/FastAPI/MCP import-scan detection for every recognized MCP import style, FastAPI-over-MCP precedence when MCP is mounted inside a FastAPI app, generic-`$PORT` fallback, app-variable extraction and its defaults
+- [x] Fast unit tests for code-launcher detection (`tests/test_target.py`) — Streamlit/Mxlit/FastAPI/MCP import-scan detection for every recognized MCP import style, FastAPI-over-MCP precedence when MCP is mounted inside a FastAPI app, generic-`$PORT` fallback, app-variable extraction and its defaults
 - [x] Fast unit tests for BYO-domain tunneling (`tests/test_tunnel_byo.py`) — token decode (pure); mocked Cloudflare API/`cloudflared` subprocess coverage of `provision_byo_domain` and `open_byo_tunnel` (create, update, stable hostname, missing-zone error, ingress upsert idempotency, two apps sharing one ingress config); shared-process lifecycle (spawned once for two apps, killed only on the last app's teardown, stale-pidfile recovery); a real cross-thread `_domain_lock` mutual-exclusion check
 - [x] Fast unit tests for the secrets vault (`tests/test_secrets_vault.py`) — round-trips `set_secret`/`get_secret` through the real encrypt-write/decrypt-read path (no in-memory cache to fake it), edge-case values (empty string, unicode, large), confirms the on-disk file doesn't contain the plaintext, multi-secret isolation, key-file reuse across writes, remove-then-get raising `SecretNotFoundError`
 - [x] Real runtime dependencies: Starlette, uvicorn, httpx, `websockets`, `cryptography` (not just named-but-uninstalled)

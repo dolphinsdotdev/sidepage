@@ -2,7 +2,7 @@
 
 Local-first hosting and tunneling for code, static sites, and notebooks.
 `sidepage serve` wraps almost anything — a script, a static site, a
-Streamlit or FastAPI app, a Python MCP server, a Jupyter notebook —
+Streamlit, Mxlit, or FastAPI app, a Python MCP server, a Jupyter notebook —
 behind a local reverse proxy and hands you a URL. `sidepage new`
 scaffolds a static site to get started.
 
@@ -34,6 +34,9 @@ uv run sidepage serve tests/fixtures/static-site --name demo
 
 # Serve a Streamlit app, gated behind a token
 uv run sidepage serve tests/fixtures/streamlit-app/app.py --name demo --auth token
+
+# Serve a Mxlit app (a Streamlit alternative built on FastAPI/HTMX)
+uv run sidepage serve tests/fixtures/mxlit-app/app.py --name demo
 
 # Serve a FastAPI app — /docs (Swagger UI) works automatically
 uv run sidepage serve tests/fixtures/fastapi-app/app.py --name demo
@@ -132,10 +135,10 @@ sidepage serve <target> [--type auto|code|static|notebook] [--name <app-name>]
 ```
 
 - `--type` is usually inferred: `code` targets are auto-detected as
-  Streamlit, FastAPI, or a Python MCP server (official `mcp` SDK or the
-  third-party `fastmcp` package) and launched with their real launcher
-  (`streamlit run`, `uvicorn <module>:<app>`, or `uvicorn --factory
-  <module>:<mcp-var>.<app-method>`); anything else falls back to a
+  Streamlit, Mxlit, FastAPI, or a Python MCP server (official `mcp` SDK or
+  the third-party `fastmcp` package) and launched with their real launcher
+  (`streamlit run`, `mxlit run`, `uvicorn <module>:<app>`, or `uvicorn
+  --factory <module>:<mcp-var>.<app-method>`); anything else falls back to a
   generic `$PORT`-reading launch. `notebook` (`.ipynb`) targets get a
   full, editable Jupyter Lab instance with a live kernel.
   MCP servers are launched by bypassing their own entrypoint entirely
@@ -227,7 +230,7 @@ src/sidepage/
 └── config/          Local config paths (XDG-style, overridable via SIDEPAGE_HOME)
 
 tests/
-├── fixtures/        Real apps used as test targets (static site, Streamlit, FastAPI, MCP, notebook)
+├── fixtures/        Real apps used as test targets (static site, Streamlit, Mxlit, FastAPI, MCP, notebook)
 └── test_*.py        Unit and integration tests
 
 docs/
@@ -252,7 +255,7 @@ expected to be available wherever tests run.
 ## Project status
 
 **Real and tested end to end:** `serve` for static, code, and notebook
-targets (Streamlit/FastAPI/Python-MCP auto-detected, generic `$PORT`
+targets (Streamlit/Mxlit/FastAPI/Python-MCP auto-detected, generic `$PORT`
 fallback, full Jupyter Lab for `.ipynb`), `open`/`token` auth, `--env`
 secret injection, `--anon` tunneling, BYO-domain tunneling (`account
 domain set` + `serve --domain`), `secrets`, `stop`/`ls`/`status`/`usage`,
