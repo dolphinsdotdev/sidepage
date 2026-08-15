@@ -26,7 +26,7 @@ Legend: `[x]` done · `[ ]` not done · `[~]` real but scoped (see the note on t
 
 ## §2 Serving
 
-- [x] CLI: `sidepage serve <target> [--type] [--name] [--domain] [--auth] [--anon] [--token] [--env]... [--scope] [--guardrail]`
+- [x] CLI: `sidepage serve <target> [--type] [--name] [--domain] [--auth] [--anon] [--token] [--env]... [--scope] [--guardrail] [--timeout] [--idle-timeout] [--peer]...` (last three are v5, see below)
 - [x] CLI: `sidepage stop <app-name>`
 - [x] Core: `sidepage.core.process.serve` — the biggest real module; orchestrates target detection, port allocation, subprocess launch, proxy, tunnel, registry
 - [x] Core: `sidepage.core.process.stop` — SIGTERM to the registered pid, routed through the same clean teardown as Ctrl+C
@@ -43,6 +43,7 @@ Legend: `[x]` done · `[ ]` not done · `[~]` real but scoped (see the note on t
 - [x] Core: MCP (Python) launcher — `sidepage.core.target.detect_mcp_package`/`detect_mcp_app_variable` recognize two packages (official `mcp` SDK — `FastMCP` or, in the current major version, `MCPServer`, both exposing `.streamable_http_app()`; third-party `fastmcp` — `FastMCP`, exposing `.http_app()`), launched via real `uvicorn --factory <module>:<var>.<method>`, never by running the script or calling `.run()` directly. Because that entrypoint is never executed, a script whose own `__main__` only wires up the stdio transport (the default for both packages) still ends up served over real Streamable HTTP — resolves the practical case of `docs/OPEN_QUESTIONS.md` #4. Both packages' current API shape was verified live against their actually-resolvable releases, not assumed
 - [x] Core: MCP/FastAPI detection precedence — a script that mounts an MCP server inside a FastAPI app (`app.mount("/mcp", mcp.streamable_http_app())`) is still detected as FASTAPI, not MCP, since the FastAPI app is the real top-level ASGI app and already serves the MCP sub-mount; only a standalone MCP script (no FastAPI import) is detected as MCP
 - [x] Verified end to end: `tests/fixtures/mcp-app` (real `mcp` SDK server, `__main__` deliberately left stdio-only), real subprocess CLI invocation (`tests/test_serve_mcp.py`) — a genuine `initialize` handshake and `tools/call` round trip through the actual reverse proxy (not talking to the wrapped process directly), plus the auth gate covering `/mcp` too. Fast, no-subprocess detection-logic coverage in `tests/test_target.py`
+- [x] Verified end to end (v5): `tests/test_serve_v5.py` — real subprocess coverage of `--timeout`/`--idle-timeout` auto-teardown (including idle-timeout resetting under continuous traffic), lazy start for code targets (a marker file proves `subprocess.Popen` doesn't run until the first request), and `--peer` (boot-time env injection, live `GET /.sidepage/peers.json`, fail-loud on an unresolvable peer); fast in-process coverage for the flag-validation rejections (negative/zero timeout values, malformed `--peer` spec, `--peer` on a static target)
 
 ## §3 Naming & identity
 
@@ -186,6 +187,38 @@ Legend: `[x]` done · `[ ]` not done · `[~]` real but scoped (see the note on t
 
 - [ ] Orchestrator (fleet/process management) — separate product by design, not tracked here beyond noting it's not started
 
+## v5: `docs/SPEC_V5_DRAFT.md`
+
+*(Numbering continues from §16, per that document's own convention. Only
+§20, §21 Tier 1, and `--peer` are built this pass — §17–19, §21 Tier 2,
+§22, and §23 remain draft-only proposals, not tracked here as done/not
+done since nothing about them has been implemented.)*
+
+### §20 Timeout / auto-teardown
+
+- [x] CLI: `sidepage serve --timeout <seconds>` / `--idle-timeout <seconds>`
+- [x] Core: `sidepage.core.process.ServeConfig.timeout`/`idle_timeout`, validated (positive-only) in `_validate_supported`
+- [x] Core: both checked once a second inside `serve`'s existing blocking loop, exiting through the same `_teardown()` Ctrl+C/`stop` already use — no new teardown path, no drain window (same immediate-kill semantics as everything else)
+- [x] Core: `sidepage.core.reverse_proxy.ActivityTracker`/`ActivityMiddleware` — "time of last proxied request or WS message," touched on every HTTP request and (per-message, not just per-connection) WS message, exposed as `ProxyHandle.activity`; backs `--idle-timeout`
+- [x] Composable: both flags can be passed together; independent conditions, either can fire first
+
+### §21 Lazy start (Tier 1 only — Tier 2/scale-to-zero not attempted)
+
+- [x] Core: `sidepage.core.reverse_proxy.start_proxy(..., start_upstream=...)` — when given, `_build_proxy_app` defers calling it until the first inbound HTTP request or WS connect, behind a start-once lock (`_ensure_started`); the pre-existing `ready`-Event/holding-page path is reused verbatim, not reimplemented
+- [x] Core: `sidepage.core.process.serve` — CODE/NOTEBOOK's `subprocess.Popen` moved into a closure passed as `start_upstream`; no flag, automatic for both target kinds
+- [x] Scope respected: STATIC untouched (already in-process, no subprocess to defer)
+- [ ] Tier 2 (scale-to-zero: respawn after an idle-kill instead of tearing the whole `serve` invocation down) — **deliberately not attempted**, per the spec's own flag that it's a materially bigger, separate decision (real state-loss risk for a live Jupyter kernel in particular)
+
+### `--peer <role>=<app-name>`
+
+- [x] CLI: `sidepage serve --peer <role>=<app-name>` (repeatable), parsed by `sidepage.commands.serve._parse_peer` — fails loud on a malformed spec (missing `=`, empty role/name)
+- [x] Core: `sidepage.core.exceptions.PeerNotFoundError` (new)
+- [x] Core: `sidepage.core.registry.resolve_peer_url` — `get(app_name).tunnel_url or .url` against *live* registry state; raises `PeerNotFoundError` for a peer that isn't currently running
+- [x] Core: boot-time injection — `sidepage.core.process.serve` resolves each configured peer once and injects `SIDEPAGE_PEER_<ROLE>_URL` into the CODE/NOTEBOOK subprocess env, same mechanism `--env` already uses for vault secrets
+- [x] Core: live re-resolution — `GET /.sidepage/peers.json`, one more route in `_build_proxy_app`'s own table, so it inherits the app's `--auth` gate automatically with no separate gate to build; re-resolves on every request, so a peer that restarts mid-session with a fresh anon-tunnel URL is never stale the way the boot-time env var would be
+- [x] Resolved (own design decision, fail-loud posture): `--peer` on a `static` target is rejected up front (`ValueError`, before target detection's result is even used further) — there's no subprocess to inject into and the live route only exists in the code/notebook proxy app, so silently accepting the flag there would have been a silent no-op
+- [ ] Not attempted: `--peer` support for `static` targets (would need its own client-fetchable endpoint design — see the related, still-draft §22 sibling-discovery proposal in `docs/SPEC_V5_DRAFT.md`)
+
 ## Registry spec v2: local app registry
 
 *(Not part of the v3/v4 spec numbering — a separate document,
@@ -226,6 +259,7 @@ Legend: `[x]` done · `[ ]` not done · `[~]` real but scoped (see the note on t
 - [x] Real subprocess integration tests for the app registry (`tests/test_serve_registry.py`) — a registered app's stored auth tier actually gates it, a CLI override actually overrides it for one run without mutating the registration, an unregistered name falls back to the pre-registry literal-path error
 - [x] Fast in-process tests for the app registry (`tests/test_app_registry.py`) — `sidepage.core.app_registry` round trip (register/get/list/unregister, duplicate rejection, missing-name rejection), the stored JSON shape matching the registry spec's field names, the CLI's `--token` rejection and nonexistent-target rejection, `--type` auto-detection at registration, and `show --with` previewing without mutating the base
 - [x] Real integration tests for `inspect` (`tests/test_inspector.py`) — target resolution, auth auto-sourcing, request execution against the static-site fixture
+- [x] Real subprocess + fast in-process tests for v5 (`tests/test_serve_v5.py`) — `--timeout`/`--idle-timeout` auto-teardown (including idle-reset-under-traffic), lazy start (marker-file proof `subprocess.Popen` is deferred to the first request), `--peer` (env injection, live `peers.json`, fail-loud on a missing peer), and flag-validation rejections for all three
 - [x] Fast unit tests for dependency resolution (`tests/test_ecosystem.py`) — pins the `.venv`-trust regression fix
 - [x] Fast unit tests for code-launcher detection (`tests/test_target.py`) — Streamlit/FastAPI/MCP import-scan detection for every recognized MCP import style, FastAPI-over-MCP precedence when MCP is mounted inside a FastAPI app, generic-`$PORT` fallback, app-variable extraction and its defaults
 - [x] Fast unit tests for BYO-domain tunneling (`tests/test_tunnel_byo.py`) — token decode (pure); mocked Cloudflare API/`cloudflared` subprocess coverage of `provision_byo_domain` and `open_byo_tunnel` (create, update, stable hostname, missing-zone error, ingress upsert idempotency, two apps sharing one ingress config); shared-process lifecycle (spawned once for two apps, killed only on the last app's teardown, stale-pidfile recovery); a real cross-thread `_domain_lock` mutual-exclusion check

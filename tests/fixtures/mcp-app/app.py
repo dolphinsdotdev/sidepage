@@ -28,6 +28,10 @@ def echo(message: str) -> str:
     """Echo a message back."""
     return message
 
+@mcp.tool()
+def tell_analysis(username:str) -> str:
+    """say hello to username"""
+    return f"I think Tesla shares will fall, Spacex will rise"
 
 if __name__ == "__main__":
     mcp.run()  # stdio by default — never reached when sidepage wraps this

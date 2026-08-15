@@ -38,6 +38,14 @@ every flag's natural default — e.g. `--auth open`, `--scope local` —
 keeps working as a real default rather than colliding with "was it
 passed"). An argument that doesn't match any registered name falls back
 to the existing behavior unchanged: a literal target path.
+
+v5 adds `--timeout`/`--idle-timeout` (auto-teardown, spec §20) and
+`--peer <role>=<app-name>` (repeatable — injects another running served
+app's URL as `SIDEPAGE_PEER_<ROLE>_URL`). All three are always taken from
+*this* invocation, never from a registered app's saved config — same
+treatment as `--token`, and for the same reason: none of the three is
+part of `AppRegistration`, so there's nothing in the registry to merge
+against.
 """
 
 from __future__ import annotations
@@ -57,6 +65,18 @@ from sidepage.core.process import serve as core_serve
 from sidepage.core.process import stop as core_stop
 from sidepage.core.target import TargetKind
 from sidepage.output import error, not_implemented
+
+
+def _parse_peer(spec: str) -> tuple[str, str]:
+    """Parse one `--peer ROLE=APP-NAME` spec. Fails loud on a bad shape
+    (missing `=`, empty role or app name) rather than silently dropping
+    it or guessing — same posture as every other real validation in this
+    module."""
+    role, sep, app_name = spec.partition("=")
+    role, app_name = role.strip(), app_name.strip()
+    if not sep or not role or not app_name:
+        raise ValueError(f"--peer {spec!r} must be ROLE=APP-NAME, e.g. --peer api=my-api")
+    return role, app_name
 
 
 class ServeTargetType(StrEnum):
@@ -140,9 +160,41 @@ def serve(
             help="[parked, not yet available] Pre/post-processing config.",
         ),
     ] = None,
+    timeout: Annotated[
+        float | None,
+        typer.Option(
+            "--timeout",
+            help="Absolute lifetime in seconds, measured from start — torn down automatically "
+            "once reached, same as Ctrl+C.",
+        ),
+    ] = None,
+    idle_timeout: Annotated[
+        float | None,
+        typer.Option(
+            "--idle-timeout",
+            help="Idle lifetime in seconds — resets on every proxied request or WebSocket "
+            "message; torn down automatically once no traffic arrives within this window.",
+        ),
+    ] = None,
+    peer: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--peer",
+            help="Inject another currently-running served app's URL as "
+            "SIDEPAGE_PEER_<ROLE>_URL, e.g. --peer api=my-api. Repeatable. Resolved from the "
+            "registry at start (fails loud if the named app isn't running); also re-resolved "
+            "live via GET /.sidepage/peers.json. code/notebook targets only.",
+        ),
+    ] = None,
 ) -> None:
     """Serve a target and expose it through a tunnel. Blocks the terminal;
     Ctrl+C tears the tunnel down immediately."""
+    try:
+        peers = tuple(_parse_peer(p) for p in (peer or ()))
+    except ValueError as exc:
+        error(str(exc))
+        raise typer.Exit(1) from exc
+
     registered = app_registry.get(str(target))
     if registered is None:
         target_kind = None if target_type == ServeTargetType.AUTO else TargetKind(target_type.value)
@@ -157,6 +209,9 @@ def serve(
             token=token,
             env_secrets=tuple(env or ()),
             guardrail=guardrail,
+            timeout=timeout,
+            idle_timeout=idle_timeout,
+            peers=peers,
         )
     else:
         merged = merge_with_registered(
@@ -179,7 +234,14 @@ def serve(
             # to the underlying file's stem (ServeConfig's own default),
             # which could be a completely different, less meaningful name.
             merged["name"] = str(target)
-        config = ServeConfig(target=registered.target, token=token, **merged)
+        config = ServeConfig(
+            target=registered.target,
+            token=token,
+            timeout=timeout,
+            idle_timeout=idle_timeout,
+            peers=peers,
+            **merged,
+        )
     try:
         core_serve(config)
     except NotImplementedError as exc:

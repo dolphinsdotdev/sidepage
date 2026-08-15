@@ -29,6 +29,18 @@ teardown via a SIGTERM handler that raises `KeyboardInterrupt`) tears
 everything down **immediately** — no grace period, confirmed default.
 Multi-process/background management is out of scope for this binary
 (orchestrator, §16); `--background` is explicitly ruled out.
+
+v5 adds three more, composing with everything above rather than replacing
+it: `--timeout`/`--idle-timeout` (§20) are checked inside this same
+blocking loop and exit through the same `_teardown()` Ctrl+C/`stop`
+already use; CODE/NOTEBOOK's `subprocess.Popen` is deferred into a
+closure handed to `sidepage.core.reverse_proxy.start_proxy` as
+`start_upstream`, fired on first inbound request instead of unconditionally
+here (§21 Tier 1, lazy start — STATIC is untouched, already in-process);
+and `--peer <role>=<app-name>` resolves each named peer once against
+`sidepage.core.registry`'s live state and injects
+`SIDEPAGE_PEER_<ROLE>_URL` into the wrapped subprocess's env, the same
+injection mechanism `--env` already uses for vault secrets.
 """
 
 from __future__ import annotations
@@ -72,6 +84,9 @@ class ServeConfig:
     token: str | None = None  # explicit --token; None means env var or auto-generate
     env_secrets: tuple[str, ...] = ()  # v4 §9 — vault secret names for --env (repeatable)
     guardrail: Path | None = None  # parked, not built — see sidepage.core.guardrail
+    timeout: float | None = None  # v5 §20 — absolute lifetime in seconds, from started_at
+    idle_timeout: float | None = None  # v5 §20 — seconds since last proxied traffic
+    peers: tuple[tuple[str, str], ...] = ()  # v5 --peer: (role, app_name) pairs, repeatable
 
 
 def _build_code_launch_argv(target: Path, launcher: CodeLauncher, port: int) -> list[str]:
@@ -174,6 +189,12 @@ def _validate_supported(config: ServeConfig) -> account.DomainConfig | None:
         raise NotImplementedError(
             "--guardrail isn't implemented — parked, see sidepage.core.guardrail."
         )
+    if config.timeout is not None and config.timeout <= 0:
+        raise ValueError(f"--timeout must be a positive number of seconds, got {config.timeout}")
+    if config.idle_timeout is not None and config.idle_timeout <= 0:
+        raise ValueError(
+            f"--idle-timeout must be a positive number of seconds, got {config.idle_timeout}"
+        )
 
     if config.domain is None:
         return None
@@ -199,6 +220,12 @@ def serve(config: ServeConfig) -> None:
     # actually ran `sidepage serve` from.
     target = config.target.resolve()
     target_kind = detect_target_kind(target, override=config.target_kind)
+    if config.peers and target_kind is TargetKind.STATIC:
+        raise ValueError(
+            "--peer isn't supported for static targets — there's no subprocess to inject "
+            "SIDEPAGE_PEER_<ROLE>_URL into, and the live GET /.sidepage/peers.json endpoint "
+            "only exists on the code/notebook proxy route table."
+        )
     app_name = config.name or target.stem or target.name
     if registry.get(app_name) is not None:
         raise ValueError(
@@ -213,6 +240,16 @@ def serve(config: ServeConfig) -> None:
     injected_env: dict[str, str] = {}
     for secret_name in config.env_secrets:
         injected_env[secret_name] = secrets_vault.get_secret(secret_name)  # fails loud if missing
+
+    # v5 --peer: resolved once, here, against the *live* registry — fails
+    # loud (registry.PeerNotFoundError) if a named peer isn't currently
+    # running. Live re-resolution for a peer that restarts mid-session is
+    # the separate GET /.sidepage/peers.json route in
+    # sidepage.core.reverse_proxy, not this one-shot env var.
+    for role, peer_app_name in config.peers:
+        injected_env[f"SIDEPAGE_PEER_{role.upper()}_URL"] = registry.resolve_peer_url(
+            peer_app_name
+        )
 
     listen_port = allocate_port()
     proc: subprocess.Popen | None = None
@@ -263,25 +300,40 @@ def serve(config: ServeConfig) -> None:
         launcher = detect_code_launcher(target)
         argv = _build_code_launch_argv(target, launcher, upstream_port)
         env = {**os.environ, **injected_env, "PORT": str(upstream_port)}
-        proc = subprocess.Popen(argv, cwd=target.parent, env=env)
+
+        def _start_code_upstream() -> None:
+            # v5 §21 Tier 1 — lazy start: not called from here at all.
+            # `sidepage.core.reverse_proxy._build_proxy_app` calls this
+            # itself, once, on the first inbound request/WS connect.
+            nonlocal proc
+            proc = subprocess.Popen(argv, cwd=target.parent, env=env)
+
         proxy = start_proxy(
             app_name,
             listen_port=listen_port,
             upstream_port=upstream_port,
             auth=config.auth.value,
             token=token,
+            start_upstream=_start_code_upstream,
+            peers=config.peers,
         )
     elif target_kind is TargetKind.NOTEBOOK:
         upstream_port = allocate_port()
         argv = notebook.build_jupyter_launch_command(target, port=upstream_port)
         env = {**os.environ, **injected_env}
-        proc = subprocess.Popen(argv, cwd=target.parent, env=env)
+
+        def _start_notebook_upstream() -> None:
+            nonlocal proc
+            proc = subprocess.Popen(argv, cwd=target.parent, env=env)
+
         proxy = start_proxy(
             app_name,
             listen_port=listen_port,
             upstream_port=upstream_port,
             auth=config.auth.value,
             token=token,
+            start_upstream=_start_notebook_upstream,
+            peers=config.peers,
         )
     else:
         raise NotImplementedError(
@@ -311,6 +363,7 @@ def serve(config: ServeConfig) -> None:
         )
         tunnel_url = tunnel.url
 
+    started_at = time.time()
     registry.register(
         registry.RunningApp(
             name=app_name,
@@ -320,7 +373,7 @@ def serve(config: ServeConfig) -> None:
             listen_port=listen_port,
             url=local_url,
             tunnel_url=tunnel_url,
-            started_at=time.time(),
+            started_at=started_at,
             domain=domain_config.domain if domain_config is not None else None,
         )
     )
@@ -334,11 +387,32 @@ def serve(config: ServeConfig) -> None:
         success(f"public URL: {tunnel_url}")
     if token is not None:
         info(f"access token: {token}")
+    if config.timeout is not None:
+        info(f"auto-stop after {config.timeout:g}s")
+    if config.idle_timeout is not None:
+        info(f"auto-stop after {config.idle_timeout:g}s of no traffic")
     info("Ctrl+C to stop")
 
+    # §20 timeout / idle-timeout: both checked right here in the existing
+    # blocking loop, both exiting through the same `break` -> `finally:
+    # _teardown()` path Ctrl+C and SIGTERM already use — no separate
+    # teardown route. `proxy.activity.last()` is the "time of last
+    # proxied request/WS message" `sidepage.core.reverse_proxy` tracks;
+    # for a still-booting app (lazy start, nothing has hit it yet) that's
+    # simply `started_at`, so idle-timeout can't fire before the app has
+    # ever received a single request.
     try:
         while True:
             time.sleep(1)
+            now = time.time()
+            if config.timeout is not None and now - started_at >= config.timeout:
+                info(f"{app_name}: --timeout ({config.timeout:g}s) reached, stopping")
+                break
+            if config.idle_timeout is not None:
+                idle_for = now - proxy.activity.last()
+                if idle_for >= config.idle_timeout:
+                    info(f"{app_name}: --idle-timeout ({config.idle_timeout:g}s) reached, stopping")
+                    break
     except KeyboardInterrupt:
         pass
     finally:

@@ -27,6 +27,23 @@ Usage counts (`sidepage.core.usage_reporter`) are persisted to a JSON file
 per app under `sidepage.config.settings.runtime_dir()` on every request/
 message — simple, not high-throughput-optimized, appropriate for a local
 dev tool.
+
+v5 adds three things, all composing with the proxy contract above rather
+than replacing it:
+- `ActivityTracker`/`ActivityMiddleware`: last-request timestamp, touched
+  on every HTTP request and WS message, exposed on `ProxyHandle.activity`
+  — backs `sidepage.core.process.serve`'s `--idle-timeout` (spec v5 §20).
+- `start_proxy(..., start_upstream=...)`: when given, `subprocess.Popen`
+  for a CODE/NOTEBOOK target is deferred out of `serve` entirely and fired
+  once, behind a start-once lock, on the first inbound request/WS connect
+  — the existing `ready`-Event/holding-page mechanism is reused verbatim,
+  just triggered by traffic instead of by `serve` itself starting (spec v5
+  §21 Tier 1, lazy start).
+- `GET /.sidepage/peers.json` in `_build_proxy_app`'s own route table, so
+  it inherits the app's `--auth` gate automatically — re-resolves each
+  configured `--peer` against `sidepage.core.registry` on every request,
+  so a peer that restarts mid-session with a fresh tunnel URL is never
+  stale the way a boot-time env var would be (spec v5 `--peer`).
 """
 
 from __future__ import annotations
@@ -35,6 +52,7 @@ import asyncio
 import json
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs
@@ -45,12 +63,14 @@ import websockets
 from starlette.applications import Starlette
 from starlette.datastructures import Headers
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from sidepage.config.settings import ensure_dirs, runtime_dir
+from sidepage.core import registry
+from sidepage.core.exceptions import PeerNotFoundError
 
 _HOP_BY_HOP = {
     "connection",
@@ -93,6 +113,50 @@ def _parse_cookies(cookie_header: str) -> dict[str, str]:
             k, v = part.strip().split("=", 1)
             cookies[k] = v
     return cookies
+
+
+class ActivityTracker:
+    """Last-request-or-WS-message timestamp for one served app — backs
+    `--idle-timeout` (spec v5 §20). A single `float` attribute rather than
+    anything lock-protected: CPython's GIL already makes a bare attribute
+    assignment atomic, and the consumer (`process.serve`'s blocking loop)
+    only ever needs an approximate, monotonically-fresh read, not a
+    strictly synchronized one.
+    """
+
+    def __init__(self) -> None:
+        self._last = time.time()
+
+    def touch(self) -> None:
+        self._last = time.time()
+
+    def last(self) -> float:
+        return self._last
+
+
+class ActivityMiddleware:
+    """Raw ASGI middleware, same shape as `AuthGateMiddleware` below:
+    touches `tracker` once per HTTP request and once per WS *connection*.
+    Message-level granularity within one long-lived WS connection (what
+    `--idle-timeout`'s "resets on each proxied ... WS message" promises)
+    is handled separately, by explicit `activity.touch()` calls inside
+    `_build_proxy_app`'s own per-message forwarding loops — an ASGI
+    `websocket` scope is only entered once per connection, so this outer
+    layer alone can't see individual messages.
+
+    Deliberately outermost (wraps `AuthGateMiddleware`, not the reverse):
+    even a request that fails auth is still a human or client actively
+    poking the app, so it should still count as "not idle."
+    """
+
+    def __init__(self, app, tracker: ActivityTracker) -> None:
+        self.app = app
+        self.tracker = tracker
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] in ("http", "websocket"):
+            self.tracker.touch()
+        await self.app(scope, receive, send)
 
 
 class AuthGateMiddleware:
@@ -174,10 +238,50 @@ def _build_proxy_app(
     token: str | None,
     ready: threading.Event,
     counts: dict[str, int],
+    activity: ActivityTracker,
+    start_upstream: Callable[[], None] | None = None,
+    peers: tuple[tuple[str, str], ...] = (),
 ):
     client = httpx.AsyncClient(timeout=30.0)
 
+    started = False
+    start_lock = threading.Lock()
+
+    def _ensure_started() -> None:
+        """Lazy start (spec v5 §21 Tier 1): if `start_upstream` was given,
+        the wrapped subprocess hasn't been launched at all yet — this is
+        the start-once trigger, fired on the first inbound request or WS
+        connect. `started` is read outside the lock as a fast path (a
+        stale `False` just means an extra lock acquisition, never a
+        double-start, since the check inside the lock is authoritative)
+        and only ever set inside it."""
+        nonlocal started
+        if start_upstream is None or started:
+            return
+        with start_lock:
+            if started:
+                return
+            started = True
+            start_upstream()
+
+            def _poll_ready() -> None:
+                if check_upstream_ready(upstream_port):
+                    ready.set()
+
+            threading.Thread(target=_poll_ready, daemon=True).start()
+
+    async def peers_json(request: Request) -> JSONResponse:
+        resolved: dict[str, str | None] = {}
+        for role, peer_app_name in peers:
+            try:
+                resolved[role] = registry.resolve_peer_url(peer_app_name)
+            except PeerNotFoundError:
+                resolved[role] = None
+        return JSONResponse(resolved)
+
     async def proxy_http(request: Request):
+        _ensure_started()
+        activity.touch()
         counts["http_requests"] = counts.get("http_requests", 0) + 1
         if not ready.is_set():
             _persist_counts(app_name, counts)
@@ -206,7 +310,9 @@ def _build_proxy_app(
         )
 
     async def proxy_ws(websocket: WebSocket) -> None:
+        _ensure_started()
         await websocket.accept()
+        activity.touch()
         counts["ws_connections"] = counts.get("ws_connections", 0) + 1
         _persist_counts(app_name, counts)
         upstream_url = f"ws://127.0.0.1:{upstream_port}{websocket.url.path}"
@@ -222,9 +328,11 @@ def _build_proxy_app(
                                 break
                             if msg.get("text") is not None:
                                 await upstream_ws.send(msg["text"])
+                                activity.touch()
                                 counts["ws_messages"] = counts.get("ws_messages", 0) + 1
                             elif msg.get("bytes") is not None:
                                 await upstream_ws.send(msg["bytes"])
+                                activity.touch()
                                 counts["ws_messages"] = counts.get("ws_messages", 0) + 1
                     except WebSocketDisconnect:
                         pass
@@ -235,6 +343,7 @@ def _build_proxy_app(
                             await websocket.send_text(message)
                         else:
                             await websocket.send_bytes(message)
+                        activity.touch()
                         counts["ws_messages"] = counts.get("ws_messages", 0) + 1
 
                 tasks = [
@@ -251,6 +360,11 @@ def _build_proxy_app(
 
     routes = [
         Route("/__sidepage_auth", _auth_post_handler(token), methods=["POST"]),
+        # Ahead of the catch-all routes below so it wins the match, and
+        # inside this same route table (not a separate mount) so it
+        # inherits the AuthGateMiddleware wrap applied to `app` as a
+        # whole — same auth tier as the rest of this app, no separate gate.
+        Route("/.sidepage/peers.json", peers_json, methods=["GET"]),
         WebSocketRoute("/{path:path}", proxy_ws),
         Route(
             "/{path:path}",
@@ -273,6 +387,7 @@ class ProxyHandle:
     server: uvicorn.Server = field(repr=False)
     thread: threading.Thread = field(repr=False)
     ready: threading.Event = field(repr=False)
+    activity: ActivityTracker = field(repr=False)
 
 
 def check_upstream_ready(upstream_port: int, *, timeout: float = 20.0) -> bool:
@@ -298,14 +413,31 @@ def start_proxy(
     static_root: Path | None = None,
     auth: str = "open",
     token: str | None = None,
+    start_upstream: Callable[[], None] | None = None,
+    peers: tuple[tuple[str, str], ...] = (),
 ) -> ProxyHandle:
     """Start the local reverse proxy. Exactly one of `upstream_port`
     (proxy to a wrapped subprocess) or `static_root` (serve in-process)
-    must be given."""
+    must be given.
+
+    `start_upstream`, if given (CODE/NOTEBOOK only — never paired with
+    `static_root`), defers launching the wrapped subprocess out of `serve`
+    entirely: instead of this function kicking off the readiness-poll
+    thread immediately, `_build_proxy_app` calls `start_upstream()` itself,
+    once, on the first inbound request or WS connect (spec v5 §21 Tier 1).
+    Until then `ready` never gets set, so callers see the same holding
+    page they'd see during a slow boot either way — lazy start changes
+    *when* the subprocess launches, not the readiness contract.
+
+    `peers`, if given, backs the live `GET /.sidepage/peers.json` endpoint
+    (spec v5 `--peer`) — ignored when `static_root` is set, since that
+    route only exists in `_build_proxy_app`'s table.
+    """
     if (upstream_port is None) == (static_root is None):
         raise ValueError("exactly one of upstream_port or static_root is required")
 
     ready = threading.Event()
+    activity = ActivityTracker()
     if static_root is not None:
         app = _build_static_app(static_root, auth=auth, token=token)
         ready.set()
@@ -318,13 +450,22 @@ def start_proxy(
             token=token,
             ready=ready,
             counts=counts,
+            activity=activity,
+            start_upstream=start_upstream,
+            peers=peers,
         )
 
-        def _poll_ready() -> None:
-            if check_upstream_ready(upstream_port):
-                ready.set()
+        if start_upstream is None:
 
-        threading.Thread(target=_poll_ready, daemon=True).start()
+            def _poll_ready() -> None:
+                if check_upstream_ready(upstream_port):
+                    ready.set()
+
+            threading.Thread(target=_poll_ready, daemon=True).start()
+        # else: the subprocess hasn't been launched yet at all — polling
+        # starts only once `_build_proxy_app`'s `_ensure_started` fires it.
+
+    app = ActivityMiddleware(app, activity)
 
     config = uvicorn.Config(app, host="127.0.0.1", port=listen_port, log_level="warning")
     server = uvicorn.Server(config)
@@ -342,6 +483,7 @@ def start_proxy(
         server=server,
         thread=thread,
         ready=ready,
+        activity=activity,
     )
 
 

@@ -128,3 +128,13 @@ class AppNotRegisteredError(AppRegistryError):
     argument as a literal target path instead, see
     `sidepage.commands.serve`.)
     """
+
+
+class PeerNotFoundError(DirectoryError):
+    """`serve --peer <role>=<app-name>` (v5, `--peer`) or a live `GET
+    /.sidepage/peers.json` request referenced an app name that isn't
+    currently running. Peers are resolved against
+    `sidepage.core.registry`'s *live* state, not a saved config — there's
+    no persisted peer target to fall back to, so an unresolvable name
+    fails loud rather than injecting a stale or empty URL.
+    """

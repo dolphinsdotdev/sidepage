@@ -23,16 +23,29 @@ Like `tests/fixtures/mcp-app`, `__main__` calls `mcp.run()` (stdio) and is
 never actually reached when sidepage wraps this script — sidepage calls
 `.streamable_http_app()` directly instead (see `sidepage.core.process`,
 `CodeLauncher.MCP`).
+
+v5 additions, kept in sync with `sidepage serve`'s own new flags:
+`sidepage_serve_new`/`sidepage_serve_registered` grew typed `timeout`/
+`idle_timeout`/`peers` parameters (`--timeout`/`--idle-timeout`/`--peer`,
+built on top of the same `flags` free-text escape hatch rather than
+replacing it — anything this fixture doesn't have a dedicated parameter
+for is still reachable through `flags`). `sidepage_peers` is new and
+different in kind from every other tool here: it's the one thing that
+isn't a CLI subcommand at all — `GET /.sidepage/peers.json` is a route on
+the *served app's own proxy*, so this tool resolves that app's URL via
+`sidepage status` first, then makes the HTTP call itself.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
 import subprocess
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 from mcp.server import MCPServer
@@ -49,6 +62,7 @@ _URL_RE = re.compile(
     r"|http://127\.0\.0\.1:[0-9]+[^\s]*"
 )
 _ERROR_RE = re.compile(r"error|traceback|failed to", re.IGNORECASE)
+_STATUS_URL_RE = re.compile(r"^url:\s+(\S+)", re.MULTILINE)
 
 
 def _run_direct(argv: list[str]) -> dict:
@@ -78,6 +92,29 @@ def _reap(proc: subprocess.Popen, log_file: Path) -> None:
     if returncode != 0:
         with log_file.open("a") as fh:
             fh.write(f"[mcp-control-app] process exited with code {returncode}\n")
+
+
+def _lifecycle_flags(timeout: float | None, idle_timeout: float | None) -> list[str]:
+    """`--timeout`/`--idle-timeout` (v5 §20, auto-teardown) as argv, only
+    for whichever of the two was actually given — mirrors how `flags` lets
+    a caller omit anything they don't need rather than requiring both."""
+    flags: list[str] = []
+    if timeout is not None:
+        flags += ["--timeout", str(timeout)]
+    if idle_timeout is not None:
+        flags += ["--idle-timeout", str(idle_timeout)]
+    return flags
+
+
+def _peer_flags(peers: list[str] | None) -> list[str]:
+    """`--peer <role>=<app-name>` (v5, repeatable) as argv. Each entry in
+    `peers` is passed straight through as one `ROLE=APP-NAME` spec — real
+    validation (shape, and that the named app is currently running) is
+    `sidepage serve`'s own job, not re-done here."""
+    flags: list[str] = []
+    for peer in peers or ():
+        flags += ["--peer", peer]
+    return flags
 
 
 def _start_background(serve_args: list[str], *, app_name: str) -> dict:
@@ -139,18 +176,56 @@ def _start_background(serve_args: list[str], *, app_name: str) -> dict:
 
 
 @mcp.tool()
-def sidepage_serve_new(name: str, target: str, flags: str = "") -> dict:
+def sidepage_serve_new(
+    name: str,
+    target: str,
+    flags: str = "",
+    timeout: float | None = None,
+    idle_timeout: float | None = None,
+    peers: list[str] | None = None,
+) -> dict:
     """Serve a fresh (not yet registered) target under `name`, e.g.
     flags="--auth token --anon". Backgrounds the blocking `serve` call and
-    reports back once it's running, failed, or still starting."""
-    return _start_background([target, "--name", name, *shlex.split(flags)], app_name=name)
+    reports back once it's running, failed, or still starting.
+
+    `timeout`/`idle_timeout` (seconds) are v5 auto-teardown: `timeout` is
+    an absolute lifetime from start, `idle_timeout` resets on every
+    proxied request/WS message — pass either, both, or neither. `peers` is
+    a list of "role=app-name" strings (v5 `--peer`, repeatable) — each
+    named app must already be running (`sidepage_ls`/`sidepage_status`),
+    or this call fails loud the same way the CLI flag does; not valid for
+    a `static` target."""
+    argv = [
+        target,
+        "--name",
+        name,
+        *shlex.split(flags),
+        *_lifecycle_flags(timeout, idle_timeout),
+        *_peer_flags(peers),
+    ]
+    return _start_background(argv, app_name=name)
 
 
 @mcp.tool()
-def sidepage_serve_registered(name: str, flags: str = "") -> dict:
+def sidepage_serve_registered(
+    name: str,
+    flags: str = "",
+    timeout: float | None = None,
+    idle_timeout: float | None = None,
+    peers: list[str] | None = None,
+) -> dict:
     """Serve an app already saved via `sidepage app register`, by name.
-    `flags` override the registration for this run only."""
-    return _start_background([name, *shlex.split(flags)], app_name=name)
+    `flags` override the registration for this run only. `timeout`/
+    `idle_timeout`/`peers` — see `sidepage_serve_new`; same v5 semantics,
+    same "this run only" scope (none of the three are ever part of a
+    saved registration)."""
+    argv = [
+        name,
+        *shlex.split(flags),
+        *_lifecycle_flags(timeout, idle_timeout),
+        *_peer_flags(peers),
+    ]
+    return _start_background(argv, app_name=name)
 
 
 @mcp.tool()
@@ -180,6 +255,37 @@ def sidepage_status(name: str) -> dict:
 def sidepage_usage(name: str) -> dict:
     """Request/connection counts for one app (`sidepage usage`)."""
     return _run_direct(["usage", name])
+
+
+@mcp.tool()
+def sidepage_peers(name: str) -> dict:
+    """Live-reresolve every `--peer <role>=<app-name>` configured for
+    running app `name`, via its own `GET /.sidepage/peers.json` (v5) —
+    there's no CLI subcommand for this, it's an HTTP route on the app's
+    own proxy, gated by whatever `--auth` tier that app was served with.
+
+    Reflects *current* registry state, unlike the boot-time
+    `SIDEPAGE_PEER_<ROLE>_URL` env var already baked into `name`'s own
+    subprocess environment, which goes stale the moment a peer restarts
+    mid-session with a fresh anon-tunnel URL. Resolves `name`'s own URL
+    via `sidepage status` first, same as every other tool here that needs
+    to reach a running app rather than just shell out to the CLI."""
+    status_result = _run_direct(["status", name])
+    match = _STATUS_URL_RE.search(status_result["output"])
+    if match is None:
+        return {
+            "status": "error",
+            "app": name,
+            "detail": f"couldn't resolve a URL for {name!r} from `sidepage status` — "
+            f"is it running? {status_result['output']}",
+        }
+    peers_url = match.group(1).rstrip("/") + "/.sidepage/peers.json"
+    try:
+        with urllib.request.urlopen(peers_url, timeout=10) as resp:  # noqa: S310 — local proxy only
+            body = json.loads(resp.read().decode())
+    except Exception as exc:
+        return {"status": "error", "app": name, "detail": f"GET {peers_url} failed: {exc}"}
+    return {"status": "ok", "app": name, "peers": body}
 
 
 @mcp.tool()

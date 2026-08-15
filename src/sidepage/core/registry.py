@@ -20,6 +20,7 @@ import subprocess
 from dataclasses import asdict, dataclass
 
 from sidepage.config.settings import ensure_dirs, registry_file
+from sidepage.core.exceptions import PeerNotFoundError
 
 # Captured at import time, before any test can monkeypatch `subprocess.Popen`
 # — `is_alive`'s `ps` shell-out must stay real even when a test fakes Popen
@@ -144,3 +145,27 @@ def list_running_for_domain(domain: str) -> list[RunningApp]:
     `sidepage.core.tunnel_manager` reference-counts against to decide
     whether the domain's shared `cloudflared` process is still in use."""
     return [app for app in list_running() if app.domain == domain]
+
+
+def resolve_peer_url(app_name: str) -> str:
+    """Resolve `app_name`'s current URL for `--peer` injection (v5) — the
+    tunnel URL if it has one, otherwise the loopback `url` every running
+    app always has. Always resolved against *live* registry state, never
+    cached: this is what both the one-shot boot-time env injection
+    (`sidepage.core.process.serve`) and the live `GET
+    /.sidepage/peers.json` endpoint (`sidepage.core.reverse_proxy`) call,
+    so a peer that restarted mid-session with a fresh anon-tunnel URL is
+    reflected on the next live lookup even though the boot-time env var
+    baked into some other app's subprocess stays stale.
+
+    Raises `sidepage.core.exceptions.PeerNotFoundError` if `app_name`
+    isn't currently running — fails loud rather than injecting an empty
+    or stale URL for a peer that was never started or already stopped.
+    """
+    app = get(app_name)
+    if app is None:
+        raise PeerNotFoundError(
+            f"peer app {app_name!r} isn't currently running — `sidepage serve` it first, "
+            "or check `sidepage ls` for the exact registered name."
+        )
+    return app.tunnel_url or app.url
