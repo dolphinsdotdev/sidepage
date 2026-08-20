@@ -41,6 +41,14 @@ and `--peer <role>=<app-name>` resolves each named peer once against
 `sidepage.core.registry`'s live state and injects
 `SIDEPAGE_PEER_<ROLE>_URL` into the wrapped subprocess's env, the same
 injection mechanism `--env` already uses for vault secrets.
+
+`proxy`/`ProxyConfig` (backing `sidepage proxy`) reuse this module's
+validation, tunnel, registry, and blocking-loop machinery but skip target
+detection and subprocess launch entirely — `config.port` is assumed
+already listening. `_validate_common` factors out the flag-combination/
+`--domain`-resolution checks shared by both `serve`'s `_validate_supported`
+and `proxy`; `proxy`'s own `_teardown` deliberately never touches
+`config.port`'s process, the one real behavioral difference from `serve`.
 """
 
 from __future__ import annotations
@@ -69,7 +77,7 @@ from sidepage.core.target import (
     detect_target_kind,
 )
 from sidepage.core.token_runtime import RuntimeToken, resolve_token, write_runtime_file
-from sidepage.output import error, info, stdout, success
+from sidepage.output import error, info, stdout, success, warn
 
 
 @dataclass(frozen=True)
@@ -87,6 +95,28 @@ class ServeConfig:
     timeout: float | None = None  # v5 §20 — absolute lifetime in seconds, from started_at
     idle_timeout: float | None = None  # v5 §20 — seconds since last proxied traffic
     peers: tuple[tuple[str, str], ...] = ()  # v5 --peer: (role, app_name) pairs, repeatable
+
+
+@dataclass(frozen=True)
+class ProxyConfig:
+    """Config for `proxy` — wraps an *already-running* local service on
+    `port` instead of a target `serve` launches itself. Deliberately has
+    no `target`/`target_kind`/`env_secrets`/`guardrail`/`peers` fields:
+    those are all subprocess-injection concepts, and `proxy` never spawns
+    or owns a process, so there's nothing to inject into. See
+    `sidepage.commands.proxy` for why those flags are rejected outright
+    rather than silently accepted and ignored.
+    """
+
+    port: int
+    name: str
+    domain: str | None
+    auth: AuthTier
+    scope: Scope
+    anon: bool = False
+    token: str | None = None
+    timeout: float | None = None
+    idle_timeout: float | None = None
 
 
 def _build_code_launch_argv(target: Path, launcher: CodeLauncher, port: int) -> list[str]:
@@ -161,6 +191,53 @@ def _build_code_launch_argv(target: Path, launcher: CodeLauncher, port: int) -> 
     return runner + [str(target)]
 
 
+def _validate_common(
+    *,
+    domain: str | None,
+    anon: bool,
+    scope: Scope,
+    auth: AuthTier,
+    timeout: float | None,
+    idle_timeout: float | None,
+) -> account.DomainConfig | None:
+    """Flag-combination and `--domain` validation shared by `serve` and
+    `proxy` — everything that's target-agnostic (doesn't reference a file
+    to launch or a subprocess to inject into). Run before either does
+    anything else, so a bad flag combination or an unconfigured domain
+    fails immediately.
+
+    Returns the resolved `DomainConfig` when `domain` is set (used by the
+    caller to actually open the tunnel), or `None` otherwise.
+    """
+    if domain is not None and anon:
+        raise ValueError(
+            "--domain and --anon are mutually exclusive — --anon is Cloudflare's anonymous "
+            "Quick Tunnel with no custom domain; --domain routes through your own BYO domain."
+        )
+    if scope is not Scope.LOCAL:
+        raise NotImplementedError(
+            f"--scope {scope} isn't implemented — there's no directory service to "
+            "register with yet. Only the default --scope local works."
+        )
+    if auth not in (AuthTier.OPEN, AuthTier.TOKEN):
+        raise NotImplementedError(f"--auth {auth} isn't implemented — only open and token are built.")
+    if timeout is not None and timeout <= 0:
+        raise ValueError(f"--timeout must be a positive number of seconds, got {timeout}")
+    if idle_timeout is not None and idle_timeout <= 0:
+        raise ValueError(f"--idle-timeout must be a positive number of seconds, got {idle_timeout}")
+
+    if domain is None:
+        return None
+    domain_config = account.get_default_domain()
+    if domain_config is None or domain_config.domain != domain:
+        raise ValueError(
+            f"--domain {domain} isn't configured — run `sidepage account domain "
+            f"set {domain} --api-token-name <name>` first (the name must already "
+            "be in the vault, see `sidepage secrets set`)."
+        )
+    return domain_config
+
+
 def _validate_supported(config: ServeConfig) -> account.DomainConfig | None:
     """Validate `config` and resolve `--domain` against the persisted BYO
     configuration, all before `serve` does anything else — including
@@ -171,41 +248,18 @@ def _validate_supported(config: ServeConfig) -> account.DomainConfig | None:
     Returns the resolved `DomainConfig` when `config.domain` is set (used
     by `serve` to actually open the tunnel), or `None` otherwise.
     """
-    if config.domain is not None and config.anon:
-        raise ValueError(
-            "--domain and --anon are mutually exclusive — --anon is Cloudflare's anonymous "
-            "Quick Tunnel with no custom domain; --domain routes through your own BYO domain."
-        )
-    if config.scope is not Scope.LOCAL:
-        raise NotImplementedError(
-            f"--scope {config.scope} isn't implemented — there's no directory service to "
-            "register with yet. Only the default --scope local works."
-        )
-    if config.auth not in (AuthTier.OPEN, AuthTier.TOKEN):
-        raise NotImplementedError(
-            f"--auth {config.auth} isn't implemented — only open and token are built."
-        )
     if config.guardrail is not None:
         raise NotImplementedError(
             "--guardrail isn't implemented — parked, see sidepage.core.guardrail."
         )
-    if config.timeout is not None and config.timeout <= 0:
-        raise ValueError(f"--timeout must be a positive number of seconds, got {config.timeout}")
-    if config.idle_timeout is not None and config.idle_timeout <= 0:
-        raise ValueError(
-            f"--idle-timeout must be a positive number of seconds, got {config.idle_timeout}"
-        )
-
-    if config.domain is None:
-        return None
-    domain_config = account.get_default_domain()
-    if domain_config is None or domain_config.domain != config.domain:
-        raise ValueError(
-            f"--domain {config.domain} isn't configured — run `sidepage account domain "
-            f"set {config.domain} --api-token-name <name>` first (the name must already "
-            "be in the vault, see `sidepage secrets set`)."
-        )
-    return domain_config
+    return _validate_common(
+        domain=config.domain,
+        anon=config.anon,
+        scope=config.scope,
+        auth=config.auth,
+        timeout=config.timeout,
+        idle_timeout=config.idle_timeout,
+    )
 
 
 def serve(config: ServeConfig) -> None:
@@ -410,6 +464,167 @@ def serve(config: ServeConfig) -> None:
                 break
             if config.idle_timeout is not None:
                 idle_for = now - proxy.activity.last()
+                if idle_for >= config.idle_timeout:
+                    info(f"{app_name}: --idle-timeout ({config.idle_timeout:g}s) reached, stopping")
+                    break
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _teardown()
+
+
+def proxy(config: ProxyConfig) -> None:
+    """Wrap an already-running local service (`config.port`, always
+    `127.0.0.1`) with sidepage's proxy/auth/tunnel/registry stack, without
+    ever launching or owning a process. Mirrors `serve`'s shape closely —
+    same validation, same tunnel modes, same SIGTERM/timeout/idle-timeout
+    blocking loop — minus everything target-detection- and
+    subprocess-launch-related, since there's no file to detect a kind from
+    and nothing for `proxy` to spawn.
+
+    **Teardown asymmetry with `serve`, load-bearing, do not "fix" this**:
+    `serve`'s `_teardown()` kills the subprocess it spawned; this one must
+    not — sidepage never started `config.port`'s service, so Ctrl+C /
+    `sidepage stop <name>` tears down only the proxy, the tunnel, and the
+    registry entry, leaving that service running exactly as it was. See
+    `sidepage.commands.proxy` for the full set of user-facing caveats
+    (Origin/CSRF, localhost-trust security, OAuth/`--anon`) this prints a
+    condensed version of at startup.
+    """
+    domain_config = _validate_common(
+        domain=config.domain,
+        anon=config.anon,
+        scope=config.scope,
+        auth=config.auth,
+        timeout=config.timeout,
+        idle_timeout=config.idle_timeout,
+    )
+
+    app_name = config.name
+    if registry.get(app_name) is not None:
+        raise ValueError(
+            f"an app named {app_name!r} is already registered as running — "
+            f"`sidepage stop {app_name}` it first, or pass --name for a different one."
+        )
+
+    token: str | None = None
+    if config.auth is AuthTier.TOKEN:
+        token = resolve_token(explicit=config.token, env_value=os.environ.get("SIDEPAGE_TOKEN"))
+
+    listen_port = allocate_port()
+    proxy_handle: ProxyHandle
+    tunnel = None
+
+    def _teardown() -> None:
+        stop_proxy(proxy_handle)
+        # Unregister before closing the tunnel — same ordering requirement
+        # as serve()'s _teardown, see tunnel_manager.close_tunnel's
+        # docstring (BYO-domain teardown reference-counts the registry to
+        # decide whether the shared cloudflared process should die too).
+        registry.unregister(app_name)
+        if tunnel is not None:
+            try:
+                tunnel_manager.close_tunnel(tunnel)
+            except Exception as exc:
+                error(f"tunnel teardown failed: {exc}")
+        # Deliberately no subprocess teardown here (contrast serve()'s
+        # proc.terminate()/.kill()) — proxy never spawned config.port's
+        # service, so there is nothing to terminate.
+        stdout.print()
+        warn(
+            f"{app_name} stopped — the service on 127.0.0.1:{config.port} was not touched "
+            "and may still be running"
+        )
+
+    def _handle_sigterm(signum: int, frame: object) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+    proxy_handle = start_proxy(
+        app_name,
+        listen_port=listen_port,
+        upstream_port=config.port,
+        auth=config.auth.value,
+        token=token,
+    )
+
+    if token is not None:
+        write_runtime_file(RuntimeToken(app_name=app_name, pid=os.getpid(), value=token))
+
+    local_url = f"http://127.0.0.1:{listen_port}"
+    tunnel_url = None
+    if config.anon:
+        info("opening anonymous Cloudflare Quick Tunnel...")
+        tunnel = tunnel_manager.open_anon_tunnel(listen_port)
+        tunnel_url = tunnel.url
+    elif domain_config is not None:
+        info(f"opening BYO-domain tunnel on {domain_config.domain}...")
+        tunnel = tunnel_manager.open_byo_tunnel(
+            app_name,
+            domain_config.domain,
+            listen_port,
+            zone_id=domain_config.zone_id,
+            account_id=domain_config.account_id,
+            tunnel_id=domain_config.tunnel_id,
+            api_token_name=domain_config.api_token_name,
+            tunnel_token_name=domain_config.tunnel_token_name,
+        )
+        tunnel_url = tunnel.url
+
+    started_at = time.time()
+    registry.register(
+        registry.RunningApp(
+            name=app_name,
+            pid=os.getpid(),
+            target=f"127.0.0.1:{config.port}",
+            target_kind="external",
+            listen_port=listen_port,
+            url=local_url,
+            tunnel_url=tunnel_url,
+            started_at=started_at,
+            domain=domain_config.domain if domain_config is not None else None,
+        )
+    )
+
+    success(f"{app_name} proxying 127.0.0.1:{config.port} -> {local_url}")
+    if tunnel_url:
+        success(f"public URL: {tunnel_url}")
+    if token is not None:
+        info(f"access token: {token}")
+    if config.timeout is not None:
+        info(f"auto-stop after {config.timeout:g}s")
+    if config.idle_timeout is not None:
+        info(f"auto-stop after {config.idle_timeout:g}s of no traffic")
+    warn(
+        f"stopping {app_name!r} only tears down this proxy — your service on "
+        f"127.0.0.1:{config.port} keeps running"
+    )
+    warn(
+        "every proxied request reaches your app from 127.0.0.1 — any localhost-only "
+        "debug/admin logic (e.g. Flask's interactive debugger) is now reachable through "
+        "the tunnel too, regardless of --auth"
+    )
+    warn(
+        "your app's own Origin/Host/CSRF checks may still reject traffic even with "
+        "X-Forwarded-* set correctly — see `sidepage proxy --help` for framework fixes"
+    )
+    if config.anon:
+        warn(
+            "--anon: this hostname changes every run — OAuth/SSO redirect URIs can't be "
+            "registered against it; use --domain if your app does OAuth login"
+        )
+    info("Ctrl+C to stop")
+
+    try:
+        while True:
+            time.sleep(1)
+            now = time.time()
+            if config.timeout is not None and now - started_at >= config.timeout:
+                info(f"{app_name}: --timeout ({config.timeout:g}s) reached, stopping")
+                break
+            if config.idle_timeout is not None:
+                idle_for = now - proxy_handle.activity.last()
                 if idle_for >= config.idle_timeout:
                     info(f"{app_name}: --idle-timeout ({config.idle_timeout:g}s) reached, stopping")
                     break

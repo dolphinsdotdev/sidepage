@@ -8,6 +8,7 @@ Command tree:
   sidepage new <name>                                     §1
   sidepage serve <target>                                  §2
   sidepage stop <app-name>                                 §2
+  sidepage proxy --port <n> --name <app-name>              (not in spec — see note below)
   sidepage promote <app-name>                              §5
   sidepage login                                           §13
   sidepage account status                                  §13
@@ -26,6 +27,13 @@ Note: `sidepage setup` isn't a v1/v3/v4 spec command at all — it's a
 binary tunnel functionality needs without making it a Python dependency
 or vendoring it into the wheel). See `sidepage.core.cloudflared_installer`
 and `sidepage.commands.setup`.
+
+Note: `sidepage proxy` isn't a v1/v3/v4 spec command either — it's `serve`
+with target detection and subprocess launch removed, for wrapping a
+service the user already has running rather than one sidepage starts
+itself. Reuses `serve`'s validation/tunnel/registry/auth machinery
+(`sidepage.core.process._validate_common`) and shares `serve`'s `stop`
+rather than declaring its own. See `sidepage.commands.proxy`.
 
 Note: v3 has no "Directory queries" section (v1's §10) — it doesn't
 mention `ls`/`status` at all, jumping from §9 (local reverse proxy) to §10
@@ -66,6 +74,7 @@ from sidepage.commands import (
     directory,
     inspect,
     new,
+    proxy,
     scope,
     secrets,
     serve,
@@ -116,6 +125,12 @@ app.command("new")(new.new)
 # §2 — serving
 app.command("serve")(serve.serve)
 app.command("stop")(serve.stop)
+
+# Not a numbered spec section — wraps an already-running local service
+# instead of a target `serve` launches itself. Shares `stop` with `serve`
+# (sidepage.core.process.stop` is target-agnostic, keyed on the registry
+# pid) rather than declaring a second one. See sidepage.commands.proxy.
+app.command("proxy")(proxy.proxy)
 
 # §5 — discovery & scope
 app.command("promote")(scope.promote)

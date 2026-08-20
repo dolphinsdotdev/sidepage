@@ -34,6 +34,15 @@ different in kind from every other tool here: it's the one thing that
 isn't a CLI subcommand at all — `GET /.sidepage/peers.json` is a route on
 the *served app's own proxy*, so this tool resolves that app's URL via
 `sidepage status` first, then makes the HTTP call itself.
+
+`sidepage_proxy_new` mirrors `sidepage_serve_new` for `sidepage proxy`
+(wraps an already-running local service instead of a target this fixture
+launches) — same detach-and-poll-the-log background pattern via
+`_start_background`, just building `proxy` argv (`--port`, `--name`)
+instead of `serve` argv (a positional target). No `peers` parameter:
+`--peer` doesn't apply to `proxy` (see `sidepage.commands.proxy`, which
+rejects it outright rather than accepting and ignoring it) since there's
+no subprocess to inject `SIDEPAGE_PEER_<ROLE>_URL` into.
 """
 
 from __future__ import annotations
@@ -117,15 +126,19 @@ def _peer_flags(peers: list[str] | None) -> list[str]:
     return flags
 
 
-def _start_background(serve_args: list[str], *, app_name: str) -> dict:
-    """Launch `sidepage serve <serve_args>` detached and poll its log for a
-    URL or an error, same algorithm as `scripts/start_site.sh`."""
+def _start_background(argv: list[str], *, app_name: str, subcommand: str = "serve") -> dict:
+    """Launch `sidepage <subcommand> <argv>` detached and poll its log for a
+    URL or an error, same algorithm as `scripts/start_site.sh`. Shared by
+    `sidepage_serve_new`/`sidepage_serve_registered` (`subcommand="serve"`,
+    the default) and `sidepage_proxy_new` (`subcommand="proxy"`) — both
+    block in the foreground and only exit on Ctrl+C/`stop`, so both need
+    the same detach-and-poll treatment."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_file = LOG_DIR / f"{app_name}.log"
     log_handle = log_file.open("w")
 
     proc = subprocess.Popen(
-        [SIDEPAGE_BIN, "serve", *serve_args],
+        [SIDEPAGE_BIN, subcommand, *argv],
         stdout=log_handle,
         stderr=subprocess.STDOUT,
         start_new_session=True,
@@ -226,6 +239,34 @@ def sidepage_serve_registered(
         *_peer_flags(peers),
     ]
     return _start_background(argv, app_name=name)
+
+
+@mcp.tool()
+def sidepage_proxy_new(
+    port: int,
+    name: str | None = None,
+    flags: str = "",
+    timeout: float | None = None,
+    idle_timeout: float | None = None,
+) -> dict:
+    """Proxy an already-running local service on `port` (`sidepage proxy
+    --port <port>`), e.g. flags="--auth token --anon". Backgrounds the
+    blocking `proxy` call and reports back once it's running, failed, or
+    still starting — same detach-and-poll treatment as `sidepage_serve_new`.
+
+    `name` is optional for plain local use (defaults to `proxy-<port>`,
+    same as the CLI) but required if `flags` includes `--domain`/`--anon`
+    — `sidepage proxy` itself rejects the combination loud rather than
+    silently generating one, since the name becomes part of the public
+    hostname/registry entry there. No `peers` parameter: `--peer` isn't
+    accepted by `proxy` at all (see `sidepage.commands.proxy`)."""
+    argv = ["--port", str(port)]
+    if name is not None:
+        argv += ["--name", name]
+    argv += shlex.split(flags)
+    argv += _lifecycle_flags(timeout, idle_timeout)
+    app_name = name or f"proxy-{port}"
+    return _start_background(argv, app_name=app_name, subcommand="proxy")
 
 
 @mcp.tool()

@@ -3,10 +3,12 @@
 Local-first hosting and tunneling for code, static sites, and notebooks.
 `sidepage serve` wraps almost anything — a script, a static site, a
 Streamlit or FastAPI app, a Python MCP server, a Jupyter notebook —
-behind a local reverse proxy and hands you a URL. `sidepage new`
-scaffolds a static site to get started.
+behind a local reverse proxy and hands you a URL. `sidepage proxy` does
+the same for a service you already have running (`npm run dev`, a
+container, anything already listening on a port) instead of one sidepage
+launches itself. `sidepage new` scaffolds a static site to get started.
 
-**Status:** `serve`, `secrets`, `inspect`, and bring-your-own-domain
+**Status:** `serve`, `proxy`, `secrets`, `inspect`, and bring-your-own-domain
 tunneling are real and tested end to end. Features that need a Sidepage
 cloud backend that doesn't exist yet (brokered tunneling, account login,
 the directory beyond this machine) print a clear "not implemented"
@@ -54,11 +56,18 @@ uv run sidepage serve some_app.py --env MY_KEY --anon
 # Auto-stop after 30 minutes of no traffic, and inject another running
 # app's URL as SIDEPAGE_PEER_API_URL
 uv run sidepage serve frontend.py --idle-timeout 1800 --peer api=backend
+
+# Proxy a service you already have running instead of one sidepage
+# launches — npm run dev, a container, anything on a port
+uv run sidepage proxy --port 5173 --name my-vite-app
 ```
 
-Every `serve` call blocks the terminal until Ctrl+C (or `sidepage stop
-<app-name>` from another terminal), tearing everything down immediately —
-no background/daemon mode.
+Every `serve`/`proxy` call blocks the terminal until Ctrl+C (or `sidepage
+stop <app-name>` from another terminal) — no background/daemon mode.
+`serve` tears down the process it launched too; `proxy` never launched
+anything, so Ctrl+C/`stop` only tears down the proxy and tunnel — the
+service you pointed it at keeps running (see [Proxying an already-running
+service](#proxying-an-already-running-service)).
 
 ## How it works
 
@@ -78,7 +87,8 @@ Two things sit between "just run a script" and what `serve` does:
 | Command | What it does |
 |---|---|
 | `sidepage serve <target>` | Wrap and host a static dir, script, or app — see flags below. |
-| `sidepage stop <app-name>` | Tear down a running app. |
+| `sidepage proxy --port <n>` | Wrap an already-running local service instead of one `serve` launches — see below. |
+| `sidepage stop <app-name>` | Tear down a running app (`serve` or `proxy`). |
 | `sidepage ls` / `sidepage status <app-name>` | List / check apps running on this machine. |
 | `sidepage usage <app-name>` | Request and connection counts for an app. |
 | `sidepage inspect [<app-name>]` | Interactive HTTP console against a running app. |
@@ -126,6 +136,64 @@ sidepage serve <target> [--type auto|code|static|notebook] [--name <app-name>]
 Run `sidepage <command> --help` for the full flag list, including ones
 that parse but aren't implemented yet (they report that clearly rather
 than silently doing nothing).
+
+## Proxying an already-running service
+
+`sidepage proxy` wraps a service you already have running — `npm run
+dev`, a container, anything already listening on a port — with the same
+reverse proxy, auth, and tunnel stack `serve` uses, minus one thing:
+sidepage never launches, owns, or manages the process's lifecycle.
+
+```bash
+sidepage proxy --port <n> [--name <app-name>] [--domain <domain> | --anon]
+               [--auth open|token] [--token <value>]
+               [--timeout <seconds>] [--idle-timeout <seconds>]
+```
+
+- `--port` is the only required flag — always dialed on `127.0.0.1`, with
+  an automatic fallback to `[::1]` (IPv6 loopback) if that doesn't
+  answer, since `proxy` can't control how the wrapped service was bound
+  the way `serve` can for its own launchers.
+- `--name` defaults to `proxy-<port>` for plain local use; it's required
+  (and rejected loud if missing) once `--domain`/`--anon` is set, since it
+  becomes part of the public hostname there.
+- `--type`, `--env`, `--guardrail`, `--peer` aren't accepted at all — each
+  gives a specific, actionable error instead of being silently ignored,
+  since they're all about a subprocess `proxy` doesn't own.
+
+**The one behavior that's genuinely different from `serve`:** Ctrl+C /
+`sidepage stop <name>` tear down the proxy, the tunnel, and the registry
+entry only. The service you pointed `--port` at was never sidepage's to
+stop, and it doesn't.
+
+**Read `sidepage proxy --help` before pointing this at anything public** —
+it documents, loudly, three things worth knowing up front:
+- Every proxied request reaches the wrapped app from `127.0.0.1`
+  (sidepage's own address) — any app-level logic that trusts "this came
+  from localhost" instead of checking `X-Forwarded-For` (debug endpoints,
+  admin panels, and pointedly Flask/Werkzeug's interactive debugger — a
+  known RCE if reachable) is silently defeated, `--auth` or not.
+- The real `Host`/`X-Forwarded-Host`/`X-Forwarded-Proto`/`X-Forwarded-For`
+  are forwarded on HTTP requests (WebSocket connections carry
+  `X-Forwarded-Host` only, not a literal `Host` override — some WS
+  servers, Jupyter/Tornado confirmed live, reject a forwarded real
+  hostname on the handshake) — but that only helps an app that's
+  configured to trust them. `--help` has a one-line fix per framework
+  (Django, Flask, FastAPI/Starlette, Express, Rails, Vite).
+- OAuth/SSO logins are effectively incompatible with `--anon`, since the
+  hostname changes every run and providers require an exact,
+  pre-registered redirect URI — use `--domain` for anything doing OAuth.
+
+```bash
+# Already running: npm run dev -- --host 127.0.0.1 --port 5173
+sidepage proxy --port 5173                        # local only
+sidepage proxy --port 5173 --domain example.com    # your own domain
+sidepage proxy --port 5173 --anon                  # *.trycloudflare.com
+```
+
+One known gap: HMR/live-reload for a Vite dev server proxied through
+`--anon` doesn't reliably work (initial page load and `--domain` are both
+unaffected) — see [Project status](#project-status).
 
 ## Timeouts, lazy start, and peers
 
@@ -240,7 +308,7 @@ src/sidepage/
 └── config/          Local config paths (XDG-style, overridable via SIDEPAGE_HOME)
 
 tests/
-├── fixtures/        Real apps used as test targets (static site, Streamlit, FastAPI, MCP, notebook)
+├── fixtures/        Real apps used as test targets (static site, Streamlit, FastAPI, MCP, notebook, Flask, Vite)
 └── test_*.py        Unit and integration tests
 
 docs/
@@ -261,27 +329,45 @@ Runtime dependencies are real, not stubs: Starlette, uvicorn, httpx, and
 `websockets` back the reverse proxy; `cryptography` backs the secrets
 vault. `cloudflared` and network access (for `uv run` to resolve wrapped
 apps' dependencies) are expected to be available wherever tests run.
+Node.js/npm are needed too, for the Vite fixture tests
+(`tests/test_proxy_frameworks.py`) — `npm install` runs automatically
+against `tests/fixtures/vite-app` the first time those tests run.
 
 ## Project status
 
 **Real and tested end to end:** `serve` for static, code, and notebook
 targets (Streamlit/FastAPI/Python-MCP auto-detected, generic `$PORT`
-fallback, full Jupyter Lab for `.ipynb`), `open`/`token` auth, `--env`
+fallback, full Jupyter Lab for `.ipynb`), `proxy` for an already-running
+service (own `--name` default, teardown that never touches the wrapped
+service, Caddy-style forwarded headers, and an IPv6 loopback fallback —
+the latter two shared with `serve` too), `open`/`token` auth, `--env`
 secret injection, `--anon` tunneling, BYO-domain tunneling (`account
-domain set` + `serve --domain`), `secrets`, `stop`/`ls`/`status`/`usage`,
-`inspect` for HTTP/static targets, the local app registry (`app
-register|list|show|unregister` + `serve <app-name>`, with real one-off
-override merging), `--timeout`/`--idle-timeout` auto-teardown, lazy start
-for code/notebook targets (subprocess deferred to the first request), and
-`--peer <role>=<app-name>` (boot-time env injection plus a live
-`GET /.sidepage/peers.json`).
+domain set` + `serve`/`proxy --domain`), `secrets`,
+`stop`/`ls`/`status`/`usage`, `inspect` for HTTP/static targets, the
+local app registry (`app register|list|show|unregister` + `serve
+<app-name>`, with real one-off override merging), `--timeout`/
+`--idle-timeout` auto-teardown, lazy start for code/notebook targets
+(subprocess deferred to the first request), and `--peer
+<role>=<app-name>` (boot-time env injection plus a live `GET
+/.sidepage/peers.json`).
 
 **Not implemented, and reports that clearly rather than silently
 no-op'ing:** brokered (default) tunneling, `login`/`account status`, the
 discovery directory beyond this machine, `--guardrail`, `--auth
-network`/`oauth`, MCP tool browsing in `inspect`, and the OS-keychain
-backend for the secrets vault (encrypted-file only for
-now).
+network`/`oauth`, MCP tool browsing in `inspect`, `proxy` detecting
+Vite's `allowedHosts` rejection and printing an inline hint (documented
+in `--help` instead, see [Proxying an already-running
+service](#proxying-an-already-running-service)), and the OS-keychain
+backend for the secrets vault (encrypted-file only for now).
+
+**Known limitation, investigated not fixed:** HMR/live-reload for a Vite
+target proxied through `--anon` doesn't reliably work, even though the
+initial page load and BYO-domain are both unaffected — ruled out
+sidepage's own header forwarding/routing as the cause (the exact browser
+handshake, reproduced with `curl`, succeeds through the real Cloudflare
+edge + `cloudflared` + sidepage + Vite chain end to end); the gap is
+somewhere in how a real browser's `WebSocket` negotiates against
+Cloudflare's Quick Tunnel edge specifically, not isolated further.
 
 See [`docs/CHECKLIST.md`](docs/CHECKLIST.md) for the full per-feature
 breakdown, and [`docs/OPEN_QUESTIONS.md`](docs/OPEN_QUESTIONS.md) for

@@ -44,6 +44,47 @@ than replacing it:
   configured `--peer` against `sidepage.core.registry` on every request,
   so a peer that restarts mid-session with a fresh tunnel URL is never
   stale the way a boot-time env var would be (spec v5 `--peer`).
+
+Forwarded headers (Caddy-style, not nginx's bare default): `X-Forwarded-
+Host`/`-For`/`-Proto` are set on both the HTTP path (`proxy_http`) and
+the WS handshake (`proxy_ws`, via `websockets.connect`'s
+`additional_headers`); the real inbound `Host` itself is also passed
+through as the literal `Host` header, but **HTTP only** — see
+`_forwarded_headers`'s `override_host` parameter. This exists so an
+upstream that's configured to trust its proxy (Django's
+`USE_X_FORWARDED_HOST`, Flask's `ProxyFix`, Rails' default
+`trusted_proxies`, Express's `trust proxy`, ...) generates correct
+absolute URLs/redirects/cookies regardless of whether it's reached
+directly or through a BYO-domain/anon tunnel — nginx's un-configured
+default (nothing forwarded, `Host` silently clobbered) leaves even a
+fully proxy-aware app with no header to trust, which is strictly worse,
+not just equally manual. This is necessary but not sufficient: an
+upstream that validates `Origin`/`Host` against a fixed allowlist (Vite's
+`server.allowedHosts`, Django's `ALLOWED_HOSTS`) still needs that
+allowlist updated on its own side — see `sidepage.commands.proxy` for the
+user-facing caveat. The literal `Host` override is WS-exempt because it's
+been verified live, against this project's own notebook fixture, to
+break exactly that class of check: Jupyter (Tornado) validates `Host` on
+the WS upgrade more strictly than on plain HTTP and rejected a forwarded
+real hostname outright, closing the connection — the same DNS-rebinding-
+style check Vite's `allowedHosts` does, just hit for real here instead of
+only in theory. `X-Forwarded-Proto` passes through an already-present
+value if the request arrived with one (e.g. from a fronting layer that
+sets it) and otherwise falls back to this proxy's own scope scheme
+(`http` — this process never terminates TLS itself); that fallback
+hasn't been verified against a real `cloudflared` tunnel's actual
+behavior, so treat it as the honest default rather than a
+confirmed-correct one.
+
+Upstream dial: `127.0.0.1` first, falling back to `[::1]` (IPv6 loopback)
+if that never answers (`check_upstream_ready`, `UpstreamAddress`) —
+resolved once during the readiness poll, then reused for every
+subsequent request/connection. Exists because `sidepage.commands.proxy`
+wraps a process it never launched and can't control the bind address
+of; verified live that a bare `npm run dev` (no `--host`) binds Vite's
+dev server to IPv6 loopback only, which `serve`'s own launchers never do
+since sidepage passes an explicit `--host`/`--server.address 127.0.0.1`
+at spawn time for every framework it has a real launcher for.
 """
 
 from __future__ import annotations
@@ -113,6 +154,42 @@ def _parse_cookies(cookie_header: str) -> dict[str, str]:
             k, v = part.strip().split("=", 1)
             cookies[k] = v
     return cookies
+
+
+def _forwarded_headers(
+    headers: dict[str, str],
+    request_headers: Headers,
+    client_host: str | None,
+    *,
+    override_host: bool,
+) -> None:
+    """Mutates `headers` (already stripped of hop-by-hop names, see
+    `_HOP_BY_HOP`) in place, adding the `X-Forwarded-*` trio and,
+    when `override_host` is set, a Caddy-style `Host` too — see this
+    module's docstring for why. Shared by `proxy_http` and `proxy_ws` so
+    both the HTTP path and the WS handshake carry the same forwarded
+    identity.
+
+    `override_host=False` on the WS path specifically (see `proxy_ws`):
+    verified live against this project's own notebook fixture that a real
+    Tornado-based server (Jupyter) validates the literal `Host` header on
+    the WS upgrade more strictly than on plain HTTP — the same
+    DNS-rebinding-style allowlist check Vite's `server.allowedHosts` does
+    (see `sidepage.commands.proxy`'s `--help`) — and rejects a forwarded
+    real hostname outright, breaking the handshake. `X-Forwarded-Host`
+    carries the real value for anything that reads it without that risk;
+    only the literal `Host` override is what a naive allowlist check
+    inspects, so only that one is skipped here.
+    """
+    inbound_host = request_headers.get("host")
+    if inbound_host:
+        if override_host:
+            headers["host"] = inbound_host
+        headers["x-forwarded-host"] = inbound_host
+    if client_host:
+        existing_xff = request_headers.get("x-forwarded-for")
+        headers["x-forwarded-for"] = f"{existing_xff}, {client_host}" if existing_xff else client_host
+    headers["x-forwarded-proto"] = request_headers.get("x-forwarded-proto") or "http"
 
 
 class ActivityTracker:
@@ -234,6 +311,7 @@ def _build_proxy_app(
     *,
     app_name: str,
     upstream_port: int,
+    upstream_host: UpstreamAddress,
     auth: str,
     token: str | None,
     ready: threading.Event,
@@ -265,7 +343,9 @@ def _build_proxy_app(
             start_upstream()
 
             def _poll_ready() -> None:
-                if check_upstream_ready(upstream_port):
+                resolved = check_upstream_ready(upstream_port)
+                if resolved is not None:
+                    upstream_host.host = resolved
                     ready.set()
 
             threading.Thread(target=_poll_ready, daemon=True).start()
@@ -287,10 +367,12 @@ def _build_proxy_app(
             _persist_counts(app_name, counts)
             return HTMLResponse(_HOLDING_PAGE)
 
-        upstream_url = f"http://127.0.0.1:{upstream_port}{request.url.path}"
+        upstream_url = f"http://{upstream_host.host}:{upstream_port}{request.url.path}"
         if request.url.query:
             upstream_url += f"?{request.url.query}"
         headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
+        client_host = request.client.host if request.client is not None else None
+        _forwarded_headers(headers, request.headers, client_host, override_host=True)
         body = await request.body()
 
         try:
@@ -315,10 +397,15 @@ def _build_proxy_app(
         activity.touch()
         counts["ws_connections"] = counts.get("ws_connections", 0) + 1
         _persist_counts(app_name, counts)
-        upstream_url = f"ws://127.0.0.1:{upstream_port}{websocket.url.path}"
+        upstream_url = f"ws://{upstream_host.host}:{upstream_port}{websocket.url.path}"
+        ws_headers: dict[str, str] = {}
+        client_host = websocket.client.host if websocket.client is not None else None
+        _forwarded_headers(ws_headers, websocket.headers, client_host, override_host=False)
 
         try:
-            async with websockets.connect(upstream_url) as upstream_ws:
+            async with websockets.connect(
+                upstream_url, additional_headers=ws_headers
+            ) as upstream_ws:
 
                 async def client_to_upstream() -> None:
                     try:
@@ -390,19 +477,46 @@ class ProxyHandle:
     activity: ActivityTracker = field(repr=False)
 
 
-def check_upstream_ready(upstream_port: int, *, timeout: float = 20.0) -> bool:
+_LOOPBACK_CANDIDATES = ("127.0.0.1", "[::1]")
+
+
+class UpstreamAddress:
+    """Resolved loopback host for one proxied upstream — `127.0.0.1` by
+    default (every existing `serve` launcher already binds there), only
+    ever overwritten if that default never answered and `[::1]` (IPv6
+    loopback) did, per `check_upstream_ready`. A single attribute,
+    GIL-atomic like `ActivityTracker` — written once by the readiness
+    poll, read on every request/connection by `proxy_http`/`proxy_ws`.
+    """
+
+    def __init__(self) -> None:
+        self.host = "127.0.0.1"
+
+
+def check_upstream_ready(upstream_port: int, *, timeout: float = 20.0) -> str | None:
     """Real HTTP GET readiness check — not a bare TCP connect, since some
     frameworks (Streamlit included) bind the socket before they're
-    actually ready to serve."""
+    actually ready to serve.
+
+    Tries `127.0.0.1` first, falling back to `[::1]` (IPv6 loopback) if
+    that one never answers — verified live that some already-running
+    services `sidepage proxy` wraps (a bare `npm run dev` Vite dev
+    server, with no way for sidepage to control how it was launched the
+    way it can for `serve`'s own targets) bind IPv6 loopback only.
+    Returns whichever host actually answered, or `None` if neither did
+    within `timeout` — never guesses.
+    """
     deadline = time.monotonic() + timeout
     with httpx.Client(timeout=1.0) as client:
         while time.monotonic() < deadline:
-            try:
-                client.get(f"http://127.0.0.1:{upstream_port}/")
-                return True
-            except httpx.TransportError:
-                time.sleep(0.2)
-    return False
+            for host in _LOOPBACK_CANDIDATES:
+                try:
+                    client.get(f"http://{host}:{upstream_port}/")
+                    return host
+                except httpx.TransportError:
+                    continue
+            time.sleep(0.2)
+    return None
 
 
 def start_proxy(
@@ -443,9 +557,11 @@ def start_proxy(
         ready.set()
     else:
         counts: dict[str, int] = {}
+        upstream_host = UpstreamAddress()
         app = _build_proxy_app(
             app_name=app_name,
             upstream_port=upstream_port,
+            upstream_host=upstream_host,
             auth=auth,
             token=token,
             ready=ready,
@@ -458,7 +574,9 @@ def start_proxy(
         if start_upstream is None:
 
             def _poll_ready() -> None:
-                if check_upstream_ready(upstream_port):
+                resolved = check_upstream_ready(upstream_port)
+                if resolved is not None:
+                    upstream_host.host = resolved
                     ready.set()
 
             threading.Thread(target=_poll_ready, daemon=True).start()
