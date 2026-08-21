@@ -188,7 +188,9 @@ def _forwarded_headers(
         headers["x-forwarded-host"] = inbound_host
     if client_host:
         existing_xff = request_headers.get("x-forwarded-for")
-        headers["x-forwarded-for"] = f"{existing_xff}, {client_host}" if existing_xff else client_host
+        headers["x-forwarded-for"] = (
+            f"{existing_xff}, {client_host}" if existing_xff else client_host
+        )
     headers["x-forwarded-proto"] = request_headers.get("x-forwarded-proto") or "http"
 
 

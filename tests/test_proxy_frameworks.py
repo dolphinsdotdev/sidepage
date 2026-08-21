@@ -80,7 +80,9 @@ def _stop(name: str, env: dict[str, str]) -> None:
     subprocess.run([SIDEPAGE_BIN, "stop", name], env=env, capture_output=True, timeout=15)
 
 
-def _poll_until_ready(url: str, *, timeout: float, headers: dict[str, str] | None = None) -> httpx.Response:
+def _poll_until_ready(
+    url: str, *, timeout: float, headers: dict[str, str] | None = None
+) -> httpx.Response:
     deadline = time.monotonic() + timeout
     last: httpx.Response | None = None
     while time.monotonic() < deadline:

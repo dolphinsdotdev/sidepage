@@ -1,6 +1,6 @@
 [project]
 name = "sidepage"
-version = "0.2.0"
+version = "0.2.1"
 description = "Sidepage CLI — local-first hosting, tunneling, and directory for small apps and MCP servers"
 readme = "README.md"
 authors = [{ name = "Kalpit B", email = "kalpit@dolphins.dev" }]

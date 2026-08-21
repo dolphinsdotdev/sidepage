@@ -474,7 +474,8 @@ def test_proxy_byo_domain_opens_tunnel_and_registers(
 
     from sidepage.core.auth import AuthTier
     from sidepage.core.directory_client import Scope
-    from sidepage.core.process import ProxyConfig, proxy as core_proxy
+    from sidepage.core.process import ProxyConfig
+    from sidepage.core.process import proxy as core_proxy
 
     config = ProxyConfig(
         port=echo_server.port,

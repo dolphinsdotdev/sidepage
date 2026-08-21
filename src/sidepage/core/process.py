@@ -240,7 +240,9 @@ def _validate_common(
             "register with yet. Only the default --scope local works."
         )
     if auth not in (AuthTier.OPEN, AuthTier.TOKEN):
-        raise NotImplementedError(f"--auth {auth} isn't implemented — only open and token are built.")
+        raise NotImplementedError(
+            f"--auth {auth} isn't implemented — only open and token are built."
+        )
     if timeout is not None and timeout <= 0:
         raise ValueError(f"--timeout must be a positive number of seconds, got {timeout}")
     if idle_timeout is not None and idle_timeout <= 0:
