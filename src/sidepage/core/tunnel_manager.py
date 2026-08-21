@@ -57,13 +57,10 @@ Three modes, selected by what `serve` was given:
 from __future__ import annotations
 
 import base64
-import fcntl
 import json
-import os
 import queue
 import re
 import shutil
-import signal
 import subprocess
 import threading
 import time
@@ -81,7 +78,7 @@ from sidepage.config.settings import (
     tunnel_pid_file,
     tunnels_dir,
 )
-from sidepage.core import registry, secrets_vault
+from sidepage.core import _platform, registry, secrets_vault
 from sidepage.core.directory_client import check_name
 from sidepage.core.exceptions import CloudflaredResolutionError, TunnelError
 
@@ -308,20 +305,12 @@ def _domain_lock(domain: str):
     """
     tunnels_dir().mkdir(parents=True, exist_ok=True, mode=0o700)
     lock_path = tunnel_lock_file(domain)
-    with open(lock_path, "w") as fh:
-        fcntl.flock(fh, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fh, fcntl.LOCK_UN)
+    with open(lock_path, "w") as fh, _platform.lock_exclusive(fh):
+        yield
 
 
 def _is_pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+    return _platform.is_pid_alive(pid)
 
 
 def _ensure_shared_tunnel_running(domain: str, tunnel_token: str) -> None:
@@ -361,7 +350,7 @@ def _ensure_shared_tunnel_running(domain: str, tunnel_token: str) -> None:
             [str(binary), "tunnel", "run", "--token", tunnel_token],
             stdout=log_handle,
             stderr=subprocess.STDOUT,
-            start_new_session=True,
+            **_platform.new_process_group_kwargs(),
         )
     finally:
         log_handle.close()  # child has its own duped fd — ours would just leak otherwise
@@ -408,7 +397,7 @@ def _stop_shared_tunnel_if_unused(domain: str) -> None:
     if not _is_pid_alive(pid):
         return
     try:
-        os.kill(pid, signal.SIGTERM)
+        _platform.terminate_process(pid, force=False)
     except OSError:
         return
     deadline = time.monotonic() + 5.0
@@ -416,7 +405,7 @@ def _stop_shared_tunnel_if_unused(domain: str) -> None:
         time.sleep(0.1)
     if _is_pid_alive(pid):
         try:
-            os.kill(pid, signal.SIGKILL)
+            _platform.terminate_process(pid, force=True)
         except OSError:
             pass
 

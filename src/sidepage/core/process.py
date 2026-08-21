@@ -53,14 +53,26 @@ and `proxy`; `proxy`'s own `_teardown` deliberately never touches
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from sidepage.core import account, ecosystem, notebook, registry, secrets_vault, tunnel_manager
+import httpx
+
+from sidepage.core import (
+    _platform,
+    account,
+    ecosystem,
+    notebook,
+    registry,
+    secrets_vault,
+    tunnel_manager,
+)
 from sidepage.core.auth import AuthTier
 from sidepage.core.directory_client import Scope
 from sidepage.core.reverse_proxy import ProxyHandle, start_proxy, stop_proxy
@@ -76,7 +88,15 @@ from sidepage.core.target import (
     detect_mcp_package,
     detect_target_kind,
 )
-from sidepage.core.token_runtime import RuntimeToken, resolve_token, write_runtime_file
+from sidepage.core.token_runtime import (
+    ControlToken,
+    RuntimeToken,
+    generate_control_token,
+    read_control_token_file,
+    resolve_token,
+    write_control_token_file,
+    write_runtime_file,
+)
 from sidepage.output import error, info, stdout, success, warn
 
 
@@ -310,6 +330,11 @@ def serve(config: ServeConfig) -> None:
     proxy: ProxyHandle
     tunnel = None
     launcher: CodeLauncher | None = None
+    # Always generated, regardless of --auth — gates POST /.sidepage/stop,
+    # the cross-platform stand-in for a cross-process SIGTERM that
+    # sidepage.core.process.stop() uses on Windows (see that function and
+    # sidepage.core.token_runtime.ControlToken for why).
+    control_token = generate_control_token()
 
     def _teardown() -> None:
         stop_proxy(proxy)
@@ -348,6 +373,7 @@ def serve(config: ServeConfig) -> None:
             static_root=target,
             auth=config.auth.value,
             token=token,
+            control_token=control_token,
         )
     elif target_kind is TargetKind.CODE:
         upstream_port = allocate_port()
@@ -368,6 +394,7 @@ def serve(config: ServeConfig) -> None:
             upstream_port=upstream_port,
             auth=config.auth.value,
             token=token,
+            control_token=control_token,
             start_upstream=_start_code_upstream,
             peers=config.peers,
         )
@@ -386,6 +413,7 @@ def serve(config: ServeConfig) -> None:
             upstream_port=upstream_port,
             auth=config.auth.value,
             token=token,
+            control_token=control_token,
             start_upstream=_start_notebook_upstream,
             peers=config.peers,
         )
@@ -396,6 +424,7 @@ def serve(config: ServeConfig) -> None:
 
     if token is not None:
         write_runtime_file(RuntimeToken(app_name=app_name, pid=os.getpid(), value=token))
+    write_control_token_file(ControlToken(app_name=app_name, pid=os.getpid(), value=control_token))
 
     local_url = f"http://127.0.0.1:{listen_port}"
     tunnel_url = None
@@ -458,6 +487,12 @@ def serve(config: ServeConfig) -> None:
     try:
         while True:
             time.sleep(1)
+            if proxy.stop_requested.is_set():
+                # POST /.sidepage/stop — the cross-platform stand-in for a
+                # cross-process SIGTERM, used by sidepage.core.process.stop()
+                # on Windows (see that function's docstring for why the real
+                # signal doesn't work there).
+                break
             now = time.time()
             if config.timeout is not None and now - started_at >= config.timeout:
                 info(f"{app_name}: --timeout ({config.timeout:g}s) reached, stopping")
@@ -514,6 +549,7 @@ def proxy(config: ProxyConfig) -> None:
     listen_port = allocate_port()
     proxy_handle: ProxyHandle
     tunnel = None
+    control_token = generate_control_token()
 
     def _teardown() -> None:
         stop_proxy(proxy_handle)
@@ -547,10 +583,12 @@ def proxy(config: ProxyConfig) -> None:
         upstream_port=config.port,
         auth=config.auth.value,
         token=token,
+        control_token=control_token,
     )
 
     if token is not None:
         write_runtime_file(RuntimeToken(app_name=app_name, pid=os.getpid(), value=token))
+    write_control_token_file(ControlToken(app_name=app_name, pid=os.getpid(), value=control_token))
 
     local_url = f"http://127.0.0.1:{listen_port}"
     tunnel_url = None
@@ -619,6 +657,12 @@ def proxy(config: ProxyConfig) -> None:
     try:
         while True:
             time.sleep(1)
+            if proxy_handle.stop_requested.is_set():
+                # POST /.sidepage/stop — the cross-platform stand-in for a
+                # cross-process SIGTERM, used by sidepage.core.process.stop()
+                # on Windows (see that function's docstring for why the real
+                # signal doesn't work there).
+                break
             now = time.time()
             if config.timeout is not None and now - started_at >= config.timeout:
                 info(f"{app_name}: --timeout ({config.timeout:g}s) reached, stopping")
@@ -634,20 +678,72 @@ def proxy(config: ProxyConfig) -> None:
         _teardown()
 
 
+def _request_stop_windows(app: registry.RunningApp, app_name: str) -> None:
+    """Best-effort graceful stop on Windows: `POST /.sidepage/stop` on the
+    target's own reverse proxy, authenticated with its control token (see
+    `sidepage.core.token_runtime.ControlToken`). Never raises — a failure
+    here (missing control-token file, connection refused, timeout) just
+    means the caller's usual 10s wait finds the app still alive and falls
+    through to a hard kill, so this only warns rather than aborting `stop`
+    outright.
+
+    **Why POSIX doesn't need this**: `os.kill(pid, signal.SIGTERM)` sent
+    from a different process there is delivered as a real signal, caught
+    by the target's own `signal.signal(signal.SIGTERM, ...)` handler (see
+    `serve`/`proxy` above), which raises `KeyboardInterrupt` and runs the
+    normal `finally: _teardown()` path. On Windows, `os.kill(pid,
+    signal.SIGTERM)` sent cross-process instead calls `TerminateProcess`
+    directly — no signal is delivered, so that handler never runs, and the
+    target would be hard-killed without ever unregistering itself, closing
+    its tunnel, or killing a subprocess it spawned. This local HTTP call
+    reaches the target's own event loop instead, so it can run that exact
+    same teardown itself before exiting.
+    """
+    try:
+        control = read_control_token_file(app_name, app.pid)
+    except (FileNotFoundError, json.JSONDecodeError):
+        warn(
+            f"{app_name}: no control token file found for a graceful stop request — "
+            "falling back to a hard kill after the usual wait"
+        )
+        return
+    try:
+        httpx.post(
+            f"{app.url}/.sidepage/stop",
+            headers={"X-Sidepage-Control-Token": control.value},
+            timeout=5,
+        )
+    except httpx.HTTPError as exc:
+        warn(
+            f"{app_name}: couldn't reach it to request a graceful stop ({exc}) — "
+            "falling back to a hard kill after the usual wait"
+        )
+
+
 def stop(app_name: str) -> None:
     """Explicit teardown of a running app by name — distinct from Ctrl+C
-    but routed through the same clean-teardown path in `serve` via SIGTERM.
+    but routed through the same clean-teardown path `serve`/`proxy` use.
 
     Checks `registry.is_alive` up front, before ever sending a signal:
-    `os.kill(pid, 0)`/`ProcessLookupError` alone can't tell a genuinely
-    dead pid from a *zombie* one (exited, not yet reaped by whatever
-    spawned it) — POSIX allows signaling a zombie without error. Without
-    this check, a zombie app would fall through to the SIGTERM branch,
-    which also can't detect it died, and `stop` would misreport "didn't
-    stop within 10s" for an app that was already gone — actively
-    misleading, since it implies the app is alive and unresponsive rather
-    than already dead. Both "fully gone" and "zombie" now take the same,
-    already-correct stale-entry path below.
+    a bare pid-existence probe alone can't tell a genuinely dead pid from
+    a *zombie* one (exited, not yet reaped by whatever spawned it) on
+    POSIX. Without this check, a zombie app would fall through to the
+    stop branch below, which also can't detect it died, and `stop` would
+    misreport "didn't stop within 10s" for an app that was already gone —
+    actively misleading, since it implies the app is alive and
+    unresponsive rather than already dead. Both "fully gone" and
+    "zombie" now take the same, already-correct stale-entry path below.
+
+    **POSIX**: `os.kill(pid, signal.SIGTERM)`, unchanged — delivered as a
+    real signal, caught by the target's own handler, routed through its
+    normal teardown. **Windows**: `os.kill`'s cross-process `SIGTERM`
+    doesn't reach the target's signal handler at all (it maps straight to
+    `TerminateProcess`), so a local, control-token-authenticated HTTP
+    request is used instead (`_request_stop_windows`) — same teardown
+    path, different delivery mechanism. Either way, if the app hasn't
+    exited within the wait below, a hard kill (`_platform.terminate_process`
+    on Windows; the existing "didn't stop" error on POSIX, unchanged) is
+    the backstop.
     """
     app = registry.get(app_name)
     if app is None:
@@ -659,19 +755,33 @@ def stop(app_name: str) -> None:
         info(f"{app_name} wasn't actually running (stale registry entry removed)")
         return
 
-    try:
-        os.kill(app.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        registry.unregister(app_name)
-        info(f"{app_name} wasn't actually running (stale registry entry removed)")
-        return
+    if sys.platform == "win32":
+        _request_stop_windows(app, app_name)
+    else:
+        try:
+            os.kill(app.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            registry.unregister(app_name)
+            info(f"{app_name} wasn't actually running (stale registry entry removed)")
+            return
 
     deadline = time.time() + 10
+    stopped = False
     while time.time() < deadline:
         if not registry.is_alive(app.pid):
+            stopped = True
             break
         time.sleep(0.2)
-    else:
+
+    if not stopped and sys.platform == "win32":
+        try:
+            _platform.terminate_process(app.pid, force=True)
+        except OSError:
+            pass
+        time.sleep(0.5)
+        stopped = not registry.is_alive(app.pid)
+
+    if not stopped:
         error(f"{app_name} (pid {app.pid}) didn't stop within 10s")
         raise SystemExit(1)
 

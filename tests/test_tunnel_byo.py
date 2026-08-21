@@ -30,6 +30,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from sidepage.core import _platform as _real_platform
 from sidepage.core import registry, secrets_vault, tunnel_manager
 from sidepage.core.exceptions import TunnelError
 from sidepage.core.tunnel_manager import decode_tunnel_token
@@ -211,43 +212,49 @@ def _patch_cloudflare(
 
 class _PidTracker:
     """Backs a fake replacement for tunnel_manager's `_is_pid_alive` and
-    `os.kill` so shared-process lifecycle tests can simulate a process
-    dying on SIGTERM without ever touching a real OS process."""
+    `_platform.terminate_process` so shared-process lifecycle tests can
+    simulate a process dying on termination without ever touching a real
+    OS process."""
 
     def __init__(self) -> None:
         self.alive: set[int] = set()
-        self.signals: list[tuple[int, int]] = []
+        self.signals: list[tuple[int, bool]] = []  # (pid, force)
 
     def is_alive(self, pid: int) -> bool:
         return pid in self.alive
 
-    def kill(self, pid: int, sig: int) -> None:
-        self.signals.append((pid, sig))
+    def terminate(self, pid: int, *, force: bool) -> None:
+        self.signals.append((pid, force))
         self.alive.discard(pid)
 
 
-class _FakeOsModule:
-    """Stands in for the `os` name inside `tunnel_manager`'s own module
-    namespace — swapped in via `monkeypatch.setattr(tunnel_manager, "os",
-    ...)`, which rebinds the name *tunnel_manager.py itself* looks up,
-    not the real `os` module object. Mutating the real module's `kill`
-    attribute instead (`tunnel_manager.os.kill = ...`) would be a global
-    change: `sidepage.core.registry` does its own real `os.kill(pid, 0)`
-    liveness checks, and those must keep working normally in these tests
-    — this scoping is what keeps the fake from leaking into it."""
+class _FakePlatformModule:
+    """Stands in for the `_platform` name inside `tunnel_manager`'s own
+    module namespace — swapped in via `monkeypatch.setattr(tunnel_manager,
+    "_platform", ...)`, which rebinds the name *tunnel_manager.py itself*
+    looks up, not the real `sidepage.core._platform` module object.
+    Mutating the real module's `terminate_process` attribute instead would
+    be a global change that could leak into other code exercised in the
+    same test — this scoping avoids that. Only `terminate_process` is
+    faked; everything else (`lock_exclusive`, used by every test that goes
+    through `_domain_lock`, which is nearly all of them) passes through to
+    the real module unchanged."""
 
     def __init__(self, tracker: _PidTracker) -> None:
         self._tracker = tracker
 
-    def kill(self, pid: int, sig: int) -> None:
-        self._tracker.kill(pid, sig)
+    def terminate_process(self, pid: int, *, force: bool) -> None:
+        self._tracker.terminate(pid, force=force)
+
+    def __getattr__(self, name: str):
+        return getattr(_real_platform, name)
 
 
 @pytest.fixture
 def pid_tracker(monkeypatch: pytest.MonkeyPatch) -> _PidTracker:
     tracker = _PidTracker()
     monkeypatch.setattr(tunnel_manager, "_is_pid_alive", tracker.is_alive)
-    monkeypatch.setattr(tunnel_manager, "os", _FakeOsModule(tracker))
+    monkeypatch.setattr(tunnel_manager, "_platform", _FakePlatformModule(tracker))
     return tracker
 
 

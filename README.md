@@ -315,7 +315,22 @@ docs/
 ├── CHECKLIST.md       Build status for every command and core module
 ├── OPEN_QUESTIONS.md  Design decisions — resolved and still-open
 └── SPEC_V5_DRAFT.md   v5 proposals — timeout/lazy-start/--peer (built, this doc) plus still-parked ideas
+
+skills/
+└── sidepage-serve/    Packaged Claude Skill wrapping this CLI for agents (see below)
 ```
+
+## For agents and harnesses
+
+[`skills/sidepage-serve/`](skills/sidepage-serve/) is a packaged [Claude
+Skill](https://docs.claude.com/en/docs/claude-code/skills) that teaches an
+agent to drive `sidepage serve`/`sidepage proxy` safely — most importantly,
+how to background them and get structured JSON back instead of hanging,
+since neither command has a daemon mode and both block until Ctrl+C or
+`sidepage stop`. Copy or symlink that directory into wherever your harness
+looks for skills (e.g. `~/.claude/skills/`); `tests/test_skill_docs.py` and
+`tests/test_skill_scripts.py` keep it in sync with and tested against this
+CLI.
 
 ## Development
 

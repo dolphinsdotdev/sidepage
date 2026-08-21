@@ -1,0 +1,50 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    # Windows support is new (see docs/CHECKLIST.md) and this is its first
+    # CI exposure — real-Windows behavior for the process-lifecycle/signal
+    # paths has only been verified by forcing the code path on POSIX
+    # (tests/test_windows_stop.py) plus manual smoke testing, not by CI
+    # itself. Don't let a still-shaking-out Windows leg block the Ubuntu
+    # leg (which this project has always been correct on) from gating
+    # merges — drop this once the Windows leg has proven stable for a
+    # while.
+    continue-on-error: ${{ matrix.os == 'windows-latest' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Lint skill scripts
+        # Non-blocking, mirroring the Windows leg's continue-on-error above:
+        # a shellcheck finding is a signal worth seeing in logs, not (yet) a
+        # merge gate on its own. Both ubuntu-latest and windows-latest ship
+        # shellcheck preinstalled.
+        continue-on-error: true
+        run: shellcheck skills/sidepage-serve/scripts/*.sh
+
+      - name: Test
+        run: uv run pytest -v
+        env:
+          # tests/test_proxy_frameworks.py's Vite fixture runs `npm install`
+          # on first use — relies on the runner image's preinstalled
+          # Node.js/npm (both ubuntu-latest and windows-latest ship it),
+          # no separate setup step here.
+          PYTHONUNBUFFERED: "1"

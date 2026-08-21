@@ -271,7 +271,13 @@ class AuthGateMiddleware:
             await self.app(scope, receive, send)
             return
 
-        if authed or scope["path"] == "/__sidepage_auth":
+        if authed or scope["path"] in ("/__sidepage_auth", "/.sidepage/stop"):
+            # `/.sidepage/stop` deliberately bypasses the public gate: it
+            # enforces its own, separate control-token check (see
+            # `_stop_route`) regardless of this app's `--auth` tier — an
+            # `--auth open` app still needs `sidepage stop` to work, and
+            # the control token is a stronger, single-purpose secret, not
+            # a bypass of the public one.
             await self.app(scope, receive, send)
             return
 
@@ -288,6 +294,36 @@ def _persist_counts(app_name: str, counts: dict[str, int]) -> None:
     counts_path(app_name).write_text(json.dumps(counts))
 
 
+def _stop_route(stop_requested: threading.Event, control_token: str | None) -> Route:
+    """`POST /.sidepage/stop` — the cross-platform substitute for a
+    cross-process `SIGTERM` (see `sidepage.core.process` for why POSIX
+    doesn't need this but Windows does: a `SIGTERM` sent via `os.kill`
+    from a *different* process there calls `TerminateProcess` directly,
+    never reaching this process's own Python-level signal handler). Sets
+    `stop_requested`, which `process.serve`/`process.proxy`'s existing
+    blocking loop already polls once a second alongside `--timeout`/
+    `--idle-timeout` — same `break` -> `finally: _teardown()` path
+    Ctrl+C/SIGTERM/timeout all already use, no second teardown route.
+
+    Gated by `control_token`, not by `--auth` or by "did this arrive from
+    127.0.0.1" — the latter can't be trusted here any more than it can
+    for `sidepage proxy` (a request arriving through the tunnel looks
+    identical to a local one by the time it reaches this process, see
+    `sidepage.commands.proxy --help`). `control_token=None` (shouldn't
+    happen outside tests that construct the app directly) means the route
+    is permanently unreachable rather than open.
+    """
+
+    async def stop_app(request: Request) -> JSONResponse:
+        header_token = request.headers.get("x-sidepage-control-token")
+        if control_token is None or header_token != control_token:
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        stop_requested.set()
+        return JSONResponse({"status": "stopping"})
+
+    return Route("/.sidepage/stop", stop_app, methods=["POST"])
+
+
 def _auth_post_handler(token: str | None):
     async def auth_post(request: Request) -> RedirectResponse | HTMLResponse:
         body = await request.body()
@@ -301,8 +337,20 @@ def _auth_post_handler(token: str | None):
     return auth_post
 
 
-def _build_static_app(static_root: Path, *, auth: str, token: str | None):
-    app = Starlette(routes=[Route("/__sidepage_auth", _auth_post_handler(token), methods=["POST"])])
+def _build_static_app(
+    static_root: Path,
+    *,
+    auth: str,
+    token: str | None,
+    stop_requested: threading.Event,
+    control_token: str | None,
+):
+    app = Starlette(
+        routes=[
+            Route("/__sidepage_auth", _auth_post_handler(token), methods=["POST"]),
+            _stop_route(stop_requested, control_token),
+        ]
+    )
     app.mount("/", StaticFiles(directory=str(static_root), html=True))
     return AuthGateMiddleware(app, auth=auth, token=token)
 
@@ -317,6 +365,8 @@ def _build_proxy_app(
     ready: threading.Event,
     counts: dict[str, int],
     activity: ActivityTracker,
+    stop_requested: threading.Event,
+    control_token: str | None,
     start_upstream: Callable[[], None] | None = None,
     peers: tuple[tuple[str, str], ...] = (),
 ):
@@ -452,6 +502,7 @@ def _build_proxy_app(
         # inherits the AuthGateMiddleware wrap applied to `app` as a
         # whole — same auth tier as the rest of this app, no separate gate.
         Route("/.sidepage/peers.json", peers_json, methods=["GET"]),
+        _stop_route(stop_requested, control_token),
         WebSocketRoute("/{path:path}", proxy_ws),
         Route(
             "/{path:path}",
@@ -475,6 +526,12 @@ class ProxyHandle:
     thread: threading.Thread = field(repr=False)
     ready: threading.Event = field(repr=False)
     activity: ActivityTracker = field(repr=False)
+    # Set by a `POST /.sidepage/stop` call (see `_stop_route`) — the
+    # cross-platform substitute for a cross-process SIGTERM that
+    # `sidepage.core.process`'s blocking loop polls on Windows, where a
+    # signal sent via `os.kill` from another process can't reach this
+    # one's own signal handler.
+    stop_requested: threading.Event = field(repr=False)
 
 
 _LOOPBACK_CANDIDATES = ("127.0.0.1", "[::1]")
@@ -527,6 +584,7 @@ def start_proxy(
     static_root: Path | None = None,
     auth: str = "open",
     token: str | None = None,
+    control_token: str | None = None,
     start_upstream: Callable[[], None] | None = None,
     peers: tuple[tuple[str, str], ...] = (),
 ) -> ProxyHandle:
@@ -546,14 +604,28 @@ def start_proxy(
     `peers`, if given, backs the live `GET /.sidepage/peers.json` endpoint
     (spec v5 `--peer`) — ignored when `static_root` is set, since that
     route only exists in `_build_proxy_app`'s table.
+
+    `control_token`, if given, is the secret `POST /.sidepage/stop`
+    requires (see `_stop_route`) — `sidepage.core.process`'s cross-process
+    Windows stop path. `None` (the default, and what every call site not
+    passing it explicitly gets) leaves the route permanently unreachable
+    rather than open, so tests/callers that don't care about this are
+    unaffected.
     """
     if (upstream_port is None) == (static_root is None):
         raise ValueError("exactly one of upstream_port or static_root is required")
 
     ready = threading.Event()
     activity = ActivityTracker()
+    stop_requested = threading.Event()
     if static_root is not None:
-        app = _build_static_app(static_root, auth=auth, token=token)
+        app = _build_static_app(
+            static_root,
+            auth=auth,
+            token=token,
+            stop_requested=stop_requested,
+            control_token=control_token,
+        )
         ready.set()
     else:
         counts: dict[str, int] = {}
@@ -567,6 +639,8 @@ def start_proxy(
             ready=ready,
             counts=counts,
             activity=activity,
+            stop_requested=stop_requested,
+            control_token=control_token,
             start_upstream=start_upstream,
             peers=peers,
         )
@@ -602,6 +676,7 @@ def start_proxy(
         thread=thread,
         ready=ready,
         activity=activity,
+        stop_requested=stop_requested,
     )
 
 

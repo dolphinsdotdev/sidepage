@@ -15,11 +15,11 @@ actually running locally.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from dataclasses import asdict, dataclass
 
 from sidepage.config.settings import ensure_dirs, registry_file
+from sidepage.core import _platform
 from sidepage.core.exceptions import PeerNotFoundError
 
 # Captured at import time, before any test can monkeypatch `subprocess.Popen`
@@ -81,23 +81,22 @@ def unregister(name: str) -> None:
 def is_alive(pid: int) -> bool:
     """True if `pid` refers to a live, non-zombie process.
 
-    `os.kill(pid, 0)` alone isn't enough: POSIX lets you signal a zombie
-    (a process that has exited but whose parent hasn't reaped it yet)
-    without error, so a dead-but-unreaped process would otherwise be
-    reported as still running indefinitely — which is exactly what let a
-    dead app keep showing up in `sidepage ls` and made `sidepage stop`
-    report a false "didn't stop within 10s" instead of recognizing it was
-    already gone. Shelling out to `ps` is what actually distinguishes a
-    zombie from a live process — there's no `/proc` on macOS, and this
-    project already assumes a POSIX `ps` is available (same assumption
-    `fcntl`-based locking in `sidepage.core.tunnel_manager` makes).
+    A bare existence probe (`_platform.is_pid_alive`) alone isn't enough
+    on POSIX: it can't distinguish a zombie (a process that has exited but
+    whose parent hasn't reaped it yet, still "alive" by that probe) from a
+    genuinely running one — which is exactly what let a dead app keep
+    showing up in `sidepage ls` and made `sidepage stop` report a false
+    "didn't stop within 10s" instead of recognizing it was already gone.
+    Shelling out to `ps` is what actually distinguishes a zombie from a
+    live process — there's no `/proc` on macOS. Zombies are a POSIX-only
+    concept, so on Windows `_platform.is_pid_alive`'s answer is already
+    final: `ps` isn't installed there, and the `except OSError` below
+    already falls back correctly if it's ever attempted anyway.
 
     Public — also used by `sidepage.core.process.stop()`, not just
     `list_running` below.
     """
-    try:
-        os.kill(pid, 0)
-    except OSError:
+    if not _platform.is_pid_alive(pid):
         return False
     try:
         with _real_popen(
@@ -108,7 +107,7 @@ def is_alive(pid: int) -> bool:
         ) as proc:
             stdout, _ = proc.communicate(timeout=5)
     except OSError:
-        return True  # `ps` itself unavailable — fall back to the kill(0) result
+        return True  # `ps` itself unavailable (e.g. Windows) — trust is_pid_alive above
     state = stdout.strip()
     if not state:
         return False  # ps found nothing — pid was reaped between the two checks

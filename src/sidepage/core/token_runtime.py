@@ -64,6 +64,31 @@ def resolve_token(*, explicit: str | None, env_value: str | None) -> str:
     return secrets.token_urlsafe(24)
 
 
+@dataclass(frozen=True)
+class ControlToken:
+    """Internal-only secret, generated and written for **every** `serve`/
+    `proxy` process regardless of `--auth` — a demo app running `--auth
+    open` still needs `sidepage stop` to work. Deliberately a separate
+    dataclass/file from `RuntimeToken`, not a reuse of the public
+    `--auth token` value: that value is user-facing (printed, gates real
+    visitors) and may not exist at all for an open app; this one gates a
+    single internal route (`POST /.sidepage/stop`,
+    `sidepage.core.reverse_proxy`) used only by `sidepage.core.process
+    .stop()` on Windows, where a cross-process `SIGTERM` can't reach the
+    target's own signal handler the way it does on POSIX (see
+    `sidepage.core.process` for why) — so it needs its own trust boundary
+    rather than borrowing the public one.
+    """
+
+    app_name: str
+    pid: int
+    value: str
+
+
+def generate_control_token() -> str:
+    return secrets.token_urlsafe(24)
+
+
 def _runtime_path(app_name: str, pid: int) -> Path:
     return runtime_dir() / f"{app_name}-{pid}.json"
 
@@ -87,3 +112,27 @@ def read_runtime_file(app_name: str, pid: int) -> RuntimeToken:
     path = _runtime_path(app_name, pid)
     data = json.loads(path.read_text())
     return RuntimeToken(**data)
+
+
+def _control_path(app_name: str, pid: int) -> Path:
+    return runtime_dir() / f"{app_name}-{pid}-control.json"
+
+
+def write_control_token_file(token: ControlToken) -> Path:
+    """Write `token` to
+    `~/.local/state/sidepage/runtime/<app-name>-<pid>-control.json` with
+    mode `0600`. Returns the written path."""
+    ensure_dirs()
+    path = _control_path(token.app_name, token.pid)
+    path.write_text(json.dumps(asdict(token)))
+    path.chmod(0o600)
+    return path
+
+
+def read_control_token_file(app_name: str, pid: int) -> ControlToken:
+    """Read back a previously written control token file — used by
+    `sidepage.core.process.stop()` on Windows to authenticate its
+    `POST /.sidepage/stop` request to the target app's own reverse proxy."""
+    path = _control_path(app_name, pid)
+    data = json.loads(path.read_text())
+    return ControlToken(**data)

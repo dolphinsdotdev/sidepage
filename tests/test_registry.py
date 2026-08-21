@@ -7,9 +7,13 @@ reporting a false "didn't stop within 10s").
 
 Zombies are produced for real via `os.fork()` + `os._exit()` in the child
 without the test process reaping it until after the assertion — the only
-reliable way to get a real zombie state to test against, and consistent
-with this project's existing POSIX-only assumptions (`fcntl` locking in
-`sidepage.core.tunnel_manager`, no Windows support attempted anywhere).
+reliable way to get a real zombie state to test against. Zombies are a
+POSIX-only concept (no `os.fork()` on Windows at all), so every test here
+that relies on one is skipped there — `sidepage.core.registry.is_alive`
+itself is still exercised on Windows via `sidepage.core._platform
+.is_pid_alive`, just not through this fork-a-zombie technique. See
+`tests/test_platform_compat.py` for the cross-platform liveness-probe
+coverage.
 """
 
 from __future__ import annotations
@@ -83,6 +87,7 @@ def test_is_alive_true_for_running_process() -> None:
     assert registry.is_alive(os.getpid()) is True
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="os.fork isn't available on Windows")
 def test_is_alive_false_for_nonexistent_pid() -> None:
     # A forked-then-reaped pid is guaranteed gone, unlike a made-up large
     # number which could theoretically collide with something real.
@@ -130,6 +135,7 @@ def test_stop_zombie_app_reports_stale_not_timeout(
     assert "didn't stop" not in output
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="os.fork isn't available on Windows")
 def test_stop_fully_gone_app_reports_stale(sidepage_home: Path) -> None:
     pid = os.fork()
     if pid == 0:
