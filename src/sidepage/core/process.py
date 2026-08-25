@@ -80,6 +80,7 @@ from sidepage.core.static import validate_static_root
 from sidepage.core.target import (
     MCP_APP_METHOD,
     CodeLauncher,
+    McpPackage,
     TargetKind,
     allocate_port,
     detect_asgi_app_variable,
@@ -139,6 +140,79 @@ class ProxyConfig:
     idle_timeout: float | None = None
 
 
+# Both recognized MCP packages ship their own DNS-rebinding protection
+# that validates the inbound `Host`/`Origin` headers against an allowlist
+# of loopback values — the official SDK auto-enables it whenever
+# `streamable_http_app(host=...)` defaults to (or is passed) `127.0.0.1`
+# (`mcp.server.lowlevel.server.Server.streamable_http_app`); `fastmcp`'s
+# `http_app(host_origin_protection="auto")` default does the same. Once a
+# request comes back through Sidepage's own reverse proxy, the `Host` seen
+# by the wrapped process is never `127.0.0.1` — it's the real inbound
+# `Host` (`sidepage.core.reverse_proxy` forwards it literally, Caddy-style
+# `override_host`), whether that's a `--domain` hostname, an `--anon`
+# `*.trycloudflare.com` one, or the local proxy's own listen port. Every
+# one of those trips the allowlist and the request is rejected with
+# `421 Misdirected Request` — reproduced live against
+# `tests/fixtures/mcp-app`, see `tests/test_serve_mcp.py`.
+#
+# Disabling it here is safe, not a hole: Sidepage's own reverse proxy is
+# already the actual trust boundary (loopback-only upstream, `--auth` gate
+# in front of it) — the same reasoning already applied to Jupyter's
+# `--ServerApp.disable_check_xsrf=True` in `sidepage.core.notebook`.
+_MCP_WRAPPER_SOURCE: dict[McpPackage, str] = {
+    McpPackage.OFFICIAL: (
+        "from {module} import {app_var}\n"
+        "from mcp.server.transport_security import TransportSecuritySettings\n"
+        "\n"
+        "\n"
+        "def make_app():\n"
+        "    return {app_var}.{app_method}(\n"
+        "        transport_security=TransportSecuritySettings(\n"
+        "            enable_dns_rebinding_protection=False\n"
+        "        )\n"
+        "    )\n"
+    ),
+    McpPackage.FASTMCP: (
+        "from {module} import {app_var}\n"
+        "\n"
+        "\n"
+        "def make_app():\n"
+        "    return {app_var}.{app_method}(host_origin_protection=False)\n"
+    ),
+}
+
+
+def _mcp_wrapper_path(target: Path) -> Path:
+    """Deterministic per-target path for the generated wrapper module (see
+    `_write_mcp_host_wrapper`) — recomputed by `serve`'s `_teardown` to
+    clean it up without threading extra state through the closure."""
+    return target.parent / f"_sidepage_mcp_wrapper_{target.stem}.py"
+
+
+def _write_mcp_host_wrapper(
+    target: Path, package: McpPackage, app_var: str, app_method: str
+) -> Path:
+    """Writes a small module next to `target` that imports the user's MCP
+    server variable and calls the real app-builder method with the
+    package's built-in Host/Origin allowlisting turned off (see the
+    `_MCP_WRAPPER_SOURCE` comment above for why that's necessary and
+    safe). Written next to `target` — not into a temp/runtime dir — so it
+    picks up the same cwd-based import resolution the plain
+    `<module>:<app>` reference already relies on elsewhere in this
+    function (the wrapped subprocess always runs with `cwd=target.parent`,
+    see `serve`).
+
+    Regenerated fresh on every `serve` call, not reused across runs, and
+    removed again by `serve`'s `_teardown` — see `_mcp_wrapper_path`.
+    """
+    source = _MCP_WRAPPER_SOURCE[package].format(
+        module=target.stem, app_var=app_var, app_method=app_method
+    )
+    wrapper_path = _mcp_wrapper_path(target)
+    wrapper_path.write_text(source)
+    return wrapper_path
+
+
 def _build_code_launch_argv(target: Path, launcher: CodeLauncher, port: int) -> list[str]:
     if launcher is CodeLauncher.STREAMLIT:
         # extra_packages=["streamlit"] guarantees the launcher's own
@@ -178,27 +252,39 @@ def _build_code_launch_argv(target: Path, launcher: CodeLauncher, port: int) -> 
         ]
 
     if launcher is CodeLauncher.MCP:
-        # Launched via `uvicorn <module>:<var>.<app-method> --factory`,
-        # never by running the script directly — bypasses whatever the
-        # script's own `__main__` block does, same reasoning as FastAPI
-        # above. The payoff is bigger here: most MCP servers' `__main__`
-        # calls `<var>.run()`, which defaults to the *stdio* transport
-        # (no HTTP at all) unless the author explicitly wired up
+        # Launched via `uvicorn <wrapper-module>:make_app --factory`, never
+        # by running the script directly — bypasses whatever the script's
+        # own `__main__` block does, same reasoning as FastAPI above. The
+        # payoff is bigger here: most MCP servers' `__main__` calls
+        # `<var>.run()`, which defaults to the *stdio* transport (no HTTP
+        # at all) unless the author explicitly wired up
         # `transport="streamable-http"` — calling `.streamable_http_app()`
         # / `.http_app()` directly sidesteps that choice entirely, so even
         # a script only ever authored for stdio becomes a real,
         # reverse-proxied HTTP MCP server. See sidepage.core.target for
         # which of the two recognized packages maps to which app-builder
         # method.
+        #
+        # Not called via a bare `<module>:<var>.<app-method>` reference
+        # (what FastAPI's branch above does) because both recognized
+        # packages auto-enable Host/Origin allowlisting that only ever
+        # accepts `127.0.0.1`/`localhost` — see `_write_mcp_host_wrapper`
+        # — and `--factory` calls the referenced callable with zero
+        # arguments, so there's no way to pass the disabling kwarg through
+        # a bare reference. `_write_mcp_host_wrapper` generates a small
+        # module that calls the real app-builder itself, with that
+        # protection turned off, and uvicorn serves *that* module's
+        # `make_app` factory instead.
         package = detect_mcp_package(target)
         app_method = MCP_APP_METHOD[package]
         app_var = detect_mcp_app_variable(target)
         runner = ecosystem.resolve_python_runner(
             target.parent, extra_packages=[package.value, "uvicorn"]
         )
+        wrapper_path = _write_mcp_host_wrapper(target, package, app_var, app_method)
         return runner + [
             "uvicorn",
-            f"{target.stem}:{app_var}.{app_method}",
+            f"{wrapper_path.stem}:make_app",
             "--factory",
             "--host",
             "127.0.0.1",
@@ -359,6 +445,11 @@ def serve(config: ServeConfig) -> None:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        if launcher is CodeLauncher.MCP:
+            # Best-effort: `_write_mcp_host_wrapper` always writes this
+            # file before the subprocess referencing it is ever started,
+            # so it exists by the time any teardown path can run.
+            _mcp_wrapper_path(target).unlink(missing_ok=True)
         stdout.print()
         info(f"{app_name} stopped")
 

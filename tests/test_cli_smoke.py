@@ -128,7 +128,7 @@ def test_serve_nonexistent_target_fails_fast() -> None:
     in-process."""
     result = runner.invoke(app, ["serve", "definitely-does-not-exist.py"])
     assert result.exit_code != 0
-    assert "does not exist" in result.output
+    assert "does not exist" in _flat(result.output)
 
 
 def test_serve_nonexistent_target_fails_fast_even_with_type_override() -> None:
@@ -138,7 +138,7 @@ def test_serve_nonexistent_target_fails_fast_even_with_type_override() -> None:
     past validation into the real blocking loop instead of failing."""
     result = runner.invoke(app, ["serve", "definitely-does-not-exist.py", "--type", "code"])
     assert result.exit_code != 0
-    assert "does not exist" in result.output
+    assert "does not exist" in _flat(result.output)
 
 
 def test_serve_guardrail_flag_rejected_before_touching_target() -> None:
@@ -283,7 +283,7 @@ def test_serve_domain_with_configured_domain_passes_validation(
         app, ["serve", "definitely-does-not-exist.py", "--domain", "example.com"]
     )
     assert result.exit_code != 0
-    assert "does not exist" in result.output
+    assert "does not exist" in _flat(result.output)
     assert "isn't configured" not in result.output
 
 

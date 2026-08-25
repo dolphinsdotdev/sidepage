@@ -176,6 +176,46 @@ def test_mcp_tool_call_round_trip(sidepage_home: Path) -> None:
         proc.wait(timeout=15)
 
 
+def test_mcp_endpoint_reachable_with_non_loopback_host_header(sidepage_home: Path) -> None:
+    """Regression test for a real bug: both recognized MCP packages
+    auto-enable Host/Origin allowlisting that only accepts
+    `127.0.0.1`/`localhost` by default (the official SDK whenever
+    `streamable_http_app()` defaults to `host="127.0.0.1"`), but a request
+    reaching this endpoint through Sidepage's reverse proxy never actually
+    carries that `Host` — the proxy forwards the real inbound `Host`
+    literally (Caddy-style `override_host`, see
+    `sidepage.core.reverse_proxy`), which is always the public `--domain`/
+    `--anon` hostname once traffic comes back through a real tunnel. That
+    used to 421 with `Invalid Host header` on *every* real request, not
+    just an edge case — see `sidepage.core.process._write_mcp_host_wrapper`
+    for the fix (a generated wrapper module that disables the package's
+    own Host/Origin check, since Sidepage's own reverse proxy — loopback-
+    only upstream, `--auth` gate in front — is already the real trust
+    boundary).
+
+    `entry["url"]` is `http://127.0.0.1:<port>` for a local (non-`--domain`/
+    `--anon`) serve, so httpx's own default `Host` header would happen to
+    pass the allowlist and mask the bug entirely — the explicit `Host`
+    override below is what actually exercises the tunnel-forwarded case.
+    """
+    env = {**os.environ, "SIDEPAGE_HOME": str(sidepage_home)}
+    proc = _run_serve([str(FIXTURES / "mcp-app" / "app.py"), "--name", "mcp-host"], env=env)
+    try:
+        entry = _wait_for_registry_entry(sidepage_home, "mcp-host", timeout=20)
+        # Establish readiness against the default (loopback) Host first, so
+        # a slow-starting upstream isn't mistaken for the bug under test.
+        _wait_for_mcp_ready(entry["url"], timeout=20)
+
+        result, session_id = _mcp_initialize(
+            entry["url"], headers={"Host": "mcp-host.dolphins.dev"}
+        )
+        assert result["result"]["serverInfo"]["name"] == "fixture-mcp-server"
+        assert session_id
+    finally:
+        _stop("mcp-host", env)
+        proc.wait(timeout=15)
+
+
 def test_mcp_endpoint_gated_by_auth_token_too(sidepage_home: Path) -> None:
     """No special-casing: the proxy's auth gate covers /mcp the same as
     any other path, same as FastAPI's /docs (test_serve_fastapi.py) and
