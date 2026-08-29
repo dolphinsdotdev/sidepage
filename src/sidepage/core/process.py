@@ -64,6 +64,7 @@ from pathlib import Path
 
 import httpx
 
+from sidepage.config.settings import mcp_wrappers_dir
 from sidepage.core import (
     _platform,
     account,
@@ -173,6 +174,9 @@ class ProxyConfig:
 # "simple" response headers from JS by default.
 _MCP_WRAPPER_SOURCE: dict[McpPackage, str] = {
     McpPackage.OFFICIAL: (
+        "import sys\n"
+        "sys.path.insert(0, {target_parent!r})\n"
+        "\n"
         "from {module} import {app_var}\n"
         "from mcp.server.transport_security import TransportSecuritySettings\n"
         "from starlette.middleware.cors import CORSMiddleware\n"
@@ -193,6 +197,9 @@ _MCP_WRAPPER_SOURCE: dict[McpPackage, str] = {
         "    )\n"
     ),
     McpPackage.FASTMCP: (
+        "import sys\n"
+        "sys.path.insert(0, {target_parent!r})\n"
+        "\n"
         "from {module} import {app_var}\n"
         "from starlette.middleware.cors import CORSMiddleware\n"
         "\n"
@@ -210,39 +217,55 @@ _MCP_WRAPPER_SOURCE: dict[McpPackage, str] = {
 }
 
 
-def _mcp_wrapper_path(target: Path) -> Path:
-    """Deterministic per-target path for the generated wrapper module (see
+def _mcp_wrapper_path(app_name: str) -> Path:
+    """Deterministic per-app path for the generated wrapper module (see
     `_write_mcp_host_wrapper`) — recomputed by `serve`'s `_teardown` to
-    clean it up without threading extra state through the closure."""
-    return target.parent / f"_sidepage_mcp_wrapper_{target.stem}.py"
+    clean it up without threading extra state through the closure.
+
+    Lives under `sidepage.config.settings.mcp_wrappers_dir()`, not next to
+    the target script: `serve` requires `app_name` to be unique among
+    currently-running apps (checked up front), so keying on it here can't
+    collide the way keying on `target.stem` next to the target could — two
+    unrelated targets named `app.py` in different directories used to both
+    want `_sidepage_mcp_wrapper_app.py` in *their own* directory, which was
+    fine until one of them was a directory the user also tracks in git
+    (see `tests/fixtures/mcp-app`, whose committed fixture file this exact
+    collision used to clobber and then delete on every `serve`/teardown)."""
+    return mcp_wrappers_dir() / f"_sidepage_mcp_wrapper_{app_name}.py"
 
 
 def _write_mcp_host_wrapper(
-    target: Path, package: McpPackage, app_var: str, app_method: str
+    target: Path, app_name: str, package: McpPackage, app_var: str, app_method: str
 ) -> Path:
-    """Writes a small module next to `target` that imports the user's MCP
-    server variable, calls the real app-builder method with the package's
-    built-in Host/Origin allowlisting turned off, and wraps the result in
-    permissive CORS middleware (see the `_MCP_WRAPPER_SOURCE` comment above
-    for why both are necessary and safe). Written next to `target` — not
-    into a temp/runtime dir — so it
-    picks up the same cwd-based import resolution the plain
-    `<module>:<app>` reference already relies on elsewhere in this
-    function (the wrapped subprocess always runs with `cwd=target.parent`,
-    see `serve`).
+    """Writes a small module under `mcp_wrappers_dir()` that imports the
+    user's MCP server variable, calls the real app-builder method with the
+    package's built-in Host/Origin allowlisting turned off, and wraps the
+    result in permissive CORS middleware (see the `_MCP_WRAPPER_SOURCE`
+    comment above for why both are necessary and safe).
+
+    Living outside `target`'s own directory means the plain cwd-based
+    import resolution the bare `<module>:<app>` reference relies on
+    elsewhere in this function no longer applies — the generated source
+    itself `sys.path.insert(0, ...)`s `target.parent` before importing the
+    user's module, and `_build_code_launch_argv`'s MCP branch passes
+    uvicorn `--app-dir` pointing at *this* module's directory instead, so
+    the import resolves regardless of the subprocess's cwd.
 
     Regenerated fresh on every `serve` call, not reused across runs, and
     removed again by `serve`'s `_teardown` — see `_mcp_wrapper_path`.
     """
     source = _MCP_WRAPPER_SOURCE[package].format(
-        module=target.stem, app_var=app_var, app_method=app_method
+        target_parent=str(target.parent), module=target.stem, app_var=app_var, app_method=app_method
     )
-    wrapper_path = _mcp_wrapper_path(target)
+    wrapper_path = _mcp_wrapper_path(app_name)
+    wrapper_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     wrapper_path.write_text(source)
     return wrapper_path
 
 
-def _build_code_launch_argv(target: Path, launcher: CodeLauncher, port: int) -> list[str]:
+def _build_code_launch_argv(
+    target: Path, launcher: CodeLauncher, port: int, app_name: str
+) -> list[str]:
     if launcher is CodeLauncher.STREAMLIT:
         # extra_packages=["streamlit"] guarantees the launcher's own
         # detected requirement is present even if the target's own
@@ -303,18 +326,24 @@ def _build_code_launch_argv(target: Path, launcher: CodeLauncher, port: int) -> 
         # a bare reference. `_write_mcp_host_wrapper` generates a small
         # module that calls the real app-builder itself, with that
         # protection turned off, and uvicorn serves *that* module's
-        # `make_app` factory instead.
+        # `make_app` factory instead. That module lives under
+        # `mcp_wrappers_dir()`, not next to `target` (see
+        # `_write_mcp_host_wrapper`) — `--app-dir` points uvicorn's own
+        # import at that directory since the subprocess's cwd is still
+        # `target.parent`, not the wrapper's directory.
         package = detect_mcp_package(target)
         app_method = MCP_APP_METHOD[package]
         app_var = detect_mcp_app_variable(target)
         runner = ecosystem.resolve_python_runner(
             target.parent, extra_packages=[package.value, "uvicorn"]
         )
-        wrapper_path = _write_mcp_host_wrapper(target, package, app_var, app_method)
+        wrapper_path = _write_mcp_host_wrapper(target, app_name, package, app_var, app_method)
         return runner + [
             "uvicorn",
             f"{wrapper_path.stem}:make_app",
             "--factory",
+            "--app-dir",
+            str(wrapper_path.parent),
             "--host",
             "127.0.0.1",
             "--port",
@@ -478,7 +507,7 @@ def serve(config: ServeConfig) -> None:
             # Best-effort: `_write_mcp_host_wrapper` always writes this
             # file before the subprocess referencing it is ever started,
             # so it exists by the time any teardown path can run.
-            _mcp_wrapper_path(target).unlink(missing_ok=True)
+            _mcp_wrapper_path(app_name).unlink(missing_ok=True)
         stdout.print()
         info(f"{app_name} stopped")
 
@@ -500,7 +529,7 @@ def serve(config: ServeConfig) -> None:
     elif target_kind is TargetKind.CODE:
         upstream_port = allocate_port()
         launcher = detect_code_launcher(target)
-        argv = _build_code_launch_argv(target, launcher, upstream_port)
+        argv = _build_code_launch_argv(target, launcher, upstream_port, app_name)
         env = {**os.environ, **injected_env, "PORT": str(upstream_port)}
 
         def _start_code_upstream() -> None:

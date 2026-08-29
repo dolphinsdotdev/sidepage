@@ -115,6 +115,16 @@ def tunnel_pid_file(domain: str) -> Path:
     return tunnels_dir() / f"{domain}.pid"
 
 
+# --- Generated MCP host wrapper modules — real, used by
+# sidepage.core.process for CodeLauncher.MCP targets. Previously written
+# next to the target script itself; moved here so the deterministic
+# filename can never collide with a same-named file the target's own
+# directory happens to contain (see the fixture that used to get its
+# `_sidepage_mcp_wrapper_app.py` clobbered/deleted every `serve` run). ---
+def mcp_wrappers_dir() -> Path:
+    return state_dir() / "mcp_wrappers"
+
+
 # --- Name bindings (§3) — real, used by sidepage.core.directory_client.
 # Stable <app-name> -> <4-char-id> mapping so a given app name resolves to
 # the same `<app-name>-<id>.<domain>` hostname across `serve` restarts,
@@ -158,5 +168,12 @@ def cloudflared_binary_path() -> Path:
 
 def ensure_dirs() -> None:
     """Create all XDG roots (0700) if missing. Safe to call repeatedly."""
-    for d in (config_dir(), cache_dir(), state_dir(), runtime_dir(), tunnels_dir()):
+    for d in (
+        config_dir(),
+        cache_dir(),
+        state_dir(),
+        runtime_dir(),
+        tunnels_dir(),
+        mcp_wrappers_dir(),
+    ):
         d.mkdir(parents=True, exist_ok=True, mode=0o700)
