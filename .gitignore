@@ -10,3 +10,9 @@ build/
 .coverage
 htmlcov/
 node_modules/
+
+# Backstop only — sidepage.core.process now writes these under
+# SIDEPAGE_HOME's state dir (mcp_wrappers_dir()), never next to a served
+# target, but this catches anyone's local target directory still ending up
+# with one (e.g. from a build predating that fix).
+_sidepage_mcp_wrapper_*.py
