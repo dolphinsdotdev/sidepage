@@ -176,6 +176,112 @@ def test_mcp_tool_call_round_trip(sidepage_home: Path) -> None:
         proc.wait(timeout=15)
 
 
+def test_mcp_app_ui_meta_and_resource_survive_the_proxy(sidepage_home: Path) -> None:
+    """MCP Apps extension check: the fixture's `show_widget` tool declares
+    `_meta.ui.resourceUri` pointing at a `ui://` resource. sidepage's
+    reverse proxy does no MCP-aware parsing — it forwards bytes/streams
+    generically — so both the tool's `_meta` and the resource's HTML body
+    (plus its own `_meta.ui.csp`) should arrive at the client exactly as
+    the server sent them, through the real proxy, not a direct connection
+    to the wrapped subprocess."""
+    env = {**os.environ, "SIDEPAGE_HOME": str(sidepage_home)}
+    proc = _run_serve([str(FIXTURES / "mcp-app" / "app.py"), "--name", "mcp-app-ui"], env=env)
+    try:
+        entry = _wait_for_registry_entry(sidepage_home, "mcp-app-ui", timeout=20)
+        _, session_id = _wait_for_mcp_ready(entry["url"], timeout=20)
+        headers = {**_MCP_HEADERS, "Mcp-Session-Id": session_id}
+
+        tools_resp = httpx.post(
+            f"{entry['url']}/mcp",
+            headers=headers,
+            json={"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
+            timeout=10,
+        )
+        tools_resp.raise_for_status()
+        tools = _parse_sse_json(tools_resp.text)["result"]["tools"]
+        widget_tool = next(t for t in tools if t["name"] == "show_widget")
+        assert widget_tool["_meta"]["ui"]["resourceUri"] == "ui://widget/hello.html"
+        assert widget_tool["_meta"]["ui/resourceUri"] == "ui://widget/hello.html"
+
+        resource_resp = httpx.post(
+            f"{entry['url']}/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "resources/read",
+                "params": {"uri": "ui://widget/hello.html"},
+            },
+            timeout=10,
+        )
+        resource_resp.raise_for_status()
+        content = _parse_sse_json(resource_resp.text)["result"]["contents"][0]
+        assert content["mimeType"] == "text/html;profile=mcp-app"
+        # The View must proactively perform the ui/initialize handshake
+        # (apps.mdx "Transport Layer") — assert the resource actually
+        # contains it rather than serving inert static markup.
+        assert "ui/initialize" in content["text"]
+        assert "ui/notifications/initialized" in content["text"]
+        assert content["_meta"]["ui"]["csp"] == {"connectDomains": []}
+    finally:
+        _stop("mcp-app-ui", env)
+        proc.wait(timeout=15)
+
+
+def test_mcp_endpoint_allows_cross_origin_browser_hosts(sidepage_home: Path) -> None:
+    """Regression test for a real bug: a browser-based MCP Apps host (e.g.
+    the reference `ext-apps/examples/basic-host`, reproduced live against
+    this exact fixture) connects to the MCP endpoint with a direct
+    `fetch()`/SSE call from the host page's own origin — the official SDK's
+    default ASGI app ships with no CORS headers at all, so every such
+    connection was rejected by the browser before a single MCP message got
+    through, even though a non-browser client (httpx, curl) never noticed
+    since it isn't subject to CORS. See `sidepage.core.process`'s
+    `_MCP_WRAPPER_SOURCE` for the fix (CORSMiddleware wrapped around the
+    generated app, same trust-boundary reasoning as the Host/Origin
+    bypass)."""
+    env = {**os.environ, "SIDEPAGE_HOME": str(sidepage_home)}
+    proc = _run_serve([str(FIXTURES / "mcp-app" / "app.py"), "--name", "mcp-cors"], env=env)
+    try:
+        entry = _wait_for_registry_entry(sidepage_home, "mcp-cors", timeout=20)
+        _wait_for_mcp_ready(entry["url"], timeout=20)
+
+        preflight = httpx.options(
+            f"{entry['url']}/mcp",
+            headers={
+                "Origin": "http://localhost:8080",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type,mcp-session-id",
+            },
+            timeout=10,
+        )
+        # allow_credentials isn't set, so Starlette returns a literal "*"
+        # rather than echoing the request's Origin — both are valid CORS
+        # responses; a browser accepts either for a non-credentialed fetch.
+        assert preflight.headers.get("access-control-allow-origin") == "*"
+
+        actual = httpx.post(
+            f"{entry['url']}/mcp",
+            headers={**_MCP_HEADERS, "Origin": "http://localhost:8080"},
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {"name": "t", "version": "0"},
+                },
+            },
+            timeout=10,
+        )
+        assert actual.headers.get("access-control-allow-origin") == "*"
+        assert "mcp-session-id" in actual.headers.get("access-control-expose-headers", "").lower()
+    finally:
+        _stop("mcp-cors", env)
+        proc.wait(timeout=15)
+
+
 def test_mcp_endpoint_reachable_with_non_loopback_host_header(sidepage_home: Path) -> None:
     """Regression test for a real bug: both recognized MCP packages
     auto-enable Host/Origin allowlisting that only accepts

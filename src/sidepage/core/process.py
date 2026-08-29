@@ -159,25 +159,53 @@ class ProxyConfig:
 # already the actual trust boundary (loopback-only upstream, `--auth` gate
 # in front of it) — the same reasoning already applied to Jupyter's
 # `--ServerApp.disable_check_xsrf=True` in `sidepage.core.notebook`.
+#
+# Both packages' default ASGI app also ships with no CORS headers at all —
+# fine for a same-origin caller, but MCP Apps hosts that are themselves web
+# pages (e.g. the reference `ext-apps/examples/basic-host`, reproduced live
+# against `tests/fixtures/mcp-app`) connect to the MCP endpoint with a
+# direct browser `fetch()`/SSE call from the host's own origin, which the
+# browser blocks outright without `Access-Control-Allow-Origin`. Wrapping
+# with `CORSMiddleware` here — allowing any origin — is the same trust-
+# boundary reasoning as the Host/Origin bypass above: Sidepage's own proxy
+# and `--auth` gate are what actually gate access, not origin checks.
+# `Mcp-Session-Id` needs explicit `expose_headers`: browsers hide non-
+# "simple" response headers from JS by default.
 _MCP_WRAPPER_SOURCE: dict[McpPackage, str] = {
     McpPackage.OFFICIAL: (
         "from {module} import {app_var}\n"
         "from mcp.server.transport_security import TransportSecuritySettings\n"
+        "from starlette.middleware.cors import CORSMiddleware\n"
         "\n"
         "\n"
         "def make_app():\n"
-        "    return {app_var}.{app_method}(\n"
+        "    app = {app_var}.{app_method}(\n"
         "        transport_security=TransportSecuritySettings(\n"
         "            enable_dns_rebinding_protection=False\n"
         "        )\n"
         "    )\n"
+        "    return CORSMiddleware(\n"
+        "        app,\n"
+        "        allow_origins=['*'],\n"
+        "        allow_methods=['*'],\n"
+        "        allow_headers=['*'],\n"
+        "        expose_headers=['Mcp-Session-Id'],\n"
+        "    )\n"
     ),
     McpPackage.FASTMCP: (
         "from {module} import {app_var}\n"
+        "from starlette.middleware.cors import CORSMiddleware\n"
         "\n"
         "\n"
         "def make_app():\n"
-        "    return {app_var}.{app_method}(host_origin_protection=False)\n"
+        "    app = {app_var}.{app_method}(host_origin_protection=False)\n"
+        "    return CORSMiddleware(\n"
+        "        app,\n"
+        "        allow_origins=['*'],\n"
+        "        allow_methods=['*'],\n"
+        "        allow_headers=['*'],\n"
+        "        expose_headers=['Mcp-Session-Id'],\n"
+        "    )\n"
     ),
 }
 
@@ -193,10 +221,11 @@ def _write_mcp_host_wrapper(
     target: Path, package: McpPackage, app_var: str, app_method: str
 ) -> Path:
     """Writes a small module next to `target` that imports the user's MCP
-    server variable and calls the real app-builder method with the
-    package's built-in Host/Origin allowlisting turned off (see the
-    `_MCP_WRAPPER_SOURCE` comment above for why that's necessary and
-    safe). Written next to `target` — not into a temp/runtime dir — so it
+    server variable, calls the real app-builder method with the package's
+    built-in Host/Origin allowlisting turned off, and wraps the result in
+    permissive CORS middleware (see the `_MCP_WRAPPER_SOURCE` comment above
+    for why both are necessary and safe). Written next to `target` — not
+    into a temp/runtime dir — so it
     picks up the same cwd-based import resolution the plain
     `<module>:<app>` reference already relies on elsewhere in this
     function (the wrapped subprocess always runs with `cwd=target.parent`,
