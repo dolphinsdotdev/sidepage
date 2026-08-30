@@ -1,19 +1,28 @@
 """Integration tests for notebook (Jupyter Lab) support in `sidepage
 serve`, against the real `tests/fixtures/notebook-app` fixture.
 
-The flagship test here (`test_notebook_kernel_execution_round_trip`) is
-the one that actually matters: Jupyter Server rejects cross-origin
-requests and WebSocket upgrades by default, and the browser's `Origin`
-through Sidepage's proxy is the *proxy's* address, not Jupyter's own
-(different) upstream port — a mismatch that gets rejected without the
-`--ServerApp.allow_origin=*`/`--ServerApp.disable_check_xsrf=True` flags
-`sidepage.core.notebook.build_jupyter_launch_command` passes (verified
-live against a real Jupyter Server before committing to that design — see
-that module's docstring). This test reproduces the real shape of that
-risk: it starts a kernel and opens the WebSocket *through the actual
-sidepage proxy port*, deliberately sending the proxy's own origin (what a
-real browser would send), and checks a real `execute_request` gets a real
-stdout reply back — not just that the server started.
+Jupyter Server checks `Origin` and `Host` separately, and Sidepage's proxy
+breaks each for a different reason (see `sidepage.core.notebook`'s module
+docstring for the full "verified live, not assumed" story on both):
+
+- `test_notebook_kernel_execution_round_trip` is the flagship test:
+  Jupyter rejects cross-origin requests/WebSocket upgrades by default,
+  comparing `Origin` against its own `Host` — through the proxy, the
+  browser's `Origin` is the *proxy's* address, not Jupyter's real
+  (different) upstream port, a mismatch that gets rejected without
+  `--ServerApp.allow_origin=*`/`--ServerApp.disable_check_xsrf=True`. This
+  test starts a real kernel and opens the WebSocket *through the actual
+  sidepage proxy port*, deliberately sending the proxy's own origin (what
+  a real browser would send), and checks a real `execute_request` gets a
+  real stdout reply back — not just that the server started.
+- `test_notebook_allows_non_local_host_through_domain_tunnel` covers the
+  separate `Host` check (`ServerApp.allow_remote_access`, distinct from
+  the `Origin` one above — reproduced live as every static asset 403ing
+  with "Blocking request with non-local 'Host'" once a real `--domain`
+  tunnel is in front of a notebook): sends a plain HTTP request through
+  the local proxy with an explicit non-local `Host` header, exactly what
+  `reverse_proxy._forwarded_headers`'s `override_host=True` forwards for
+  real once an actual BYO-domain/anon tunnel is in front of this.
 
 No Jupyter client library is used: the kernel WebSocket protocol is
 exercised directly over `websockets` (already a project dependency, used
@@ -168,6 +177,36 @@ def test_notebook_kernel_execution_round_trip(sidepage_home: Path) -> None:
         assert stream_text == "hello from sidepage\n"
     finally:
         _stop("nb-exec", env)
+        proc.wait(timeout=15)
+
+
+def test_notebook_allows_non_local_host_through_domain_tunnel(sidepage_home: Path) -> None:
+    """Reproduces the real `--domain`/`--anon` failure locally, without
+    actually opening a tunnel: `reverse_proxy._forwarded_headers` forwards
+    the real inbound `Host` on plain HTTP requests (`override_host=True`)
+    — through a real BYO-domain tunnel that's `<app>-<id>.<domain>`, not
+    `127.0.0.1:<port>`. Jupyter's `ServerApp.allow_remote_access` check
+    (distinct from the `Origin` check the flagship test above covers)
+    rejects any `Host` that doesn't look local, so this sends exactly that
+    shape of request straight at the local proxy and checks it's not
+    blocked."""
+    env = {**os.environ, "SIDEPAGE_HOME": str(sidepage_home)}
+    proc = _run_serve(
+        [str(FIXTURES / "notebook-app" / "notebook.ipynb"), "--name", "nb-host"], env=env
+    )
+    try:
+        entry = _wait_for_registry_entry(sidepage_home, "nb-host", timeout=30)
+        _poll_until_ready(f"{entry['url']}/lab", timeout=30)  # wait for readiness first
+
+        resp = httpx.get(
+            f"{entry['url']}/lab",
+            headers={"Host": "nb-host-ab12.example.com"},
+            timeout=10,
+        )
+        assert resp.status_code == 200
+        assert "non-local" not in resp.text.lower()
+    finally:
+        _stop("nb-host", env)
         proc.wait(timeout=15)
 
 
