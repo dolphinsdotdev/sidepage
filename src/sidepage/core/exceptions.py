@@ -130,6 +130,16 @@ class AppNotRegisteredError(AppRegistryError):
     """
 
 
+class PwaConfigError(SidepageError):
+    """`sidepage serve --pwa` (spec: `--pwa`/`--pwa-*` flags) was given an
+    invalid combination or value — a non-hex `--pwa-theme`/`--pwa-bg`, a
+    `--pwa-icon` that isn't a readable square PNG >=512px, or a
+    `--pwa-manifest` file that doesn't parse as JSON. Always names the
+    actual problem found (the bad value, or the actual dimensions/type
+    read from the file), never a generic "invalid" message.
+    """
+
+
 class PeerNotFoundError(DirectoryError):
     """`serve --peer <role>=<app-name>` (v5, `--peer`) or a live `GET
     /.sidepage/peers.json` request referenced an app name that isn't

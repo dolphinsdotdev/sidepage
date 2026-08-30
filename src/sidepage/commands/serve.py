@@ -46,6 +46,14 @@ app's URL as `SIDEPAGE_PEER_<ROLE>_URL`). All three are always taken from
 treatment as `--token`, and for the same reason: none of the three is
 part of `AppRegistration`, so there's nothing in the registry to merge
 against.
+
+`--pwa`/`--pwa-*` (`sidepage.core.pwa`) makes the served app installable
+to a phone home screen — synthetic manifest/service-worker routes plus
+HTML `<head>` injection, entirely at the reverse-proxy layer
+(`sidepage.core.reverse_proxy`), never touching the wrapped app. `--qr`
+prints a terminal QR code for the resulting URL, independent of `--pwa`.
+Same non-merging treatment as `--timeout`/`--peer` above: neither is part
+of `AppRegistration`, always taken from this invocation.
 """
 
 from __future__ import annotations
@@ -63,8 +71,9 @@ from sidepage.core.directory_client import Scope
 from sidepage.core.process import ServeConfig
 from sidepage.core.process import serve as core_serve
 from sidepage.core.process import stop as core_stop
+from sidepage.core.pwa import PwaDisplay, PwaOptions
 from sidepage.core.target import TargetKind
-from sidepage.output import error, not_implemented
+from sidepage.output import error, not_implemented, warn
 
 
 def _parse_peer(spec: str) -> tuple[str, str]:
@@ -186,6 +195,58 @@ def serve(
             "live via GET /.sidepage/peers.json. code/notebook targets only.",
         ),
     ] = None,
+    pwa: Annotated[
+        bool,
+        typer.Option("--pwa", help="Make this app installable to a phone home screen."),
+    ] = False,
+    pwa_name: Annotated[
+        str | None,
+        typer.Option("--pwa-name", help="App name. [default: resolved app name]"),
+    ] = None,
+    pwa_short_name: Annotated[
+        str | None,
+        typer.Option(
+            "--pwa-short-name",
+            help="Home screen label. [default: --pwa-name truncated to 12 chars]",
+        ),
+    ] = None,
+    pwa_theme: Annotated[
+        str, typer.Option("--pwa-theme", help="Theme / status bar hex color.")
+    ] = "#111111",
+    pwa_bg: Annotated[
+        str, typer.Option("--pwa-bg", help="Splash background hex color.")
+    ] = "#ffffff",
+    pwa_icon: Annotated[
+        Path | None,
+        typer.Option(
+            "--pwa-icon", help="Source PNG, square, >=512px. [default: bundled sidepage mark]"
+        ),
+    ] = None,
+    pwa_display: Annotated[
+        PwaDisplay, typer.Option("--pwa-display", help="Display mode.")
+    ] = PwaDisplay.STANDALONE,
+    pwa_manifest: Annotated[
+        Path | None,
+        typer.Option(
+            "--pwa-manifest",
+            help="Serve this file verbatim as the manifest; ignores --pwa-name/-short-name/"
+            "-theme/-bg/-icon/-display.",
+        ),
+    ] = None,
+    pwa_force: Annotated[
+        bool,
+        typer.Option(
+            "--pwa-force",
+            help="Inject sidepage's manifest link even if the app already ships its own.",
+        ),
+    ] = False,
+    pwa_no_sw: Annotated[
+        bool, typer.Option("--pwa-no-sw", help="Manifest only, no service worker.")
+    ] = False,
+    qr: Annotated[
+        bool,
+        typer.Option("--qr", help="Print a terminal QR code for the resulting URL."),
+    ] = False,
 ) -> None:
     """Serve a target and expose it through a tunnel. Blocks the terminal;
     Ctrl+C tears the tunnel down immediately."""
@@ -194,6 +255,52 @@ def serve(
     except ValueError as exc:
         error(str(exc))
         raise typer.Exit(1) from exc
+
+    def _explicit(field: str) -> bool:
+        source = ctx.get_parameter_source(field)
+        return source is not None and source.name == "COMMANDLINE"
+
+    # --pwa-* fields that build the generated manifest's *content* — the
+    # ones pwa.build_runtime actually ignores when --pwa-manifest is set
+    # (see that module's docstring for why --pwa-force/--pwa-no-sw are
+    # deliberately not in this list: they control the injection process,
+    # not manifest content, so they stay honored even with --pwa-manifest).
+    _pwa_manifest_content_fields = (
+        "pwa_name",
+        "pwa_short_name",
+        "pwa_theme",
+        "pwa_bg",
+        "pwa_icon",
+        "pwa_display",
+    )
+    _pwa_process_fields = ("pwa_manifest", "pwa_force", "pwa_no_sw")
+    pwa_flags_explicit = any(
+        _explicit(f) for f in (*_pwa_manifest_content_fields, *_pwa_process_fields)
+    )
+    if pwa_flags_explicit and not pwa:
+        error("--pwa-* flags require --pwa — pass --pwa to enable PWA mode.")
+        raise typer.Exit(1)
+    if _explicit("pwa_manifest") and any(_explicit(f) for f in _pwa_manifest_content_fields):
+        warn(
+            "--pwa-manifest is served verbatim — --pwa-name/-short-name/-theme/-bg/-icon/"
+            "-display are ignored"
+        )
+
+    pwa_options = (
+        PwaOptions(
+            name=pwa_name,
+            short_name=pwa_short_name,
+            theme=pwa_theme,
+            bg=pwa_bg,
+            icon=pwa_icon,
+            display=pwa_display,
+            manifest=pwa_manifest,
+            force=pwa_force,
+            no_sw=pwa_no_sw,
+        )
+        if pwa
+        else None
+    )
 
     registered = app_registry.get(str(target))
     if registered is None:
@@ -212,6 +319,8 @@ def serve(
             timeout=timeout,
             idle_timeout=idle_timeout,
             peers=peers,
+            pwa=pwa_options,
+            qr=qr,
         )
     else:
         merged = merge_with_registered(
@@ -240,6 +349,8 @@ def serve(
             timeout=timeout,
             idle_timeout=idle_timeout,
             peers=peers,
+            pwa=pwa_options,
+            qr=qr,
             **merged,
         )
     try:

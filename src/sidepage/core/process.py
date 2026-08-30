@@ -70,6 +70,8 @@ from sidepage.core import (
     account,
     ecosystem,
     notebook,
+    pwa,
+    qr,
     registry,
     secrets_vault,
     tunnel_manager,
@@ -117,6 +119,8 @@ class ServeConfig:
     timeout: float | None = None  # v5 §20 — absolute lifetime in seconds, from started_at
     idle_timeout: float | None = None  # v5 §20 — seconds since last proxied traffic
     peers: tuple[tuple[str, str], ...] = ()  # v5 --peer: (role, app_name) pairs, repeatable
+    pwa: pwa.PwaOptions | None = None  # --pwa; None means PWA mode is off
+    qr: bool = False  # --qr — print a terminal QR code for the resulting URL
 
 
 @dataclass(frozen=True)
@@ -453,6 +457,14 @@ def serve(config: ServeConfig) -> None:
             f"`sidepage stop {app_name}` it first, or pass --name for a different one."
         )
 
+    # Built here, before any port is allocated or subprocess spawned — a
+    # bad --pwa-icon/--pwa-manifest/hex color (pwa.PwaConfigError) fails
+    # loud immediately, same "fail before touching anything" posture as
+    # every other early check in this function.
+    pwa_runtime: pwa.PwaRuntime | None = None
+    if config.pwa is not None:
+        pwa_runtime = pwa.build_runtime(config.pwa, app_name=app_name, domain=config.domain)
+
     token: str | None = None
     if config.auth is AuthTier.TOKEN:
         token = resolve_token(explicit=config.token, env_value=os.environ.get("SIDEPAGE_TOKEN"))
@@ -525,6 +537,7 @@ def serve(config: ServeConfig) -> None:
             auth=config.auth.value,
             token=token,
             control_token=control_token,
+            pwa=pwa_runtime,
         )
     elif target_kind is TargetKind.CODE:
         upstream_port = allocate_port()
@@ -548,6 +561,7 @@ def serve(config: ServeConfig) -> None:
             control_token=control_token,
             start_upstream=_start_code_upstream,
             peers=config.peers,
+            pwa=pwa_runtime,
         )
     elif target_kind is TargetKind.NOTEBOOK:
         upstream_port = allocate_port()
@@ -567,6 +581,7 @@ def serve(config: ServeConfig) -> None:
             control_token=control_token,
             start_upstream=_start_notebook_upstream,
             peers=config.peers,
+            pwa=pwa_runtime,
         )
     else:
         raise NotImplementedError(
@@ -597,6 +612,16 @@ def serve(config: ServeConfig) -> None:
         )
         tunnel_url = tunnel.url
 
+    if pwa_runtime is not None:
+        # Only knowable now — the tunnel (if any) is up, so this is the
+        # actual served URL, not a startup-time guess. See
+        # pwa.finalize_offline_page and PwaRuntime's own docstring for why
+        # offline.html is mutated in place rather than built once up front
+        # like everything else in pwa_runtime.
+        pwa.finalize_offline_page(
+            pwa_runtime, app_name=app_name, served_url=tunnel_url or local_url
+        )
+
     started_at = time.time()
     registry.register(
         registry.RunningApp(
@@ -625,7 +650,18 @@ def serve(config: ServeConfig) -> None:
         info(f"auto-stop after {config.timeout:g}s")
     if config.idle_timeout is not None:
         info(f"auto-stop after {config.idle_timeout:g}s of no traffic")
+    if pwa_runtime is not None:
+        sw_desc = "sw disabled (--pwa-no-sw)" if pwa_runtime.sw_js is None else "sw /sw.js"
+        icon_desc = "icon bundled default" if config.pwa.icon is None else f"icon {config.pwa.icon}"
+        info(f"PWA: manifest /manifest.webmanifest · {sw_desc} · {icon_desc}")
+        if domain_config is not None:
+            info(f"PWA: stable install · id {domain_config.domain}")
+        else:
+            info("PWA: ephemeral session — icon breaks when this URL ends")
+            info("PWA: use --domain for a permanent install")
     info("Ctrl+C to stop")
+    if config.qr:
+        qr.print_qr(tunnel_url or local_url)
 
     # §20 timeout / idle-timeout: both checked right here in the existing
     # blocking loop, both exiting through the same `break` -> `finally:
