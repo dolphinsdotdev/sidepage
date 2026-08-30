@@ -286,6 +286,22 @@ def _build_code_launch_argv(
             "true",
             "--server.address",
             "127.0.0.1",
+            # Streamlit's own Tornado WebSocket handler rejects a
+            # connection whenever Origin doesn't match Host by default
+            # (server.enableCORS's default) — and through sidepage's
+            # reverse proxy, Origin is always the real public hostname
+            # while Host is always 127.0.0.1:<port>, so that mismatch is
+            # guaranteed, not occasional. Reproduced live as every
+            # WS-based render silently failing behind --domain/--anon
+            # ("Rejecting WebSocket connection with disallowed Origin or
+            # Host header"). Same trust-boundary reasoning already
+            # applied to the MCP host wrapper's
+            # enable_dns_rebinding_protection=False and Jupyter's
+            # --ServerApp.disable_check_xsrf=True: sidepage's own proxy +
+            # --auth gate is what actually gates access here, not
+            # Streamlit's Origin check.
+            "--server.enableCORS",
+            "false",
         ]
 
     if launcher is CodeLauncher.FASTAPI:

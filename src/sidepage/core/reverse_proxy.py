@@ -136,6 +136,38 @@ _HOP_BY_HOP = {
     "host",
 }
 
+# WS-specific exclusions on top of _HOP_BY_HOP for proxy_ws's outbound
+# headers: `websockets.connect` generates its own Sec-WebSocket-Key/
+# -Version/-Extensions for the handshake it performs, and
+# Sec-WebSocket-Protocol is negotiated via `subprotocols=` (see
+# proxy_ws) rather than forwarded as a raw header — passing any of these
+# through `additional_headers` too would just duplicate/conflict with
+# what the library sets itself.
+#
+# `origin` is excluded for the same reason `host` already is (see
+# `override_host=False` in `_forwarded_headers`'s docstring): the
+# upstream connection's literal Host is always `127.0.0.1:<port>`, never
+# whatever public hostname the browser actually used, so the browser's
+# real Origin is *guaranteed* to mismatch it. Forwarding it anyway
+# doesn't make the connection more legitimate — it just hands a
+# framework that validates Origin-against-Host (reproduced live:
+# Streamlit's Tornado WS handler, `server.enableCORS`'s default) a
+# reason to reject every single WS-based app served through `--domain`/
+# `--anon`, full stop. Sidepage's own reverse proxy + `--auth` gate is
+# the actual trust boundary here, exactly like the MCP host wrapper's
+# `enable_dns_rebinding_protection=False` and Jupyter's
+# `--ServerApp.disable_check_xsrf=True` (see `sidepage.core.process`) —
+# Streamlit gets the equivalent treatment via `--server.enableCORS
+# false` in its own launch flags, not just this header omission alone.
+_WS_HOP_BY_HOP = _HOP_BY_HOP | {
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-extensions",
+    "sec-websocket-protocol",
+    "sec-websocket-accept",
+    "origin",
+}
+
 _COOKIE_NAME = "sidepage_session"
 
 _GATE_PAGE = """<!doctype html>
@@ -678,19 +710,44 @@ def _build_proxy_app(
 
     async def proxy_ws(websocket: WebSocket) -> None:
         _ensure_started()
-        await websocket.accept()
-        activity.touch()
-        counts["ws_connections"] = counts.get("ws_connections", 0) + 1
-        _persist_counts(app_name, counts)
         upstream_url = f"ws://{upstream_host.host}:{upstream_port}{websocket.url.path}"
-        ws_headers: dict[str, str] = {}
+        # Forward the client's real headers (Origin, Cookie, ...), not an
+        # empty dict — matches proxy_http's `headers = {k: v for k, v in
+        # request.headers.items() ...}` starting point. WS-handshake-only
+        # header names are excluded: `websockets.connect` sets
+        # Sec-WebSocket-Key/-Version/-Extensions itself, and
+        # Sec-WebSocket-Protocol is handled below via `subprotocols=`
+        # instead of a raw header, so the client's requested list can
+        # actually be negotiated rather than just echoed blind.
+        ws_headers = {
+            k: v for k, v in websocket.headers.items() if k.lower() not in _WS_HOP_BY_HOP
+        }
         client_host = websocket.client.host if websocket.client is not None else None
         _forwarded_headers(ws_headers, websocket.headers, client_host, override_host=False)
+        requested_subprotocols = websocket.scope.get("subprotocols") or None
 
         try:
             async with websockets.connect(
-                upstream_url, additional_headers=ws_headers
+                upstream_url, additional_headers=ws_headers, subprotocols=requested_subprotocols
             ) as upstream_ws:
+                # Accept the client side only *after* the upstream
+                # handshake has actually completed, and with whichever
+                # subprotocol upstream selected — accepting blind (no
+                # subprotocol) is what broke every WS-based app that
+                # negotiates one (Streamlit's frontend requests
+                # `["streamlit", ...]` and requires the server's 101
+                # response to echo one back per RFC 6455; without a match
+                # the *browser itself* aborts the connection immediately,
+                # before either side ever sends a single message —
+                # reproduced live: `created` -> `error` -> `close code=
+                # 1006`, with no `send` in between). Connecting upstream
+                # first also means a client the upstream never accepts at
+                # all (still starting, refused, ...) is never told
+                # "connected" only to be abruptly dropped a moment later.
+                await websocket.accept(subprotocol=upstream_ws.subprotocol)
+                activity.touch()
+                counts["ws_connections"] = counts.get("ws_connections", 0) + 1
+                _persist_counts(app_name, counts)
 
                 async def client_to_upstream() -> None:
                     try:
