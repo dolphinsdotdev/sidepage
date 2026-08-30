@@ -24,9 +24,9 @@ through Sidepage's proxy breaks each of them for a different reason:**
    different upstream port — a mismatch that gets rejected out of the box.
    Confirmed live (a real kernel start + a real `execute_request` over a
    WebSocket carrying a deliberately-mismatched `Origin` header): the
-   rejection reproduces without `--ServerApp.allow_origin=*`
-   `--ServerApp.disable_check_xsrf=True`, and passing both fixes it — used
-   below rather than assumed.
+   rejection reproduces without `--ServerApp.allow_origin` set, and passing
+   `--ServerApp.disable_check_xsrf=True` alongside it fixes it — used below
+   rather than assumed.
 
 2. Separately, Jupyter Server also rejects any request whose `Host` header
    isn't "local" (`check_host`, gated by `ServerApp.allow_remote_access`,
@@ -40,20 +40,41 @@ through Sidepage's proxy breaks each of them for a different reason:**
    serve notebook.ipynb --domain <domain> --auth token`, every static
    asset 403s with "Blocking request with non-local 'Host'"). Distinct
    from the `Origin` mismatch above — fixing that one doesn't touch this
-   check at all, `--ServerApp.allow_remote_access=True` does.
+   check at all.
 
-Same trust-boundary reasoning both times: Sidepage's own reverse proxy +
-`--auth` gate is the actual thing deciding whether a request should reach
-this process at all, so a wrapped framework's own Origin/Host check is
-redundant — and actively wrong, since it can't be satisfied correctly
-through *any* reverse proxy, Sidepage's or otherwise. `--ip=127.0.0.1`
-(not Jupyter's own default, which isn't guaranteed across versions) is the
-actual mitigation for the "what if this launch command runs outside
-Sidepage's proxy" risk this module used to flag as unmitigated — the
-wrapped process's bind address is fully Sidepage-controlled by
-construction, same guarantee every other code launcher already has, so
-there's no separate runtime check to add beyond passing that flag
-ourselves.
+**Both are allowlisted to the one real origin, not wildcarded, whenever
+that origin is actually knowable at launch time** (`--domain`, or a plain
+local serve — see `sidepage.core.process.serve`'s `public_origin`
+computation): `--ServerApp.allow_origin=<public_origin>` for the `Origin`
+check, `--ServerApp.local_hostnames=['localhost', '<host>']` for the
+`Host` one — verified live against a real Jupyter Server that this rejects
+a *different*, unlisted `Host`/`Origin` with a real 403 while accepting
+the allowlisted one, not just silencing the check. `--anon` is the one
+case with nothing to allowlist against: the `*.trycloudflare.com` hostname
+isn't assigned until `cloudflared` reports it, *after* this launch command
+already ran — that session falls back to `--ServerApp.allow_origin=*`
+`--ServerApp.allow_remote_access=True` (both wide open), same
+trust-boundary reasoning the MCP host wrapper's own
+`enable_dns_rebinding_protection=False` already relies on: Sidepage's own
+reverse proxy + `--auth` gate is the thing actually deciding whether a
+request should reach this process at all, so a wrapped framework's own
+Origin/Host check is at best redundant there — and, unlike the allowlisted
+case above, there's no narrower value to give it for an as-yet-unassigned
+hostname.
+
+`--ServerApp.disable_check_xsrf=True` stays unconditional regardless of
+`public_origin`: XSRF protection is a distinct, cookie-based mechanism
+from either check above, and Sidepage's own `--auth` gate (not a
+CSRF-style token dance with the wrapped app) is what actually protects a
+mutating request here.
+
+`--ip=127.0.0.1` (not Jupyter's own default, which isn't guaranteed across
+versions) is the actual mitigation for the "what if this launch command
+runs outside Sidepage's proxy" risk this module used to flag as
+unmitigated — the wrapped process's bind address is fully
+Sidepage-controlled by construction, same guarantee every other code
+launcher already has, so there's no separate runtime check to add beyond
+passing that flag ourselves.
 
 **Dependencies via uv:** same pattern as every other code target — `uv
 run --with jupyterlab jupyter lab`, with the target directory's own
@@ -68,17 +89,21 @@ manifest of its own.
 from __future__ import annotations
 
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from sidepage.core import ecosystem
 
 
-def build_jupyter_launch_command(notebook: Path, *, port: int) -> list[str]:
+def build_jupyter_launch_command(
+    notebook: Path, *, port: int, public_origin: str | None
+) -> list[str]:
     """Construct the real `jupyter lab` launch command for `notebook`,
     binding to `port` on loopback only, with Jupyter's own auth disabled
     (the reverse proxy is the auth boundary) and its origin/XSRF/host
     checks relaxed enough to accept requests forwarded through that proxy
-    — see this module's docstring for why each is needed, verified rather
-    than assumed.
+    — see this module's docstring for why each is needed and how
+    `public_origin` (`sidepage.core.process.serve`'s computed real origin,
+    or `None` for `--anon`) narrows them, verified rather than assumed.
 
     The caller is expected to run this with `cwd=notebook.parent` (see
     `sidepage.core.process.serve`, consistent with every other code
@@ -86,7 +111,7 @@ def build_jupyter_launch_command(notebook: Path, *, port: int) -> list[str]:
     Jupyter opens it directly rather than requiring a nested lookup.
     """
     runner = ecosystem.resolve_python_runner(notebook.parent, extra_packages=["jupyterlab"])
-    return runner + [
+    argv = runner + [
         "jupyter",
         "lab",
         str(notebook),
@@ -96,7 +121,22 @@ def build_jupyter_launch_command(notebook: Path, *, port: int) -> list[str]:
         "--ip=127.0.0.1",
         "--ServerApp.token=",
         "--ServerApp.password=",
-        "--ServerApp.allow_origin=*",
         "--ServerApp.disable_check_xsrf=True",
-        "--ServerApp.allow_remote_access=True",
     ]
+    if public_origin is not None:
+        allowed_host = urlsplit(public_origin).netloc
+        argv += [
+            f"--ServerApp.allow_origin={public_origin}",
+            # repr(), not manual string-building: this is the exact
+            # syntax verified live against a real Jupyter Server for a
+            # traitlets List(Unicode()) CLI value — a bare comma-joined
+            # string is parsed as one literal hostname containing commas,
+            # not multiple entries, and silently rejects everything.
+            f"--ServerApp.local_hostnames={['localhost', allowed_host]!r}",
+        ]
+    else:
+        argv += [
+            "--ServerApp.allow_origin=*",
+            "--ServerApp.allow_remote_access=True",
+        ]
+    return argv

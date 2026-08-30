@@ -68,6 +68,7 @@ from sidepage.config.settings import mcp_wrappers_dir
 from sidepage.core import (
     _platform,
     account,
+    directory_client,
     ecosystem,
     notebook,
     pwa,
@@ -268,15 +269,28 @@ def _write_mcp_host_wrapper(
 
 
 def _build_code_launch_argv(
-    target: Path, launcher: CodeLauncher, port: int, app_name: str
+    target: Path,
+    launcher: CodeLauncher,
+    port: int,
+    app_name: str,
+    public_origin: str | None,
 ) -> list[str]:
+    """`public_origin` is the one real origin this app will actually be
+    reachable at — `https://<app>-<id>.<domain>` for `--domain`,
+    `http://127.0.0.1:<listen_port>` for a plain local serve, or `None`
+    for `--anon` (the `*.trycloudflare.com` hostname isn't assigned until
+    `cloudflared` reports it, *after* this function's caller launches the
+    subprocess — see `sidepage.core.process.serve`). Used to allowlist
+    exactly that origin instead of wildcarding Origin/CORS wide open,
+    where the launcher supports it — see the `STREAMLIT` branch below.
+    """
     if launcher is CodeLauncher.STREAMLIT:
         # extra_packages=["streamlit"] guarantees the launcher's own
         # detected requirement is present even if the target's own
         # requirements.txt doesn't declare it — see sidepage.core.ecosystem
         # for why that matters in practice.
         runner = ecosystem.resolve_python_runner(target.parent, extra_packages=["streamlit"])
-        return runner + [
+        argv = runner + [
             "streamlit",
             "run",
             str(target),
@@ -286,23 +300,46 @@ def _build_code_launch_argv(
             "true",
             "--server.address",
             "127.0.0.1",
-            # Streamlit's own Tornado WebSocket handler rejects a
-            # connection whenever Origin doesn't match Host by default
-            # (server.enableCORS's default) — and through sidepage's
-            # reverse proxy, Origin is always the real public hostname
-            # while Host is always 127.0.0.1:<port>, so that mismatch is
-            # guaranteed, not occasional. Reproduced live as every
-            # WS-based render silently failing behind --domain/--anon
-            # ("Rejecting WebSocket connection with disallowed Origin or
-            # Host header"). Same trust-boundary reasoning already
-            # applied to the MCP host wrapper's
-            # enable_dns_rebinding_protection=False and Jupyter's
-            # --ServerApp.disable_check_xsrf=True: sidepage's own proxy +
-            # --auth gate is what actually gates access here, not
-            # Streamlit's Origin check.
-            "--server.enableCORS",
-            "false",
         ]
+        # Streamlit's own Tornado WebSocket handler rejects a connection
+        # whenever Origin doesn't match Host by default
+        # (server.enableCORS's default) — and through sidepage's reverse
+        # proxy, Origin is always the real public hostname while Host is
+        # always 127.0.0.1:<port>, so that mismatch is guaranteed, not
+        # occasional. Reproduced live as every WS-based render silently
+        # failing behind --domain/--anon ("Rejecting WebSocket connection
+        # with disallowed Origin or Host header").
+        #
+        # When the real origin is known (--domain, or a plain local
+        # serve), allowlist exactly that one origin instead of opening
+        # CORS to everywhere — verified live (a real Streamlit server, a
+        # WS handshake with the allowlisted Origin succeeding, a
+        # different Origin getting a real 403) that
+        # `--server.corsAllowedOrigins` does real per-origin enforcement,
+        # not just silence the warning. `--server.enableCORS` is passed
+        # explicitly either way rather than relying on its default (which
+        # is already `true`) — this module doesn't leave a
+        # security-relevant flag to "whatever the wrapped framework
+        # currently defaults to."
+        #
+        # `--anon` (public_origin is None) keeps the wide-open fallback:
+        # the tunnel hostname genuinely isn't known yet at launch time,
+        # so there's nothing narrower to allowlist against. Same
+        # trust-boundary reasoning as the MCP host wrapper's
+        # enable_dns_rebinding_protection=False and Jupyter's
+        # --ServerApp.disable_check_xsrf=True covers that gap for ephemeral
+        # sessions: sidepage's own proxy + --auth gate is what actually
+        # gates access, not Streamlit's Origin check.
+        if public_origin is not None:
+            argv += [
+                "--server.enableCORS",
+                "true",
+                "--server.corsAllowedOrigins",
+                public_origin,
+            ]
+        else:
+            argv += ["--server.enableCORS", "false"]
+        return argv
 
     if launcher is CodeLauncher.FASTAPI:
         # Launched via `uvicorn <module>:<app>`, not by running the script
@@ -500,6 +537,28 @@ def serve(config: ServeConfig) -> None:
         )
 
     listen_port = allocate_port()
+
+    # The one real origin this app will actually be reachable at — used
+    # to allowlist Streamlit/Jupyter's own Origin/Host checks instead of
+    # wildcarding them wide open (see _build_code_launch_argv's STREAMLIT
+    # branch and notebook.build_jupyter_launch_command). Computable here,
+    # before any subprocess launches, for --domain (directory_client.
+    # check_name is a local, deterministic lookup — no network call, no
+    # dependency on the tunnel actually being open yet) and for a plain
+    # local serve (the proxy's own loopback address, known the moment
+    # listen_port is allocated). --anon is the one case this can't cover:
+    # the *.trycloudflare.com hostname isn't assigned until cloudflared
+    # reports it, which happens after this point — None here means "keep
+    # the wide-open fallback for this session," not "forgot to compute
+    # it."
+    if domain_config is not None:
+        routed_name = directory_client.check_name(app_name)
+        public_origin: str | None = f"https://{routed_name}.{domain_config.domain}"
+    elif config.anon:
+        public_origin = None
+    else:
+        public_origin = f"http://127.0.0.1:{listen_port}"
+
     proc: subprocess.Popen | None = None
     proxy: ProxyHandle
     tunnel = None
@@ -558,7 +617,7 @@ def serve(config: ServeConfig) -> None:
     elif target_kind is TargetKind.CODE:
         upstream_port = allocate_port()
         launcher = detect_code_launcher(target)
-        argv = _build_code_launch_argv(target, launcher, upstream_port, app_name)
+        argv = _build_code_launch_argv(target, launcher, upstream_port, app_name, public_origin)
         env = {**os.environ, **injected_env, "PORT": str(upstream_port)}
 
         def _start_code_upstream() -> None:
@@ -581,7 +640,9 @@ def serve(config: ServeConfig) -> None:
         )
     elif target_kind is TargetKind.NOTEBOOK:
         upstream_port = allocate_port()
-        argv = notebook.build_jupyter_launch_command(target, port=upstream_port)
+        argv = notebook.build_jupyter_launch_command(
+            target, port=upstream_port, public_origin=public_origin
+        )
         env = {**os.environ, **injected_env}
 
         def _start_notebook_upstream() -> None:
