@@ -17,50 +17,80 @@ message instead of failing silently or being left out of the CLI. See
 
 ## Install
 
-Requires [uv](https://docs.astral.sh/uv/) (it fetches Python 3.12+ for you
-if needed).
+```bash
+pip install sidepage
+sidepage setup      # installs cloudflared — needed for --anon/--domain tunneling
+sidepage --help
+```
+
+sidepage itself just needs Python 3.12+. It still shells out to
+[uv](https://docs.astral.sh/uv/) to run whatever `serve` points at — the
+wrapped app's own dependencies are always resolved through `uv run`,
+regardless of how sidepage itself got installed — so make sure `uv` is on
+`PATH` too. `sidepage setup` only installs `cloudflared` (the one
+non-Python runtime dependency tunneling needs); it's explicit and
+opt-in, never triggered silently from inside `serve`.
+
+**From source**, for working on sidepage itself rather than just using it
+— see [Development](#development) below:
 
 ```bash
 uv sync
-uv run sidepage --help
+uv run sidepage --help   # or: source .venv/bin/activate && sidepage --help
 ```
-
-Or activate the venv and call it directly: `source .venv/bin/activate &&
-sidepage --help`.
 
 ## Quickstart
 
+![sidepage serve, from command to public URL](docs/media/serve-demo.gif)
+
+
 ```bash
 # Serve a static site
-uv run sidepage serve tests/fixtures/static-site --name demo
+sidepage serve ./my-site --name demo
 
 # Serve a Streamlit app, gated behind a token
-uv run sidepage serve tests/fixtures/streamlit-app/app.py --name demo --auth token
+sidepage serve app.py --name demo --auth token
 
 # Serve a FastAPI app — /docs (Swagger UI) works automatically
-uv run sidepage serve tests/fixtures/fastapi-app/app.py --name demo
+sidepage serve app.py --name demo
 
 # Serve a Python MCP server over real Streamable HTTP — even if its own
 # __main__ only ever calls mcp.run() (stdio), sidepage never runs that
 # entrypoint, so it's reachable at /mcp regardless
-uv run sidepage serve tests/fixtures/mcp-app/app.py --name demo
+sidepage serve app.py --name demo
 
 # Serve a Jupyter notebook — a full, editable Lab instance with a live
 # kernel, reachable through the proxy like anything else
-uv run sidepage serve tests/fixtures/notebook-app/notebook.ipynb --name demo
+sidepage serve notebook.ipynb --name demo
 
 # Inject a secret and expose it over a real public tunnel
-uv run sidepage secrets set MY_KEY
-uv run sidepage serve some_app.py --env MY_KEY --anon
+sidepage secrets set MY_KEY
+sidepage serve app.py --env MY_KEY --anon
 
 # Auto-stop after 30 minutes of no traffic, and inject another running
 # app's URL as SIDEPAGE_PEER_API_URL
-uv run sidepage serve frontend.py --idle-timeout 1800 --peer api=backend
+sidepage serve frontend.py --idle-timeout 1800 --peer api=backend
 
 # Proxy a service you already have running instead of one sidepage
 # launches — npm run dev, a container, anything on a port
-uv run sidepage proxy --port 5173 --name my-vite-app
+sidepage proxy --port 5173 --name my-vite-app
+
+# Make an app installable to a phone home screen, with a terminal QR
+# code to scan and install it — see PWA install and QR codes below
+sidepage serve app.py --anon --pwa --qr
 ```
+
+Installed from source instead? Prefix every command with `uv run` (`uv run sidepage serve...`) or activate the venv first — see [Install](#install); the `uv run` prefix is only needed for that source-checkout path.
+
+`--type` is auto-detected from what you point at (`code`, `static`,
+`notebook`; within `code`, Streamlit/FastAPI/MCP are each recognized by
+import) — the four `sidepage serve app.py` lines above look identical
+because the actual dispatch happens by inspecting `app.py`'s content, not
+its filename. Want to try these against something real without writing
+your own app first? Clone this repo and swap in `tests/fixtures/static-
+site`, `tests/fixtures/streamlit-app/app.py`,
+`tests/fixtures/fastapi-app/app.py`, `tests/fixtures/mcp-app/app.py`, or
+`tests/fixtures/notebook-app/notebook.ipynb`.
 
 Every `serve`/`proxy` call blocks the terminal until Ctrl+C (or `sidepage
 stop <app-name>` from another terminal) — no background/daemon mode.
@@ -108,6 +138,7 @@ sidepage serve <target> [--type auto|code|static|notebook] [--name <app-name>]
                [--token <value>] [--env <SECRET_NAME>]...
                [--timeout <seconds>] [--idle-timeout <seconds>]
                [--peer <role>=<app-name>]...
+               [--pwa [--pwa-*]...] [--qr]
 ```
 
 - `--type` is usually inferred: `code` targets are auto-detected as
@@ -132,6 +163,9 @@ sidepage serve <target> [--type auto|code|static|notebook] [--name <app-name>]
   [Timeouts, lazy start, and peers](#timeouts-lazy-start-and-peers) below.
 - `--peer <role>=<app-name>` — repeatable; wire one served app to
   another's URL. Same section below.
+- `--pwa` / `--qr` — make the app installable to a phone home screen, and/or
+  print a terminal QR code for the URL. See [PWA install and QR
+  codes](#pwa-install-and-qr-codes) below.
 
 Run `sidepage <command> --help` for the full flag list, including ones
 that parse but aren't implemented yet (they report that clearly rather
@@ -235,6 +269,56 @@ sidepage serve backend.py --name backend
 sidepage serve frontend.py --peer api=backend   # $SIDEPAGE_PEER_API_URL in frontend's env
 ```
 
+## PWA install and QR codes
+
+**`--pwa`** makes any served app installable to a phone home screen —
+sidepage's reverse proxy synthesizes a web app manifest, a service
+worker, and the `<link>`/`<meta>` tags an app needs, injected into the
+HTML response on the fly. The wrapped app is never touched or modified on
+disk; this makes it *installable*, not mobile-friendly — no viewport
+meta, no CSS, no layout changes.
+
+```bash
+# Quickest path to an icon on a phone
+sidepage serve app.py --anon --pwa --qr
+
+# Durable install — stable across restarts, gets a real id in the manifest
+sidepage serve app.py --domain example.com \
+  --pwa --pwa-name "Sales Dashboard" --pwa-icon ./icon.png --pwa-theme "#0b3d2e"
+
+# App already ships its own manifest — sidepage defers to it by default
+sidepage serve ./dist --domain example.com --pwa --pwa-manifest ./public/manifest.json
+```
+
+- `--pwa-name` / `--pwa-short-name` — defaults to the resolved app name
+  (truncated to 12 chars for the short form). With `--anon`, `name` gets a
+  short session-marker suffix so repeat installs don't collide on the home
+  screen; `short_name` doesn't.
+- `--pwa-theme` / `--pwa-bg` — hex colors (`#rgb` or `#rrggbb`) for the
+  status bar / splash background. Default `#111111` / `#ffffff`.
+- `--pwa-icon <path>` — a square PNG, ≥512px; validated up front with a
+  clear error naming the actual dimensions found if it isn't. Omit it for
+  a bundled default icon.
+- `--pwa-display standalone|fullscreen|minimal-ui` — manifest display mode.
+- `--pwa-manifest <path>` — serve this file verbatim instead of generating
+  one; every other `--pwa-*` field is ignored for the manifest itself
+  (still honored for the injected `<meta>` tag and service worker).
+- `--pwa-force` — inject sidepage's manifest link even if the app already
+  has its own `rel="manifest"` (default: defer to the app's, but still
+  inject theme-color/service-worker).
+- `--pwa-no-sw` — manifest only, no service worker.
+
+**Ephemeral (`--anon`) vs. durable (`--domain`) installs matter here**:
+an `--anon` icon breaks the moment that session's tunnel URL stops
+existing — sidepage says so in the startup output — while a `--domain`
+install is stable across restarts and gets a real `id` in its manifest so
+reinstalling replaces the old icon instead of adding a second one.
+
+**`--qr`** prints a terminal QR code for whatever URL `serve` ends up
+with (the tunnel URL if one was opened, otherwise the local one) —
+independent of `--pwa`, useful any time there's a URL worth scanning onto
+a phone.
+
 ## Saved apps (the local registry)
 
 Save a `serve` invocation under a short name and re-run it without
@@ -334,6 +418,9 @@ CLI.
 
 ## Development
 
+For working on sidepage itself, not just using it (see
+[Install](#install) for that):
+
 ```bash
 uv sync                 # install runtime + dev deps
 uv run ruff check .     # lint
@@ -362,9 +449,12 @@ domain set` + `serve`/`proxy --domain`), `secrets`,
 local app registry (`app register|list|show|unregister` + `serve
 <app-name>`, with real one-off override merging), `--timeout`/
 `--idle-timeout` auto-teardown, lazy start for code/notebook targets
-(subprocess deferred to the first request), and `--peer
+(subprocess deferred to the first request), `--peer
 <role>=<app-name>` (boot-time env injection plus a live `GET
-/.sidepage/peers.json`).
+/.sidepage/peers.json`), and `--pwa`/`--qr` (manifest/service-worker
+synthesis + HTML injection at the proxy layer, bundled default icons,
+`--pwa-icon` validation, ephemeral vs. durable service-worker profiles,
+terminal QR output).
 
 **Not implemented, and reports that clearly rather than silently
 no-op'ing:** brokered (default) tunneling, `login`/`account status`, the

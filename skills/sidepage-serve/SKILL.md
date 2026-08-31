@@ -11,6 +11,18 @@ bring a site up, hand back a working URL, and tear it down again —
 including when running as a dispatched/background task with no
 interactive terminal.
 
+## If `sidepage` isn't on PATH
+
+It's a real PyPI package now — `pip install sidepage` (needs Python
+3.12+), then `sidepage setup` once to install `cloudflared` (only needed
+for `--anon`/`--domain` tunneling; skip it if the user only wants a local
+`127.0.0.1` link). Don't try `uv run sidepage` as a substitute — this
+skill assumes a native install on `PATH`, and the scripts below invoke
+`sidepage` directly, not through `uv run`. `sidepage` itself still shells
+out to `uv` to run whatever `serve` points at (the wrapped app's own
+dependencies), so `uv` needs to be on `PATH` too, separately from
+installing sidepage itself.
+
 ## The one thing that will bite you: `serve` and `proxy` both block
 
 `sidepage serve <target>` and `sidepage proxy --port <n>` both run in the
@@ -141,6 +153,28 @@ Key flags to reason about before launching `serve`:
   yet. The app can also re-resolve peers live via `GET
   /.sidepage/peers.json`, so a peer that restarts mid-session is never
   stale. Serve the peer first, then the app that references it.
+- **`--pwa`** — makes the app installable to a phone home screen (manifest
+  + service worker + HTML injection, all at the proxy layer — the app on
+  disk is never touched). Reach for this whenever the user wants to "add
+  it to my home screen," "make it an app," or install a demo on their
+  phone — not just for a plain sharable link, that's `--anon`/`--domain`
+  alone. Common flags: `--pwa-name`/`--pwa-short-name` (default: the
+  resolved app name), `--pwa-icon <path>` (square PNG, ≥512px — validated,
+  fails loud with the actual dimensions if it isn't), `--pwa-theme`/
+  `--pwa-bg` (hex colors). Mention up front that an `--anon` install
+  breaks the moment that session ends (sidepage says so in its own
+  output) — use `--domain` if the user wants the icon to survive restarts.
+- **`--qr`** — prints a terminal QR code for the resulting URL. Independent
+  of `--pwa`; pass it any time the user is going to want to scan a link
+  onto a phone rather than type it. Only useful when run directly in an
+  interactive terminal you can show the user — it degrades to a warning
+  (no crash) if stdout isn't a real tty, e.g. inside `start_site.sh`'s
+  backgrounded/redirected-to-a-logfile invocation, so don't rely on it
+  there — hand back the plain `url` from the JSON instead.
+
+```bash
+scripts/start_site.sh new demo app.py --anon --pwa --pwa-name "Demo"
+```
 
 ## Proxying an already-running service
 
