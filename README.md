@@ -32,7 +32,7 @@ non-Python runtime dependency tunneling needs); it's explicit and
 opt-in, never triggered silently from inside `serve`.
 
 **From source**, for working on sidepage itself rather than just using it
-— see [Development](#development) below:
+— see [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md):
 
 ```bash
 uv sync
@@ -42,7 +42,6 @@ uv run sidepage --help   # or: source .venv/bin/activate && sidepage --help
 ## Quickstart
 
 ![sidepage serve, from command to public URL](docs/media/serve-demo.gif)
-
 
 ```bash
 # Serve a static site
@@ -80,7 +79,10 @@ sidepage proxy --port 5173 --name my-vite-app
 sidepage serve app.py --anon --pwa --qr
 ```
 
-Installed from source instead? Prefix every command with `uv run` (`uv run sidepage serve...`) or activate the venv first — see [Install](#install); the `uv run` prefix is only needed for that source-checkout path.
+Installed from source instead? Prefix every command with `uv run` (`uv
+run sidepage serve...`) or activate the venv first — see
+[Install](#install); the `uv run` prefix is only needed for that
+source-checkout path.
 
 `--type` is auto-detected from what you point at (`code`, `static`,
 `notebook`; within `code`, Streamlit/FastAPI/MCP are each recognized by
@@ -173,236 +175,83 @@ than silently doing nothing).
 
 ## Proxying an already-running service
 
-`sidepage proxy` wraps a service you already have running — `npm run
-dev`, a container, anything already listening on a port — with the same
-reverse proxy, auth, and tunnel stack `serve` uses, minus one thing:
-sidepage never launches, owns, or manages the process's lifecycle.
+`sidepage proxy --port <n>` wraps a service you already have running —
+`npm run dev`, a container, anything already listening on a port — with
+the same reverse proxy, auth, and tunnel stack `serve` uses, but never
+launches or owns the process itself (Ctrl+C/`stop` only tears down the
+proxy and tunnel, not your service).
 
 ```bash
-sidepage proxy --port <n> [--name <app-name>] [--domain <domain> | --anon]
-               [--auth open|token] [--token <value>]
-               [--timeout <seconds>] [--idle-timeout <seconds>]
+sidepage proxy --port 5173 --anon   # already running: npm run dev on 5173
 ```
 
-- `--port` is the only required flag — always dialed on `127.0.0.1`, with
-  an automatic fallback to `[::1]` (IPv6 loopback) if that doesn't
-  answer, since `proxy` can't control how the wrapped service was bound
-  the way `serve` can for its own launchers.
-- `--name` defaults to `proxy-<port>` for plain local use; it's required
-  (and rejected loud if missing) once `--domain`/`--anon` is set, since it
-  becomes part of the public hostname there.
-- `--type`, `--env`, `--guardrail`, `--peer` aren't accepted at all — each
-  gives a specific, actionable error instead of being silently ignored,
-  since they're all about a subprocess `proxy` doesn't own.
-
-**The one behavior that's genuinely different from `serve`:** Ctrl+C /
-`sidepage stop <name>` tear down the proxy, the tunnel, and the registry
-entry only. The service you pointed `--port` at was never sidepage's to
-stop, and it doesn't.
-
-**Read `sidepage proxy --help` before pointing this at anything public** —
-it documents, loudly, three things worth knowing up front:
-- Every proxied request reaches the wrapped app from `127.0.0.1`
-  (sidepage's own address) — any app-level logic that trusts "this came
-  from localhost" instead of checking `X-Forwarded-For` (debug endpoints,
-  admin panels, and pointedly Flask/Werkzeug's interactive debugger — a
-  known RCE if reachable) is silently defeated, `--auth` or not.
-- The real `Host`/`X-Forwarded-Host`/`X-Forwarded-Proto`/`X-Forwarded-For`
-  are forwarded on HTTP requests (WebSocket connections carry
-  `X-Forwarded-Host` only, not a literal `Host` override — some WS
-  servers, Jupyter/Tornado confirmed live, reject a forwarded real
-  hostname on the handshake) — but that only helps an app that's
-  configured to trust them. `--help` has a one-line fix per framework
-  (Django, Flask, FastAPI/Starlette, Express, Rails, Vite).
-- OAuth/SSO logins are effectively incompatible with `--anon`, since the
-  hostname changes every run and providers require an exact,
-  pre-registered redirect URI — use `--domain` for anything doing OAuth.
-
-```bash
-# Already running: npm run dev -- --host 127.0.0.1 --port 5173
-sidepage proxy --port 5173                        # local only
-sidepage proxy --port 5173 --domain example.com    # your own domain
-sidepage proxy --port 5173 --anon                  # *.trycloudflare.com
-```
-
-One known gap: HMR/live-reload for a Vite dev server proxied through
-`--anon` doesn't reliably work (initial page load and `--domain` are both
-unaffected) — see [Project status](#project-status).
+**Read the full guide before pointing this at anything public** —
+[`docs/guides/proxy.md`](docs/guides/proxy.md) covers the safety notes
+(`X-Forwarded-*`, localhost-trust, OAuth/`--anon`), a one-line header fix
+per framework, and a known Vite HMR limitation.
 
 ## Timeouts, lazy start, and peers
 
-**Auto-teardown.** `--timeout <seconds>` stops the app once its total
-lifetime (from `serve` start) reaches the limit; `--idle-timeout
-<seconds>` stops it once that many seconds pass with no proxied HTTP
-request or WebSocket message — the timer resets on every one. Both are
-composable with each other and checked in the same blocking loop Ctrl+C
-already interrupts, so an auto-stop tears down exactly like `sidepage
-stop` would: immediately, no drain window.
-
-```bash
-sidepage serve demo.py --idle-timeout 1800   # stop after 30 idle minutes
-sidepage serve demo.py --timeout 3600        # stop after 1 hour no matter what
-```
-
-**Lazy start.** For `code`/`notebook` targets, the wrapped process isn't
-launched at `serve` time — it launches on the *first* inbound request,
-behind the same "starting…" holding page a slow boot already shows. A
-`serve` call that nobody ever hits never spends the CPU/memory to boot
-the wrapped app at all. (`static` targets are already in-process and
-instant, so there's nothing to defer there.) This is automatic — no flag.
-
-**Peers.** `--peer <role>=<app-name>` (repeatable) resolves another
-*currently running* served app's URL and injects it as
-`SIDEPAGE_PEER_<ROLE>_URL` in the wrapped process's environment — useful
-for a frontend that needs to reach a backend whose tunnel URL doesn't
-exist until it's actually served, and changes across `--anon` runs.
-Resolution fails loud (nonzero exit, clear message) if the named peer
-isn't running yet. The app can also re-resolve peers live, at any point,
-via `GET /.sidepage/peers.json` — gated by the app's own `--auth` tier
-like any other route — so a peer that restarts mid-session with a fresh
-URL is never stale the way the boot-time env var would be. `code`/
-`notebook` targets only; there's no subprocess to inject into for a
-`static` target, so `--peer` on one is rejected up front.
+`--timeout <seconds>` / `--idle-timeout <seconds>` auto-stop a served app
+(total lifetime, or no-traffic window); `code`/`notebook` targets also
+lazy-start their subprocess on the first inbound request instead of at
+`serve` time; `--peer <role>=<app-name>` wires one served app to
+another's URL via `SIDEPAGE_PEER_<ROLE>_URL`.
 
 ```bash
 sidepage serve backend.py --name backend
-sidepage serve frontend.py --peer api=backend   # $SIDEPAGE_PEER_API_URL in frontend's env
+sidepage serve frontend.py --idle-timeout 1800 --peer api=backend
 ```
+
+Full detail (live peer re-resolution via `GET /.sidepage/peers.json`,
+exactly when lazy start fires, why `--peer` is `code`/`notebook`-only) in
+[`docs/guides/timeouts-and-peers.md`](docs/guides/timeouts-and-peers.md).
 
 ## PWA install and QR codes
 
-**`--pwa`** makes any served app installable to a phone home screen —
-sidepage's reverse proxy synthesizes a web app manifest, a service
-worker, and the `<link>`/`<meta>` tags an app needs, injected into the
-HTML response on the fly. The wrapped app is never touched or modified on
-disk; this makes it *installable*, not mobile-friendly — no viewport
-meta, no CSS, no layout changes.
+`--pwa` makes any served app installable to a phone home screen —
+manifest, service worker, and HTML injection all synthesized by the
+reverse proxy, the wrapped app never touched on disk. `--qr` prints a
+terminal QR code for the resulting URL, independent of `--pwa`.
 
 ```bash
-# Quickest path to an icon on a phone
 sidepage serve app.py --anon --pwa --qr
-
-# Durable install — stable across restarts, gets a real id in the manifest
-sidepage serve app.py --domain example.com \
-  --pwa --pwa-name "Sales Dashboard" --pwa-icon ./icon.png --pwa-theme "#0b3d2e"
-
-# App already ships its own manifest — sidepage defers to it by default
-sidepage serve ./dist --domain example.com --pwa --pwa-manifest ./public/manifest.json
 ```
 
-- `--pwa-name` / `--pwa-short-name` — defaults to the resolved app name
-  (truncated to 12 chars for the short form). With `--anon`, `name` gets a
-  short session-marker suffix so repeat installs don't collide on the home
-  screen; `short_name` doesn't.
-- `--pwa-theme` / `--pwa-bg` — hex colors (`#rgb` or `#rrggbb`) for the
-  status bar / splash background. Default `#111111` / `#ffffff`.
-- `--pwa-icon <path>` — a square PNG, ≥512px; validated up front with a
-  clear error naming the actual dimensions found if it isn't. Omit it for
-  a bundled default icon.
-- `--pwa-display standalone|fullscreen|minimal-ui` — manifest display mode.
-- `--pwa-manifest <path>` — serve this file verbatim instead of generating
-  one; every other `--pwa-*` field is ignored for the manifest itself
-  (still honored for the injected `<meta>` tag and service worker).
-- `--pwa-force` — inject sidepage's manifest link even if the app already
-  has its own `rel="manifest"` (default: defer to the app's, but still
-  inject theme-color/service-worker).
-- `--pwa-no-sw` — manifest only, no service worker.
-
-**Ephemeral (`--anon`) vs. durable (`--domain`) installs matter here**:
-an `--anon` icon breaks the moment that session's tunnel URL stops
-existing — sidepage says so in the startup output — while a `--domain`
-install is stable across restarts and gets a real `id` in its manifest so
-reinstalling replaces the old icon instead of adding a second one.
-
-**`--qr`** prints a terminal QR code for whatever URL `serve` ends up
-with (the tunnel URL if one was opened, otherwise the local one) —
-independent of `--pwa`, useful any time there's a URL worth scanning onto
-a phone.
+Every `--pwa-*` flag, the ephemeral-vs-durable install distinction, and
+icon validation are in [`docs/guides/pwa.md`](docs/guides/pwa.md).
 
 ## Saved apps (the local registry)
 
 Save a `serve` invocation under a short name and re-run it without
-retyping flags:
+retyping flags — any flag passed at `serve` time overrides the
+registered one for that run only, the saved registration is never
+changed.
 
 ```bash
 sidepage app register "abc.py --auth token" abc-app
 sidepage serve abc-app
 ```
 
-Any flag passed at `serve` time overrides the registered one **for that
-one run only** — the saved registration itself is never changed:
-
-```bash
-sidepage serve abc-app --scope web   # runs with --auth token (registered)
-                                      # but --scope web for just this run
-```
-
-`sidepage app show abc-app` prints the saved config; add `--with "<flags>"`
-to preview the effective merged config before actually running it, e.g.
-`sidepage app show abc-app --with "--scope web"`.
-
-A registered app's target is resolved once, at registration time — so
-`--type` is stored as a concrete value (`code`, `static`, `notebook`),
-never "auto." `sidepage app register` **refuses** a literal `--token
-<value>`: auth tokens are per-process and regenerate on every `serve`
-call, so storing one would defeat the point of them being ephemeral.
-`--env <SECRET_NAME>` is fine to save — it's a reference to a vault entry,
-never the secret value itself.
-
-```bash
-sidepage app list
-sidepage app unregister abc-app
-```
+Override/merge semantics, the `--with` preview, and why a literal
+`--token` is refused at registration time are in
+[`docs/guides/registry.md`](docs/guides/registry.md).
 
 ## Bring your own domain
 
 Route apps through your own Cloudflare domain instead of
-`*.trycloudflare.com`. One-time setup:
+`*.trycloudflare.com`:
 
-1. Create a Cloudflare API token (dashboard → My Profile → API Tokens)
-   scoped to:
-   - Account → Cloudflare Tunnel → Edit
-   - Zone → DNS → Edit
-   - Zone → Zone → Read
-2. Store it in the vault, then provision the domain:
-   ```bash
-   sidepage secrets set cf-api-token
-   sidepage account domain set example.com --api-token-name cf-api-token
-   ```
-   This creates one Cloudflare Tunnel for the whole domain and stores its
-   run-token in the vault automatically — the CLI prints the vault name it
-   landed under (`cf-tunnel-token::example.com`), since it was never typed
-   by you.
-3. Serve apps through it:
-   ```bash
-   sidepage serve app.py --domain example.com
-   ```
-
-Every app served under the same domain shares that one tunnel — no new
-Cloudflare resources or tokens per app. The shared `cloudflared` process
-starts with the first app on a domain and stops with the last.
-
-## Project layout
-
+```bash
+sidepage secrets set cf-api-token
+sidepage account domain set example.com --api-token-name cf-api-token
+sidepage serve app.py --domain example.com
 ```
-src/sidepage/
-├── cli.py           Root Typer app
-├── commands/        Argument parsing & help text — one module per command group
-├── core/            The SDK: serve/tunnel/proxy orchestration, secrets vault, running-app registry, saved-app registry
-└── config/          Local config paths (XDG-style, overridable via SIDEPAGE_HOME)
 
-tests/
-├── fixtures/        Real apps used as test targets (static site, Streamlit, FastAPI, MCP, notebook, Flask, Vite)
-└── test_*.py        Unit and integration tests
-
-docs/
-├── CHECKLIST.md       Build status for every command and core module
-├── OPEN_QUESTIONS.md  Design decisions — resolved and still-open
-└── SPEC_V5_DRAFT.md   v5 proposals — timeout/lazy-start/--peer (built, this doc) plus still-parked ideas
-
-skills/
-└── sidepage-serve/    Packaged Claude Skill wrapping this CLI for agents (see below)
-```
+One-time setup needs a scoped Cloudflare API token; every app served
+under the same domain then shares that one Cloudflare Tunnel — no new
+resources or tokens per app. Token scopes and the shared-tunnel model are
+in [`docs/guides/byo-domain.md`](docs/guides/byo-domain.md).
 
 ## For agents and harnesses
 
@@ -412,14 +261,9 @@ agent to drive `sidepage serve`/`sidepage proxy` safely — most importantly,
 how to background them and get structured JSON back instead of hanging,
 since neither command has a daemon mode and both block until Ctrl+C or
 `sidepage stop`. Copy or symlink that directory into wherever your harness
-looks for skills (e.g. `~/.claude/skills/`); `tests/test_skill_docs.py` and
-`tests/test_skill_scripts.py` keep it in sync with and tested against this
-CLI.
+looks for skills (e.g. `~/.claude/skills/`).
 
 ## Development
-
-For working on sidepage itself, not just using it (see
-[Install](#install) for that):
 
 ```bash
 uv sync                 # install runtime + dev deps
@@ -427,53 +271,41 @@ uv run ruff check .     # lint
 uv run pytest           # full suite (~4 min; mostly first-run dependency resolves)
 ```
 
-Runtime dependencies are real, not stubs: Starlette, uvicorn, httpx, and
-`websockets` back the reverse proxy; `cryptography` backs the secrets
-vault. `cloudflared` and network access (for `uv run` to resolve wrapped
-apps' dependencies) are expected to be available wherever tests run.
-Node.js/npm are needed too, for the Vite fixture tests
-(`tests/test_proxy_frameworks.py`) — `npm install` runs automatically
-against `tests/fixtures/vite-app` the first time those tests run.
+Project layout, the full dependency list, and what's needed on the
+machine running tests (`cloudflared`, Node.js/npm for the Vite fixture)
+are in [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md).
 
 ## Project status
 
-**Real and tested end to end:** `serve` for static, code, and notebook
-targets (Streamlit/FastAPI/Python-MCP auto-detected, generic `$PORT`
-fallback, full Jupyter Lab for `.ipynb`), `proxy` for an already-running
-service (own `--name` default, teardown that never touches the wrapped
-service, Caddy-style forwarded headers, and an IPv6 loopback fallback —
-the latter two shared with `serve` too), `open`/`token` auth, `--env`
-secret injection, `--anon` tunneling, BYO-domain tunneling (`account
-domain set` + `serve`/`proxy --domain`), `secrets`,
-`stop`/`ls`/`status`/`usage`, `inspect` for HTTP/static targets, the
-local app registry (`app register|list|show|unregister` + `serve
-<app-name>`, with real one-off override merging), `--timeout`/
-`--idle-timeout` auto-teardown, lazy start for code/notebook targets
-(subprocess deferred to the first request), `--peer
-<role>=<app-name>` (boot-time env injection plus a live `GET
-/.sidepage/peers.json`), and `--pwa`/`--qr` (manifest/service-worker
-synthesis + HTML injection at the proxy layer, bundled default icons,
-`--pwa-icon` validation, ephemeral vs. durable service-worker profiles,
-terminal QR output).
+**Real and tested end to end:** `serve`/`proxy` for static, code, and
+notebook targets, `open`/`token` auth, `--env` secret injection, `--anon`
+tunneling, BYO-domain tunneling, `secrets`, `stop`/`ls`/`status`/`usage`,
+`inspect`, the local app registry, `--timeout`/`--idle-timeout`/`--peer`,
+and `--pwa`/`--qr`.
 
 **Not implemented, and reports that clearly rather than silently
 no-op'ing:** brokered (default) tunneling, `login`/`account status`, the
 discovery directory beyond this machine, `--guardrail`, `--auth
-network`/`oauth`, MCP tool browsing in `inspect`, `proxy` detecting
-Vite's `allowedHosts` rejection and printing an inline hint (documented
-in `--help` instead, see [Proxying an already-running
-service](#proxying-an-already-running-service)), and the OS-keychain
+network`/`oauth`, MCP tool browsing in `inspect`, and an OS-keychain
 backend for the secrets vault (encrypted-file only for now).
 
-**Known limitation, investigated not fixed:** HMR/live-reload for a Vite
-target proxied through `--anon` doesn't reliably work, even though the
-initial page load and BYO-domain are both unaffected — ruled out
-sidepage's own header forwarding/routing as the cause (the exact browser
-handshake, reproduced with `curl`, succeeds through the real Cloudflare
-edge + `cloudflared` + sidepage + Vite chain end to end); the gap is
-somewhere in how a real browser's `WebSocket` negotiates against
-Cloudflare's Quick Tunnel edge specifically, not isolated further.
+**One known limitation, investigated not fixed:** HMR/live-reload for a
+Vite target proxied through `--anon` — see
+[`docs/guides/proxy.md`](docs/guides/proxy.md).
 
 See [`docs/CHECKLIST.md`](docs/CHECKLIST.md) for the full per-feature
-breakdown, and [`docs/OPEN_QUESTIONS.md`](docs/OPEN_QUESTIONS.md) for
-design rationale behind what's resolved and what's still open.
+breakdown.
+
+## See also
+
+- [`docs/guides/proxy.md`](docs/guides/proxy.md),
+  [`docs/guides/timeouts-and-peers.md`](docs/guides/timeouts-and-peers.md),
+  [`docs/guides/pwa.md`](docs/guides/pwa.md),
+  [`docs/guides/registry.md`](docs/guides/registry.md),
+  [`docs/guides/byo-domain.md`](docs/guides/byo-domain.md) — per-feature
+  deep dives.
+- [`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md) — project layout,
+  contributor setup.
+- [`docs/CHECKLIST.md`](docs/CHECKLIST.md) — full per-feature build status.
+- [`docs/OPEN_QUESTIONS.md`](docs/OPEN_QUESTIONS.md) — design rationale
+  behind what's resolved and what's still open.
