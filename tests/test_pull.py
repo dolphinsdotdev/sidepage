@@ -415,13 +415,28 @@ def test_pull_downloads_registers_and_reports(sidepage_home: Path, fake_hub) -> 
     assert registered.target == app_dir / "app.py"
 
 
-def test_pull_reports_the_requested_env_name_without_granting_it(
-    sidepage_home: Path, fake_hub
-) -> None:
+def test_pull_reports_the_env_name_without_setting_it(sidepage_home: Path, fake_hub) -> None:
     result = runner.invoke(app, ["pull", "hf:someone/demo-space"])
     assert "FINNHUB_API_KEY" in result.output
-    assert "not granted" in result.output
-    assert "--env FINNHUB_API_KEY" in result.output
+    assert "not set" in result.output
+
+
+def test_pull_does_not_suggest_a_serve_command_that_cannot_work(
+    sidepage_home: Path, fake_hub
+) -> None:
+    """The scan reports every variable the app reads, and most are plain
+    configuration. `--env` takes a *vault secret name* and fails loud when
+    that name isn't in the vault, so appending it to the suggested command
+    produced a copy-pasteable line that always failed with "no secret
+    named 'X' in the vault" — the tool teaching the wrong lesson about its
+    own flag. The plain `serve` line must be the one offered first."""
+    result = runner.invoke(app, ["pull", "hf:someone/demo-space"])
+    normalized = " ".join(result.output.split())
+    assert "sidepage serve demo-space" in normalized
+    # Both ways of supplying it are shown, and neither is the bare
+    # `serve <app> --env NAME` that silently assumes a vault entry exists.
+    assert "FINNHUB_API_KEY=<value> sidepage serve demo-space" in normalized
+    assert "sidepage secrets set FINNHUB_API_KEY" in normalized
 
 
 def test_dry_run_downloads_nothing_and_registers_nothing(sidepage_home: Path, fake_hub) -> None:

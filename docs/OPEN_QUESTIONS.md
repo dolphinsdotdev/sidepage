@@ -579,7 +579,20 @@ until `serve --env`.
    the machine has, let it decide) is deliberately not built: there's no
    consumer for it yet beyond this one check, and inventing a hardware
    description format for a single warning would be the wrong shape.
-8. **Repository size is not runtime size, and the plan can't say so.**
+8. **Trust is recorded per commit, but nothing verifies the files still
+   match it.** `serve` compares `trusted_commit` to `commit` and stays
+   quiet when they agree — yet the tree under `apps/<name>` is ordinary
+   files on disk that anything can edit. Demonstrated by editing a pulled
+   app's `app.py` in place: `sidepage app show` still reports
+   `trusted: yes, at 63cd28a` for code that is no longer what was
+   reviewed. Benign when the user edits their own pulled app on purpose
+   (the case it came up in), and not a privilege boundary — anything that
+   can write there can already run code as the user. But it does mean the
+   gate's guarantee is narrower than "the code you approved is the code
+   that runs": it is "the commit you approved is still the commit
+   recorded". Closing it means hashing the tree at pull time and checking
+   it at serve time, which is cheap and not yet built.
+9. **Repository size is not runtime size, and the plan can't say so.**
    Most Spaces are a few KB of code that call `snapshot_download` or
    `from_pretrained` on first request — `mlx-community/supertonic-3` is
    28 KB of repo and an unknown number of GB once running. `pull

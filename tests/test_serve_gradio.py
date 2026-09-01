@@ -204,6 +204,25 @@ def test_gradio_script_without_launch_resolves_demo_by_name(sidepage_home: Path)
         proc.wait(timeout=15)
 
 
+def test_launch_css_is_forwarded_to_the_mounted_app(sidepage_home: Path) -> None:
+    """Gradio 6 moved `css` off `Blocks` onto `launch()`/`mount_gradio_app()`.
+    sidepage neutralizes `launch()` and mounts the Blocks itself, so unless
+    the captured kwargs are forwarded, every Space that styles itself the
+    documented way is served unstyled — silently. Found while restyling a
+    real app and noticing `Blocks(css=...)` had become a no-op."""
+    env = {**os.environ, "SIDEPAGE_HOME": str(sidepage_home)}
+    proc = _run_serve(
+        [str(FIXTURES / "gradio-factory-app" / "app.py"), "--name", "gradio-css"], env=env
+    )
+    try:
+        entry = _wait_for_registry_entry(sidepage_home, "gradio-css", timeout=READY_TIMEOUT)
+        resp = _wait_for_gradio_ui(entry["url"], timeout=READY_TIMEOUT)
+        assert "sidepage-css-marker" in resp.text, "launch(css=...) was dropped by the wrapper"
+    finally:
+        _stop("gradio-css", env)
+        proc.wait(timeout=15)
+
+
 def test_gradio_wrapper_is_cleaned_up_on_teardown(sidepage_home: Path) -> None:
     """The generated wrapper module is per-run scratch state, not
     something left behind in the user's state directory after the app

@@ -243,8 +243,8 @@ def _print_source(source) -> None:
         plain.print(f"  hf sdk:         {sdk}")
     if source.env_requested:
         plain.print(
-            f"  requests env:   {', '.join(source.env_requested)} "
-            "[dim](not granted — pass --env to grant)[/dim]"
+            f"  reads env:      {', '.join(source.env_requested)} "
+            "[dim](not set — export them, or `secrets set` + --env for credentials)[/dim]"
         )
     if source.trusted_commit == source.commit:
         plain.print(f"  trusted:        yes, at {source.commit[:7]}")

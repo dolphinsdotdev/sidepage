@@ -31,5 +31,10 @@ def build_ui() -> gr.Blocks:
     return demo
 
 
+# `css=` is passed to `launch()` because Gradio 6 removed it from
+# `Blocks`. A host that mounts the Blocks itself must forward it, or the
+# app is served unstyled — see `_GRADIO_WRAPPER_SOURCE`'s `_FORWARDED`.
+CSS = "#sidepage-css-marker { color: rgb(1, 2, 3); }"
+
 if __name__ == "__main__":
-    build_ui().launch(server_port=8124)
+    build_ui().launch(server_port=8124, css=CSS)

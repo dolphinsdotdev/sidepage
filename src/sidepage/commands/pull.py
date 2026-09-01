@@ -152,7 +152,7 @@ def _print_plan(
 
     if plan.env_names:
         for name in plan.env_names:
-            plain.print(f"  env     {name}  [dim](requested — not granted)[/dim]")
+            plain.print(f"  env     {name}  [dim](read by the app — not set)[/dim]")
     plain.print()
 
     for warning in plan.warnings:
@@ -166,8 +166,23 @@ def _print_plan(
         return
 
     plain.print("  [dim]nothing has been executed. review the code, then:[/dim]")
-    env_flags = "".join(f" --env {name}" for name in plan.env_names)
-    plain.print(f"    sidepage serve {app_name}{env_flags}")
+    plain.print(f"    sidepage serve {app_name}")
+    if plan.env_names:
+        # Deliberately *not* `serve <app> --env NAME`. The scan finds every
+        # variable the app reads, and most are plain configuration; `--env`
+        # takes a vault secret *name* and fails loud if that name isn't in
+        # the vault. Suggesting it blindly produced a copy-pasteable command
+        # that always failed with "no secret named 'X' in the vault", which
+        # is a confusing way to learn the difference between config and a
+        # credential.
+        first = plan.env_names[0]
+        plain.print()
+        plain.print(f"  [dim]it reads {', '.join(plan.env_names)} — to set them:[/dim]")
+        plain.print(f"    {first}=<value> sidepage serve {app_name}        [dim]# config[/dim]")
+        plain.print(
+            f"    sidepage secrets set {first} && sidepage serve {app_name} --env {first}"
+            "   [dim]# credential[/dim]"
+        )
     plain.print(f"  [dim]source is at {app_source_dir(app_name)}[/dim]")
 
 
