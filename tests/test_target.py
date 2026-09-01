@@ -76,6 +76,36 @@ def test_fastapi_takes_precedence_over_mcp_when_mcp_is_mounted_inside_it(tmp_pat
     assert detect_code_launcher(target) is CodeLauncher.FASTAPI
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import gradio as gr\ndemo = gr.Interface(lambda x: x, 'text', 'text')\ndemo.launch()\n",
+        "from gradio import Blocks\nwith Blocks() as demo:\n    pass\ndemo.launch()\n",
+    ],
+)
+def test_detects_gradio(tmp_path: Path, source: str) -> None:
+    target = _write(tmp_path, "app.py", source)
+    assert detect_code_launcher(target) is CodeLauncher.GRADIO
+
+
+def test_fastapi_takes_precedence_over_gradio_when_gradio_is_mounted_inside_it(
+    tmp_path: Path,
+) -> None:
+    """Same rule as the MCP case above: a script that mounts its Blocks
+    onto its own FastAPI app wants that app served, not a second, separate
+    mount of the same Blocks. See detect_code_launcher's docstring."""
+    source = (
+        "import gradio as gr\n"
+        "from fastapi import FastAPI\n"
+        "app = FastAPI()\n"
+        "with gr.Blocks() as demo:\n"
+        "    pass\n"
+        "app = gr.mount_gradio_app(app, demo, path='/ui')\n"
+    )
+    target = _write(tmp_path, "app.py", source)
+    assert detect_code_launcher(target) is CodeLauncher.FASTAPI
+
+
 def test_generic_python_fallback_for_unrecognized_source(tmp_path: Path) -> None:
     target = _write(tmp_path, "app.py", "import os\nprint(os.environ.get('PORT'))\n")
     assert detect_code_launcher(target) is CodeLauncher.GENERIC_PYTHON

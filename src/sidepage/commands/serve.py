@@ -52,28 +52,120 @@ to a phone home screen — synthetic manifest/service-worker routes plus
 HTML `<head>` injection, entirely at the reverse-proxy layer
 (`sidepage.core.reverse_proxy`), never touching the wrapped app. `--qr`
 prints a terminal QR code for the resulting URL, independent of `--pwa`.
-Same non-merging treatment as `--timeout`/`--peer` above: neither is part
-of `AppRegistration`, always taken from this invocation.
+
+**`--pwa*` *is* part of `AppRegistration` and merges** — unlike
+`--timeout`/`--idle-timeout`/`--peer`/`--qr` above, which stay
+per-invocation. An installed app's name, icon, and theme are part of
+what the served app is, not how one run of it behaves, so a saved config
+that dropped them wouldn't reproduce the app it was saved from. It merges
+as one unit rather than field by field: any explicit `--pwa*` flag this
+invocation replaces the registered PWA config wholesale, and passing none
+of them applies the registered one — see
+`sidepage.commands.app_registry.merge_with_registered`.
+
+`--autoregister` saves this invocation to the app registry once the app
+is actually up (`sidepage.core.process.serve`), so a one-off `serve`
+becomes a replayable `serve <app-name>` without a second command. Flags
+the registry can't hold are reported by name rather than dropped
+silently, and re-running an already-registered identical config is a
+no-op with a pointer at the shorter command, not an error.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import StrEnum
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 
+from sidepage import output
 from sidepage.commands.app_registry import merge_with_registered
 from sidepage.core import app_registry
 from sidepage.core.auth import AuthTier
 from sidepage.core.directory_client import Scope
+from sidepage.core.exceptions import UntrustedSourceError
 from sidepage.core.process import ServeConfig
 from sidepage.core.process import serve as core_serve
 from sidepage.core.process import stop as core_stop
 from sidepage.core.pwa import PwaDisplay, PwaOptions
 from sidepage.core.target import TargetKind
-from sidepage.output import error, not_implemented, warn
+from sidepage.output import error, not_implemented, plain, warn
+
+
+def _require_source_trust(
+    app_name: str, registered: app_registry.AppRegistration, *, waived: bool
+) -> None:
+    """Gate execution of code sidepage downloaded, until a human approves
+    the exact commit about to run.
+
+    **Why this exists:** `sidepage pull` fetches a stranger's code, and
+    `serve` runs it on a machine that also holds an encrypted secrets
+    vault, the user's own projects, and their shell credentials. Hugging
+    Face puts a warning in front of the equivalent action for the same
+    reason. A convenience that lets `serve <arbitrary-url>` execute
+    without a gate isn't a convenience, it's a remote-code-execution path
+    with a friendly name.
+
+    **Trust attaches to a commit, not a name.** `AppSource.trusted_commit`
+    records what was approved; `pull` always fetches the source's current
+    state and rewrites the entry, so newly downloaded code arrives with a
+    different `commit` and no `trusted_commit`, and this prompt re-arms
+    by construction. Approving `serve foo` once does not silently approve
+    whatever `foo` becomes later.
+
+    **No prompt means no execution.** Without a terminal — an agent, a CI
+    job, a piped invocation — there is nobody to ask, so this raises
+    rather than defaulting to yes. `--trust-remote-code` is the explicit
+    waiver, which keeps the decision a thing someone typed on purpose.
+
+    Locally-registered apps (`source is None`) never reach any of this:
+    sidepage didn't download them, and gating a user's own file would be
+    theater.
+    """
+    source = registered.source
+    if source is None or source.trusted_commit == source.commit:
+        return
+
+    if waived:
+        warn(
+            f"{app_name}: running downloaded code from {source.url} @ {source.commit[:7]} "
+            "without review (--trust-remote-code)"
+        )
+        app_registry.set_trusted_commit(app_name, source.commit)
+        return
+
+    previously_trusted = source.trusted_commit is not None
+    plain.print()
+    plain.print("  [bold yellow]about to run code sidepage downloaded[/bold yellow]")
+    plain.print(f"  source   {source.url}")
+    plain.print(f"  commit   {source.commit[:7]}")
+    if source.hf is not None:
+        sdk = source.hf.sdk or "unknown"
+        if source.hf.sdk_version:
+            sdk += f" {source.hf.sdk_version}"
+        plain.print(f"  sdk      {sdk}")
+    plain.print(f"  entry    {registered.target}")
+    if source.env_requested:
+        plain.print(f"  wants    {', '.join(source.env_requested)}  [dim](not granted)[/dim]")
+    if previously_trusted:
+        plain.print(
+            f"  [yellow]changed[/yellow]  you approved {source.trusted_commit[:7]} before; "
+            "this is different code"
+        )
+    plain.print()
+
+    if not output.is_interactive():
+        raise UntrustedSourceError(
+            f"{app_name} runs code downloaded from {source.url} and hasn't been approved at "
+            f"commit {source.commit[:7]}. There's no terminal here to confirm at, so sidepage "
+            "won't execute it. Review the source, then re-run with --trust-remote-code."
+        )
+
+    if not typer.confirm("  run it?", default=False):
+        raise UntrustedSourceError(f"{app_name} was not started")
+    app_registry.set_trusted_commit(app_name, source.commit)
 
 
 def _parse_peer(spec: str) -> tuple[str, str]:
@@ -86,6 +178,59 @@ def _parse_peer(spec: str) -> tuple[str, str]:
     if not sep or not role or not app_name:
         raise ValueError(f"--peer {spec!r} must be ROLE=APP-NAME, e.g. --peer api=my-api")
     return role, app_name
+
+
+#: Every `--pwa*` parameter name, in `serve`'s own parameter/`ctx.params`
+#: spelling. Single source of truth for both building `PwaOptions` and
+#: deciding whether *this* invocation set any PWA flag at all — the
+#: registry merge needs the second question answered (see
+#: `sidepage.commands.app_registry.merge_with_registered`), and a list
+#: that could drift from the real flag set would silently break it the
+#: next time a `--pwa-*` flag is added.
+PWA_PARAM_FIELDS = (
+    "pwa",
+    "pwa_name",
+    "pwa_short_name",
+    "pwa_theme",
+    "pwa_bg",
+    "pwa_icon",
+    "pwa_display",
+    "pwa_manifest",
+    "pwa_force",
+    "pwa_no_sw",
+)
+
+
+def build_pwa_options(params: Mapping[str, Any]) -> PwaOptions | None:
+    """Build `PwaOptions` from a mapping keyed by `PWA_PARAM_FIELDS`, or
+    `None` when `--pwa` is off.
+
+    Takes a mapping rather than keyword arguments so the two callers can
+    pass what they already have without either restating the field
+    mapping: `serve` passes its own (already Typer-typed) parameters, and
+    `sidepage.commands.app_registry` passes a `make_context()`-parsed
+    `ctx.params` straight through, whose values are plain strings for the
+    same reason `_coerce_raw_params` exists. The coercions below are
+    therefore written to be idempotent — `Path(Path(...))` and
+    `PwaDisplay(PwaDisplay.X)` both round-trip.
+    """
+    if not params["pwa"]:
+        return None
+
+    def _path(value: object) -> Path | None:
+        return Path(str(value)) if value else None
+
+    return PwaOptions(
+        name=params["pwa_name"],
+        short_name=params["pwa_short_name"],
+        theme=params["pwa_theme"],
+        bg=params["pwa_bg"],
+        icon=_path(params["pwa_icon"]),
+        display=PwaDisplay(params["pwa_display"]),
+        manifest=_path(params["pwa_manifest"]),
+        force=bool(params["pwa_force"]),
+        no_sw=bool(params["pwa_no_sw"]),
+    )
 
 
 class ServeTargetType(StrEnum):
@@ -247,6 +392,23 @@ def serve(
         bool,
         typer.Option("--qr", help="Print a terminal QR code for the resulting URL."),
     ] = False,
+    trust_remote_code: Annotated[
+        bool,
+        typer.Option(
+            "--trust-remote-code",
+            help="Skip the confirmation prompt for an app whose code sidepage downloaded. "
+            "Required in non-interactive contexts, where there's nobody to prompt.",
+        ),
+    ] = False,
+    autoregister: Annotated[
+        bool,
+        typer.Option(
+            "--autoregister",
+            help="Also save this invocation to the app registry (as `sidepage app register` "
+            "would) once it's up, so `sidepage serve <app-name>` replays it. Flags the "
+            "registry doesn't store are listed explicitly rather than dropped silently.",
+        ),
+    ] = False,
 ) -> None:
     """Serve a target and expose it through a tunnel. Blocks the terminal;
     Ctrl+C tears the tunnel down immediately."""
@@ -286,20 +448,19 @@ def serve(
             "-display are ignored"
         )
 
-    pwa_options = (
-        PwaOptions(
-            name=pwa_name,
-            short_name=pwa_short_name,
-            theme=pwa_theme,
-            bg=pwa_bg,
-            icon=pwa_icon,
-            display=pwa_display,
-            manifest=pwa_manifest,
-            force=pwa_force,
-            no_sw=pwa_no_sw,
-        )
-        if pwa
-        else None
+    pwa_options = build_pwa_options(
+        {
+            "pwa": pwa,
+            "pwa_name": pwa_name,
+            "pwa_short_name": pwa_short_name,
+            "pwa_theme": pwa_theme,
+            "pwa_bg": pwa_bg,
+            "pwa_icon": pwa_icon,
+            "pwa_display": pwa_display,
+            "pwa_manifest": pwa_manifest,
+            "pwa_force": pwa_force,
+            "pwa_no_sw": pwa_no_sw,
+        }
     )
 
     registered = app_registry.get(str(target))
@@ -321,8 +482,18 @@ def serve(
             peers=peers,
             pwa=pwa_options,
             qr=qr,
+            autoregister=autoregister,
         )
     else:
+        # Before anything else in this branch: if this app's code was
+        # downloaded rather than written by the user, it doesn't run
+        # until a human has approved this exact commit.
+        try:
+            _require_source_trust(str(target), registered, waived=trust_remote_code)
+        except UntrustedSourceError as exc:
+            error(str(exc))
+            raise typer.Exit(1) from exc
+
         merged = merge_with_registered(
             ctx,
             registered,
@@ -334,6 +505,7 @@ def serve(
             anon=anon,
             env=list(env or ()),
             guardrail=guardrail,
+            pwa=pwa_options,
         )
         if merged["name"] is None:
             # Registered but no explicit --name at registration time, and
@@ -349,9 +521,9 @@ def serve(
             timeout=timeout,
             idle_timeout=idle_timeout,
             peers=peers,
-            pwa=pwa_options,
             qr=qr,
-            **merged,
+            autoregister=autoregister,
+            **merged,  # includes `pwa` — merged, not taken from this invocation unconditionally
         )
     try:
         core_serve(config)

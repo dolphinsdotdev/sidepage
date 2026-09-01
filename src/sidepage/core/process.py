@@ -9,8 +9,8 @@ the wrapped process, starts the local reverse proxy
 until interrupted.
 
 **What's real vs. not**, since this orchestrates every other module: static,
-Streamlit-flavored, FastAPI-flavored, MCP-flavored (Python), and notebook
-(Jupyter Lab) targets, `open`/`token` auth, `--env` secret injection,
+Streamlit-flavored, FastAPI-flavored, MCP-flavored (Python), Gradio-flavored,
+and notebook (Jupyter Lab) targets, `open`/`token` auth, `--env` secret injection,
 `--anon` tunneling, and `--domain` BYO tunneling (see
 `sidepage.core.tunnel_manager.open_byo_tunnel`) all actually work.
 Non-local `--scope`, `network`/`oauth` auth, and
@@ -64,10 +64,11 @@ from pathlib import Path
 
 import httpx
 
-from sidepage.config.settings import mcp_wrappers_dir
+from sidepage.config.settings import wrappers_dir
 from sidepage.core import (
     _platform,
     account,
+    app_registry,
     directory_client,
     ecosystem,
     notebook,
@@ -122,6 +123,10 @@ class ServeConfig:
     peers: tuple[tuple[str, str], ...] = ()  # v5 --peer: (role, app_name) pairs, repeatable
     pwa: pwa.PwaOptions | None = None  # --pwa; None means PWA mode is off
     qr: bool = False  # --qr — print a terminal QR code for the resulting URL
+    # --autoregister: save this invocation to the app registry
+    # (`sidepage.core.app_registry`) once it's actually serving. See
+    # `_autoregister_preflight` / `_autoregister_commit` below.
+    autoregister: bool = False
 
 
 @dataclass(frozen=True)
@@ -222,50 +227,191 @@ _MCP_WRAPPER_SOURCE: dict[McpPackage, str] = {
 }
 
 
-def _mcp_wrapper_path(app_name: str) -> Path:
-    """Deterministic per-app path for the generated wrapper module (see
-    `_write_mcp_host_wrapper`) — recomputed by `serve`'s `_teardown` to
-    clean it up without threading extra state through the closure.
+# Gradio's script conventions are the reason this launcher needs a
+# generated wrapper at all, and it's a stronger reason than MCP's. A
+# FastAPI or MCP script conventionally guards its own server startup
+# behind `if __name__ == "__main__":`, so importing the module to reach
+# its ASGI app is safe. Gradio's own documentation does the opposite —
+# the canonical example ends with a bare, unguarded `demo.launch()` at
+# module level — so a plain import would start Gradio's blocking server
+# and never return.
+#
+# **The wrapper runs the target the way `python <file>` would**
+# (`runpy.run_path(..., run_name="__main__")`), with `Blocks.launch`
+# already patched to a capturing no-op. That's deliberately the same
+# thing Hugging Face Spaces does to an `app_file`, which makes it the
+# most faithful possible emulation — and it is what handles all three
+# script shapes found in the wild, where importing the module only
+# handles the first two:
+#
+#   1. unguarded `demo.launch()` at module level  (Gradio's own docs)
+#   2. `demo` at module level, `launch()` inside a `__main__` guard
+#   3. a *factory*: `def build_ui(): ... return demo`, with
+#      `if __name__ == "__main__": build_ui().launch()`
+#
+# Shape 3 defeats both an import and a namespace scan — the Blocks is a
+# local inside the factory, and nothing at module level ever holds one.
+# Found the hard way, by pulling a real Space
+# (`JacobPEvans/mlx-benchmarks-viewer`) and watching this wrapper fail on
+# it. Running the file as `__main__` fixes it without special-casing:
+# whatever the author's own entrypoint does, `launch` captures the Blocks
+# it lands on. `SystemExit` is caught because a guard is allowed to end
+# in `sys.exit()`, and by then the capture has already happened.
+#
+# The capture also neutralizes a hardcoded `server_port=` (which would
+# otherwise ignore sidepage's allocated port entirely), `share=True` (an
+# unwanted second, Gradio-hosted tunnel), and `ssr_mode=True` (a Node
+# sidecar on a second port, breaking the one-port contract every layer
+# downstream assumes). `launch()`'s real return is a `(app, local_url,
+# share_url)` triple, so the stand-in returns one too — scripts that
+# unpack it keep working.
+#
+# `mount_gradio_app` is Gradio's own supported embedding entrypoint, and
+# it is what does the Blocks setup `launch()` would otherwise have done.
+# Calling the lower-level `routes.App.create_app(blocks)` directly does
+# not: it serves the API routes fine but `GET /` returns 500 (the
+# template renders against a `config` that is never populated), verified
+# live against gradio 6.26.0.
+#
+# **No CORS/Host bypass here, deliberately** — unlike every other wrapped
+# framework in this module (Streamlit's `--server.enableCORS`, Jupyter's
+# `--ServerApp.disable_check_xsrf`, MCP's `enable_dns_rebinding_protection`
+# above). Gradio's `CustomCORSMiddleware` only rejects anything when the
+# `Host` *the wrapped process sees* is a loopback alias, and in that case
+# the browser's `Origin` is that same loopback address, so it passes;
+# behind `--domain`/`--anon` the Host is the public hostname, which the
+# check ignores outright. Verified live (a real prediction round-trip
+# through sidepage's own reverse proxy). If a future reader finds this
+# suspicious by comparison with the launchers above: the difference is
+# real, and `strict_cors` should stay at its default.
+_GRADIO_WRAPPER_SOURCE = (
+    "import runpy\n"
+    "import sys\n"
+    "sys.path.insert(0, {target_parent!r})\n"
+    "\n"
+    "import gradio\n"
+    "from fastapi import FastAPI\n"
+    "\n"
+    "_launched = []\n"
+    "\n"
+    "\n"
+    "def _capture_launch(self, *args, **kwargs):\n"
+    "    _launched.append(self)\n"
+    "    return None, '', ''\n"
+    "\n"
+    "\n"
+    "gradio.Blocks.launch = _capture_launch\n"
+    "\n"
+    "\n"
+    "def _resolve_blocks():\n"
+    "    try:\n"
+    "        namespace = runpy.run_path({target_path!r}, run_name='__main__')\n"
+    "    except SystemExit:\n"
+    "        namespace = {{}}\n"
+    "    if _launched:\n"
+    "        return _launched[-1]\n"
+    "    found = {{\n"
+    "        name: value\n"
+    "        for name, value in namespace.items()\n"
+    "        if isinstance(value, gradio.Blocks)\n"
+    "    }}\n"
+    "    if 'demo' in found:\n"
+    "        return found['demo']\n"
+    "    if len(found) == 1:\n"
+    "        return next(iter(found.values()))\n"
+    "    if not found:\n"
+    "        raise RuntimeError(\n"
+    "            {target_name!r} + ': no gradio app found. sidepage runs this file the way "
+    "`python <file>` would, with .launch() neutralized, and serves whichever "
+    "Blocks/Interface it was called on \u2014 or a module-level one named `demo` if it is "
+    "never called.'\n"
+    "        )\n"
+    "    raise RuntimeError(\n"
+    "        {target_name!r} + ': found several gradio apps (' + ', '.join(sorted(found))\n"
+    "        + ') and none named `demo`. Call .launch() on the one to serve, or name "
+    "it `demo`.'\n"
+    "    )\n"
+    "\n"
+    "\n"
+    "def make_app():\n"
+    "    return gradio.mount_gradio_app(FastAPI(), _resolve_blocks(), path='/', ssr_mode=False)\n"
+)
 
-    Lives under `sidepage.config.settings.mcp_wrappers_dir()`, not next to
-    the target script: `serve` requires `app_name` to be unique among
+
+# Launchers that can't be started from a bare `<module>:<attr>` import
+# string and so generate a wrapper module (see `_write_launch_wrapper`).
+# `serve`'s `_teardown` consults this to know whether there's a generated
+# file to clean up, instead of testing each launcher by name.
+_WRAPPER_LAUNCHERS = frozenset({CodeLauncher.MCP, CodeLauncher.GRADIO})
+
+
+def _wrapper_path(app_name: str, launcher: CodeLauncher) -> Path:
+    """Deterministic per-app, per-launcher path for a generated wrapper
+    module (see `_write_launch_wrapper`) — recomputed by `serve`'s
+    `_teardown` to clean it up without threading extra state through the
+    closure.
+
+    Lives under `sidepage.config.settings.wrappers_dir()`, not next to the
+    target script: `serve` requires `app_name` to be unique among
     currently-running apps (checked up front), so keying on it here can't
     collide the way keying on `target.stem` next to the target could — two
     unrelated targets named `app.py` in different directories used to both
     want `_sidepage_mcp_wrapper_app.py` in *their own* directory, which was
     fine until one of them was a directory the user also tracks in git
     (see `tests/fixtures/mcp-app`, whose committed fixture file this exact
-    collision used to clobber and then delete on every `serve`/teardown)."""
-    return mcp_wrappers_dir() / f"_sidepage_mcp_wrapper_{app_name}.py"
+    collision used to clobber and then delete on every `serve`/teardown).
+
+    The launcher name is part of the filename so two launchers can never
+    want the same path for one app name. A hyphen in `app_name` is fine:
+    uvicorn resolves its import string through `importlib.import_module`,
+    which accepts any module name that maps to a file on `--app-dir`, not
+    only valid Python identifiers."""
+    return wrappers_dir() / f"_sidepage_{launcher.value}_wrapper_{app_name}.py"
+
+
+def _write_launch_wrapper(app_name: str, launcher: CodeLauncher, source: str) -> Path:
+    """Write `source` as the generated wrapper module for `app_name`.
+
+    Living outside `target`'s own directory means the plain cwd-based
+    import resolution a bare `<module>:<app>` reference relies on
+    elsewhere no longer applies — every wrapper source below
+    `sys.path.insert(0, ...)`s `target.parent` before importing the user's
+    module, and `_build_code_launch_argv` passes uvicorn `--app-dir`
+    pointing at *this* directory instead, so the import resolves
+    regardless of the subprocess's cwd.
+
+    Regenerated fresh on every `serve` call, not reused across runs, and
+    removed again by `serve`'s `_teardown` — see `_wrapper_path`.
+    """
+    wrapper_path = _wrapper_path(app_name, launcher)
+    wrapper_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    wrapper_path.write_text(source)
+    return wrapper_path
 
 
 def _write_mcp_host_wrapper(
     target: Path, app_name: str, package: McpPackage, app_var: str, app_method: str
 ) -> Path:
-    """Writes a small module under `mcp_wrappers_dir()` that imports the
-    user's MCP server variable, calls the real app-builder method with the
-    package's built-in Host/Origin allowlisting turned off, and wraps the
-    result in permissive CORS middleware (see the `_MCP_WRAPPER_SOURCE`
-    comment above for why both are necessary and safe).
-
-    Living outside `target`'s own directory means the plain cwd-based
-    import resolution the bare `<module>:<app>` reference relies on
-    elsewhere in this function no longer applies — the generated source
-    itself `sys.path.insert(0, ...)`s `target.parent` before importing the
-    user's module, and `_build_code_launch_argv`'s MCP branch passes
-    uvicorn `--app-dir` pointing at *this* module's directory instead, so
-    the import resolves regardless of the subprocess's cwd.
-
-    Regenerated fresh on every `serve` call, not reused across runs, and
-    removed again by `serve`'s `_teardown` — see `_mcp_wrapper_path`.
-    """
+    """Writes a wrapper module that imports the user's MCP server
+    variable, calls the real app-builder method with the package's
+    built-in Host/Origin allowlisting turned off, and wraps the result in
+    permissive CORS middleware (see the `_MCP_WRAPPER_SOURCE` comment
+    above for why both are necessary and safe)."""
     source = _MCP_WRAPPER_SOURCE[package].format(
         target_parent=str(target.parent), module=target.stem, app_var=app_var, app_method=app_method
     )
-    wrapper_path = _mcp_wrapper_path(app_name)
-    wrapper_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    wrapper_path.write_text(source)
-    return wrapper_path
+    return _write_launch_wrapper(app_name, CodeLauncher.MCP, source)
+
+
+def _write_gradio_wrapper(target: Path, app_name: str) -> Path:
+    """Writes a wrapper module that neutralizes `Blocks.launch`, imports
+    the user's module, and mounts whichever Blocks it finds on a fresh
+    FastAPI app (see the `_GRADIO_WRAPPER_SOURCE` comment above for why
+    each of those steps is load-bearing)."""
+    source = _GRADIO_WRAPPER_SOURCE.format(
+        target_parent=str(target.parent), target_path=str(target), target_name=target.name
+    )
+    return _write_launch_wrapper(app_name, CodeLauncher.GRADIO, source)
 
 
 def _build_code_launch_argv(
@@ -384,8 +530,8 @@ def _build_code_launch_argv(
         # module that calls the real app-builder itself, with that
         # protection turned off, and uvicorn serves *that* module's
         # `make_app` factory instead. That module lives under
-        # `mcp_wrappers_dir()`, not next to `target` (see
-        # `_write_mcp_host_wrapper`) — `--app-dir` points uvicorn's own
+        # `wrappers_dir()`, not next to `target` (see
+        # `_write_launch_wrapper`) — `--app-dir` points uvicorn's own
         # import at that directory since the subprocess's cwd is still
         # `target.parent`, not the wrapper's directory.
         package = detect_mcp_package(target)
@@ -395,6 +541,40 @@ def _build_code_launch_argv(
             target.parent, extra_packages=[package.value, "uvicorn"]
         )
         wrapper_path = _write_mcp_host_wrapper(target, app_name, package, app_var, app_method)
+        return runner + [
+            "uvicorn",
+            f"{wrapper_path.stem}:make_app",
+            "--factory",
+            "--app-dir",
+            str(wrapper_path.parent),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ]
+
+    if launcher is CodeLauncher.GRADIO:
+        # Same generated-wrapper + `uvicorn --factory` shape as MCP above,
+        # for a stronger version of the same reason: a Gradio script's
+        # `demo.launch()` is conventionally *unguarded* at module level,
+        # so there is no safe way to import the module and reach its ASGI
+        # app without first neutralizing that call. See
+        # `_GRADIO_WRAPPER_SOURCE` for what the wrapper does and why each
+        # step is load-bearing.
+        #
+        # `public_origin` is deliberately unused here — Gradio needs no
+        # origin allowlisting to work behind this proxy, the one wrapped
+        # framework in this module that doesn't. That's verified, not
+        # assumed; the reasoning is recorded on `_GRADIO_WRAPPER_SOURCE`.
+        #
+        # `fastapi` isn't in `extra_packages` even though the wrapper
+        # imports it: it's a hard dependency of `gradio` itself, the same
+        # way the MCP branch above relies on `starlette` arriving with the
+        # MCP package rather than naming it separately.
+        runner = ecosystem.resolve_python_runner(
+            target.parent, extra_packages=["gradio", "uvicorn"]
+        )
+        wrapper_path = _write_gradio_wrapper(target, app_name)
         return runner + [
             "uvicorn",
             f"{wrapper_path.stem}:make_app",
@@ -461,6 +641,135 @@ def _validate_common(
     return domain_config
 
 
+# `--autoregister` flags that describe how *this one run* behaves rather
+# than what the served app is, so `sidepage.core.app_registry` has nowhere
+# to put them. Reported by name at startup instead of dropped silently —
+# a saved config the user believes is complete, but which quietly loses
+# an auth token or a lifetime limit, is exactly the kind of silent
+# divergence this codebase refuses everywhere else. Keyed by the
+# `ServeConfig` field, valued by the user-facing flag name, with a
+# predicate for "was this actually set on this invocation".
+_UNREGISTERABLE_FLAGS: tuple[tuple[str, str], ...] = (
+    ("token", "--token"),
+    ("timeout", "--timeout"),
+    ("idle_timeout", "--idle-timeout"),
+    ("peers", "--peer"),
+    ("qr", "--qr"),
+)
+
+
+def _unregisterable_flags_in_use(config: ServeConfig) -> list[str]:
+    """Which `_UNREGISTERABLE_FLAGS` this invocation actually passed —
+    truthiness is the test, which is correct for every one of them: `None`
+    for the two timeouts and the token, an empty tuple for `--peer`, and
+    `False` for the `--qr` switch all mean "not passed."""
+    return [flag for field, flag in _UNREGISTERABLE_FLAGS if getattr(config, field)]
+
+
+def _pending_registration(
+    config: ServeConfig, *, target: Path, target_kind: TargetKind
+) -> app_registry.AppRegistration:
+    """The `AppRegistration` this invocation would save under
+    `--autoregister`. Built from the *resolved* config — concrete
+    `target`/`target_kind`, not whatever `--type auto` was typed as — so
+    it's directly comparable with an already-stored entry.
+
+    `registered_at` is a placeholder here: this object is only ever used
+    for comparison (`app_registry.same_config` ignores that field) or as
+    the argument list for a real `app_registry.register` call, which
+    stamps its own timestamp.
+    """
+    return app_registry.AppRegistration(
+        target=target,
+        target_kind=target_kind,
+        name=config.name,
+        domain=config.domain,
+        auth=config.auth,
+        scope=config.scope,
+        anon=config.anon,
+        env_secrets=config.env_secrets,
+        guardrail=config.guardrail,
+        pwa=config.pwa,
+        registered_at="",
+    )
+
+
+def _autoregister_preflight(
+    config: ServeConfig, *, app_name: str, target: Path, target_kind: TargetKind
+) -> bool:
+    """Decide — before anything is launched — whether `--autoregister`
+    should write after startup, and report anything it can't save.
+
+    Returns `True` to write once the app is up, `False` when an identical
+    entry already exists and there's nothing to do.
+
+    Raises `ValueError` when a *different* config is already registered
+    under this name. That's the one genuinely ambiguous case: silently
+    overwriting would replace a config the user may have hand-tuned with
+    `sidepage app register`, and silently keeping the old one would leave
+    them believing this invocation was saved when it wasn't. Run here,
+    before any port is allocated or subprocess spawned, so it fails
+    immediately rather than after a slow boot.
+    """
+    unregisterable = _unregisterable_flags_in_use(config)
+    if unregisterable:
+        them = "it" if len(unregisterable) == 1 else "them"
+        warn(
+            f"--autoregister won't save {', '.join(unregisterable)} — "
+            f"`sidepage serve {app_name}` won't replay {them}, "
+            "pass them on the command line again."
+        )
+    if config.token is not None:
+        info(
+            "--token specifically is never stored: it's process-scoped and a fresh one is "
+            "issued on each serve."
+        )
+
+    existing = app_registry.get(app_name)
+    if existing is None:
+        return True
+
+    candidate = _pending_registration(config, target=target, target_kind=target_kind)
+    if app_registry.same_config(existing, candidate, default_name=app_name):
+        warn(
+            f"reusing existing app, next time use `sidepage serve {app_name}` — "
+            f"{app_name!r} is already registered with this exact config."
+        )
+        return False
+
+    raise ValueError(
+        f"an app named {app_name!r} is already registered with a different config — "
+        f"`sidepage app show {app_name}` to compare, `sidepage app unregister {app_name}` "
+        "to replace it, or pass --name to register this one under a different name."
+    )
+
+
+def _autoregister_commit(
+    config: ServeConfig, *, app_name: str, target: Path, target_kind: TargetKind
+) -> None:
+    """Save this invocation to the app registry. Called only after the app
+    is genuinely up and serving — a config that failed to start is never
+    worth persisting — and only when `_autoregister_preflight` already
+    cleared the name, so the duplicate-name rejection inside
+    `app_registry.register` can't fire here.
+    """
+    pending = _pending_registration(config, target=target, target_kind=target_kind)
+    app_registry.register(
+        app_name,
+        target=pending.target,
+        target_kind=pending.target_kind,
+        name=pending.name,
+        domain=pending.domain,
+        auth=pending.auth,
+        scope=pending.scope,
+        anon=pending.anon,
+        env_secrets=pending.env_secrets,
+        guardrail=pending.guardrail,
+        pwa=pending.pwa,
+    )
+    success(f"registered as {app_name!r} — replay it with `sidepage serve {app_name}`")
+
+
 def _validate_supported(config: ServeConfig) -> account.DomainConfig | None:
     """Validate `config` and resolve `--domain` against the persisted BYO
     configuration, all before `serve` does anything else — including
@@ -508,6 +817,18 @@ def serve(config: ServeConfig) -> None:
         raise ValueError(
             f"an app named {app_name!r} is already registered as running — "
             f"`sidepage stop {app_name}` it first, or pass --name for a different one."
+        )
+
+    # Checked here, before any port is allocated or subprocess spawned,
+    # for the same reason as everything else above: a name already
+    # registered with a *different* config is a real conflict, and finding
+    # that out after a slow dependency resolve would be needlessly cruel.
+    # The actual write happens only once the app is serving — see
+    # `_autoregister_commit`.
+    autoregister_pending = False
+    if config.autoregister:
+        autoregister_pending = _autoregister_preflight(
+            config, app_name=app_name, target=target, target_kind=target_kind
         )
 
     # Built here, before any port is allocated or subprocess spawned — a
@@ -590,11 +911,11 @@ def serve(config: ServeConfig) -> None:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        if launcher is CodeLauncher.MCP:
-            # Best-effort: `_write_mcp_host_wrapper` always writes this
-            # file before the subprocess referencing it is ever started,
-            # so it exists by the time any teardown path can run.
-            _mcp_wrapper_path(app_name).unlink(missing_ok=True)
+        if launcher in _WRAPPER_LAUNCHERS:
+            # Best-effort: `_write_launch_wrapper` always writes this file
+            # before the subprocess referencing it is ever started, so it
+            # exists by the time any teardown path can run.
+            _wrapper_path(app_name, launcher).unlink(missing_ok=True)
         stdout.print()
         info(f"{app_name} stopped")
 
@@ -736,6 +1057,8 @@ def serve(config: ServeConfig) -> None:
         else:
             info("PWA: ephemeral session — icon breaks when this URL ends")
             info("PWA: use --domain for a permanent install")
+    if autoregister_pending:
+        _autoregister_commit(config, app_name=app_name, target=target, target_kind=target_kind)
     info("Ctrl+C to stop")
     if config.qr:
         qr.print_qr(tunnel_url or local_url)

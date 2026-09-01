@@ -16,7 +16,7 @@ need the app's own config updated even though the real `Host`/
 `sidepage.core.reverse_proxy`; OAuth/SSO is close to structurally
 incompatible with `--anon`'s per-run-random hostname).
 
-`--type`/`--env`/`--guardrail`/`--peer` are declared here purely so a
+`--type`/`--env`/`--guardrail`/`--peer`/`--autoregister` are declared here purely so a
 user who tries them gets one specific, actionable message instead of
 Typer's generic "no such option" — they're subprocess-injection concepts
 that don't apply to a process `proxy` doesn't own, not features that are
@@ -130,6 +130,14 @@ def proxy(
             "SIDEPAGE_PEER_<ROLE>_URL into.",
         ),
     ] = None,
+    autoregister: Annotated[
+        bool,
+        typer.Option(
+            "--autoregister",
+            help="Not applicable to `proxy` — the app registry stores `serve` configs, "
+            "which are keyed on a target `proxy` doesn't have.",
+        ),
+    ] = False,
 ) -> None:
     """Proxy an already-running local service through sidepage's reverse
     proxy/auth/tunnel stack — same auth tiers, same BYO-domain/--anon
@@ -208,6 +216,15 @@ def proxy(
         error(
             "--peer doesn't apply to `proxy` — SIDEPAGE_PEER_<ROLE>_URL injection requires a "
             "subprocess sidepage controls; a --port target already has its own environment."
+        )
+        raise typer.Exit(1)
+    if autoregister:
+        error(
+            "--autoregister doesn't apply to `proxy` — the app registry stores `serve` "
+            "invocations, every one of which is keyed on a target to launch. A `proxy` call "
+            "has no target (the service on --port is already running, and sidepage didn't "
+            "start it), so there's nothing to save that `sidepage serve <app-name>` could "
+            "replay."
         )
         raise typer.Exit(1)
 

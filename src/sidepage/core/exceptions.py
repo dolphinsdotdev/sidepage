@@ -148,3 +148,51 @@ class PeerNotFoundError(DirectoryError):
     no persisted peer target to fall back to, so an unresolvable name
     fails loud rather than injecting a stale or empty URL.
     """
+
+
+class SourceError(SidepageError):
+    """`sidepage pull <source>` failed to resolve, fetch, or plan a remote
+    source. Base for the more specific cases below; raised directly for
+    transport failures (the metadata API or a file download) where the
+    problem is neither the source's *form* nor its runnability.
+    """
+
+
+class SourceNotSupportedError(SourceError):
+    """`sidepage pull <source>` was given a source form that isn't built
+    yet (GitHub, MCP registry names, local paths) or one that isn't a
+    recognizable source at all.
+
+    Deliberately distinct from `UnrunnableSourceError`: this is "sidepage
+    can't fetch this," not "sidepage fetched it and it can't run here."
+    An unrecognized form is never guessed at — a typo'd `hf:` prefix
+    resolving to some plausible-looking repo would be a genuinely
+    dangerous convenience.
+    """
+
+
+class UnrunnableSourceError(SourceError):
+    """`sidepage pull` resolved a real source and read its manifest, but
+    that source can't run under sidepage — a Docker-SDK Space, a GPU or
+    ZeroGPU hardware requirement, a private/gated repo needing
+    credentials sidepage has no way to supply.
+
+    Raised from the metadata alone, before any repository content is
+    downloaded: finding out that a 40 GB Space needs an A100 *after*
+    fetching it would be the worst possible ordering. Always names the
+    specific blocker (the SDK, the hardware tier) rather than a generic
+    refusal.
+    """
+
+
+class UntrustedSourceError(SidepageError):
+    """`sidepage serve <app-name>` was asked to execute code sidepage
+    downloaded from a remote source, without a confirmation for the exact
+    commit being run.
+
+    Raised when there's no terminal to prompt at (an agent, a CI job, a
+    pipe) and `--trust-remote-code` wasn't passed. Running a stranger's
+    code on a machine that also holds an encrypted secrets vault is a
+    decision a human has to make explicitly; silently proceeding because
+    nobody was watching is exactly the case this exists to prevent.
+    """

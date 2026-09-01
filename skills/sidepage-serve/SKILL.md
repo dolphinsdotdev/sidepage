@@ -1,6 +1,6 @@
 ---
 name: sidepage-serve
-description: Spin up, register, inspect, and shut down local websites and apps (static sites, scripts, Streamlit, FastAPI, Python MCP servers, Jupyter notebooks) using the `sidepage` CLI, and get back a shareable URL. Also proxies an already-running local service (npm run dev, a container, anything on a port) through the same auth/tunnel stack via `sidepage proxy`. Use this whenever the user asks to "host", "serve", "preview", "spin up", "share a link to", "demo", "deploy locally", or "tunnel" a site, app, or already-running dev server, or asks to stop/tear down/take down one that's running, check what's running (`ls`/`status`/`usage`), save a reusable launch config (`app register`), or manage sidepage secrets/domains. Trigger even if they just paste a file path/port and say "can people see this" or "give me a link" — that's a serve/proxy request. Assumes `sidepage` is already installed and on PATH via a native Python 3.12 (not necessarily behind `uv run`).
+description: Spin up, register, inspect, and shut down local websites and apps (static sites, scripts, Streamlit, FastAPI, Python MCP servers, Gradio apps, Jupyter notebooks) using the `sidepage` CLI, and get back a shareable URL. Also proxies an already-running local service (npm run dev, a container, anything on a port) through the same auth/tunnel stack via `sidepage proxy`. Use this whenever the user asks to "host", "serve", "preview", "spin up", "share a link to", "demo", "deploy locally", or "tunnel" a site, app, or already-running dev server, or asks to stop/tear down/take down one that's running, check what's running (`ls`/`status`/`usage`), save a reusable launch config (`app register`), or manage sidepage secrets/domains. Trigger even if they just paste a file path/port and say "can people see this" or "give me a link" — that's a serve/proxy request. Assumes `sidepage` is already installed and on PATH via a native Python 3.12 (not necessarily behind `uv run`).
 ---
 
 # sidepage-serve
@@ -101,6 +101,8 @@ launches:
 | `.py` script, Streamlit app | `code` (auto-detected) | launched via `streamlit run` |
 | `.py` script, FastAPI app | `code` (auto-detected) | `uvicorn`; `/docs` works automatically |
 | `.py` script, MCP server (official `mcp` SDK or `fastmcp`) | `code` (auto-detected) | served over real Streamable HTTP at `/mcp`, regardless of what the script's own `__main__`/`mcp.run()` would normally do |
+| `.py` script, Gradio app | `code` (auto-detected) | mounted and served by sidepage; the script's own `demo.launch()` is neutralized, so a hardcoded `server_port=`/`share=True` can't fight sidepage's port or tunnel |
+| Hugging Face Space | fetched by `sidepage pull` first | see **Remote apps** below — needs an explicit human confirmation before it will run |
 | `.ipynb` notebook | `notebook` | full editable Jupyter Lab with a live kernel |
 
 `--type` almost never needs to be set explicitly — trust auto-detection
@@ -275,6 +277,22 @@ sidepage app show <app-name>
 sidepage app unregister <app-name>
 ```
 
+Or pass **`--autoregister`** on the `serve` call itself — the same entry is
+saved once the app is actually up, without composing a separate
+registration string. Prefer this when you're already starting the app and
+the user asks to keep it: it can't drift from what actually ran.
+
+```bash
+scripts/start_site.sh new dash ./dashboard.py --auth token --autoregister
+```
+
+Re-running `--autoregister` for an app that's already registered with the
+identical config is safe — it writes nothing and warns that `sidepage
+serve <app-name>` is enough next time. A *different* config under the same
+name is refused before the app starts, so treat that error as a real
+question for the user (`sidepage app show <app-name>` to compare), not
+something to retry around.
+
 `register`/`list`/`show`/`unregister` all return immediately — run them
 directly, no backgrounding needed. To actually run a registered app, use
 `scripts/start_site.sh registered <app-name> [override flags...]` (same
@@ -292,16 +310,70 @@ Notes that matter when using this:
   app show <app-name> --with "<flags>"` — e.g. `sidepage app show
   abc-app --with "--scope web"` — which prints the effective merged config
   without actually running it. `--timeout`/`--idle-timeout`/`--peer`/
-  `--token` are never part of a registration (nothing to merge against);
-  they always come from whatever is passed at `serve`/`start_site.sh` time.
+  `--qr`/`--token` are never part of a registration (nothing to merge
+  against); they always come from whatever is passed at
+  `serve`/`start_site.sh` time. `--pwa`/`--pwa-*` **are** stored, and merge
+  as one unit: passing any `--pwa*` flag at `serve <app-name>` time
+  replaces the saved PWA config wholesale rather than field by field.
 - `sidepage app register` will **reject** a registration string containing
   a literal `--token <value>` — auth tokens are process-scoped and meant to
   regenerate per-serve, so this isn't a bug to work around, it's the
   registry refusing to persist a secret. If the user wants a stable token
   across runs, that's what `--env` + the vault are for, not `app register`.
+  `--autoregister` is the one place a `--token` doesn't abort anything: it
+  saves the rest of the invocation and prints what it dropped. Don't read
+  that warning as a failure — the app is serving and the entry is saved.
 - `sidepage app list` / `sidepage app show <app-name>` / `sidepage app
   unregister <app-name>` round out the registry — use `list` when the user
   asks "what do I have set up" rather than guessing from memory.
+
+## Remote apps: `sidepage pull`
+
+To host someone else's Hugging Face Space, fetch it first — this
+downloads and registers it but **runs nothing**:
+
+```bash
+sidepage pull huggingface.co/spaces/<owner>/<name>     # or hf:<owner>/<name>
+sidepage pull hf:<owner>/<name> --dry-run              # plan + download size, fetches nothing
+sidepage pull hf:<owner>/<name> --json                 # one parseable line
+```
+
+Use `--dry-run` first when the user hasn't seen the Space before: it
+reports the total download size without paying for it, which matters
+because Spaces routinely carry multi-gigabyte model weights.
+
+**You cannot serve a pulled app on the user's behalf.** `serve` prints
+what it's about to run and asks for confirmation, and in a non-interactive
+context — which is what you are — it refuses outright and exits 1. That is
+deliberate: it's the difference between a convenience and a remote-code
+execution path. When the user asks you to run a pulled app:
+
+1. Run `sidepage pull ...` and show them the plan.
+2. Tell them the exact command to run themselves, including any `--env`
+   names the Space requested:
+   `sidepage serve <app-name> --env SOME_KEY`
+3. Do **not** pass `--trust-remote-code` to work around the prompt. Only
+   the user can make that call, and only after reading the code. If they
+   explicitly instruct you to, quote what the app is and where it came
+   from first.
+
+Requested env names are shown as `(requested — not granted)`. Nothing is
+bound until the user passes `--env`, and sidepage will never auto-grant a
+vault secret a downloaded manifest asks for.
+
+`pull` refuses Docker Spaces, GPU/ZeroGPU hardware tiers, and
+private/gated repos before downloading anything — those errors are final,
+not something to retry differently.
+
+To remove a pulled app and its downloaded source:
+
+```bash
+sidepage app delete <app-name> --yes
+```
+
+`app unregister` only forgets the config and leaves the files;
+`app delete` removes both. Neither will ever delete files for an app that
+was registered against a path the user already had.
 
 ## Checking on things
 

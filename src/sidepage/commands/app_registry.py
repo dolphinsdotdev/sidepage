@@ -49,17 +49,22 @@ from typing import Annotated, Any
 
 import typer
 
-from sidepage.core import app_registry
+from sidepage import output
+from sidepage.config.settings import app_source_dir
+from sidepage.core import app_registry, registry
+from sidepage.core import pull as core_pull
 from sidepage.core.app_registry import AppRegistration
 from sidepage.core.auth import AuthTier
 from sidepage.core.directory_client import Scope
 from sidepage.core.exceptions import (
     AppNotRegisteredError,
     AppRegistrationError,
+    SourceError,
     TargetDetectionError,
 )
+from sidepage.core.pwa import PwaOptions
 from sidepage.core.target import TargetKind, detect_target_kind
-from sidepage.output import error, info, stdout, success
+from sidepage.output import error, info, plain, stdout, success
 
 app_app = typer.Typer(
     name="app",
@@ -104,7 +109,7 @@ def _coerce_raw_params(raw: dict) -> dict:
     regardless of the real parameter type (confirmed live, not assumed —
     see module docstring) — this turns them into the same typed values a
     real `serve` invocation's function parameters would already have."""
-    from sidepage.commands.serve import ServeTargetType
+    from sidepage.commands.serve import ServeTargetType, build_pwa_options
 
     return {
         "target": Path(raw["target"]),
@@ -117,6 +122,10 @@ def _coerce_raw_params(raw: dict) -> dict:
         "token": raw["token"],
         "env": list(raw["env"] or ()),
         "guardrail": Path(raw["guardrail"]) if raw["guardrail"] else None,
+        # Built through `serve`'s own helper rather than restated here,
+        # for the same reason this module parses with `serve`'s own Click
+        # command: a new `--pwa-*` flag should need no change on this side.
+        "pwa": build_pwa_options(raw),
     }
 
 
@@ -137,6 +146,7 @@ def merge_with_registered(
     anon: bool,
     env: list[str],
     guardrail: Path | None,
+    pwa: PwaOptions | None = None,
 ) -> dict[str, Any]:
     """For each mergeable field, an explicit command-line value (source
     `COMMANDLINE` on `ctx`, per `ctx.get_parameter_source`) overrides the
@@ -154,12 +164,22 @@ def merge_with_registered(
     with every other field's replace semantics rather than inventing a
     different rule for the one list-valued flag.
 
+    **`--pwa*` merges as one unit, not field by field**: if this
+    invocation passed *any* `--pwa*` flag, its whole PWA config wins;
+    otherwise the registered one applies unchanged. Field-by-field
+    merging would mean `--pwa-theme` alone silently inheriting a
+    registered `--pwa-icon` and `--pwa-manifest`, which is both harder to
+    predict and impossible to express the other way (there'd be no way to
+    say "PWA, but none of the saved settings"). It also keeps `serve`'s
+    existing "`--pwa-*` requires `--pwa`" validation meaningful: a
+    partial override is rejected up front rather than half-applied.
+
     Returns a dict shaped as `ServeConfig`'s own keyword arguments
     (`target_kind`, `name`, `domain`, `auth`, `scope`, `anon`,
-    `env_secrets`, `guardrail`) — ready to splice into
+    `env_secrets`, `guardrail`, `pwa`) — ready to splice into
     `ServeConfig(target=..., token=..., **merged)`.
     """
-    from sidepage.commands.serve import ServeTargetType
+    from sidepage.commands.serve import PWA_PARAM_FIELDS, ServeTargetType
 
     if _is_explicit(ctx, "target_type"):
         target_kind = None if target_type is ServeTargetType.AUTO else TargetKind(target_type.value)
@@ -178,11 +198,63 @@ def merge_with_registered(
         "anon": use("anon", anon, registered.anon),
         "env_secrets": tuple(env) if _is_explicit(ctx, "env") else registered.env_secrets,
         "guardrail": use("guardrail", guardrail, registered.guardrail),
+        "pwa": pwa if any(_is_explicit(ctx, f) for f in PWA_PARAM_FIELDS) else registered.pwa,
     }
 
 
 def _or_none(value: object, label: str = "(none)") -> str:
     return str(value) if value is not None else f"[dim]{label}[/dim]"
+
+
+def _describe_pwa(pwa: PwaOptions | None) -> str:
+    """One-line summary of a stored PWA config — the fields that actually
+    distinguish two of them, not every default."""
+    if pwa is None:
+        return "[dim](off)[/dim]"
+    parts = [f"name {pwa.name}" if pwa.name else "name (defaults to app-name)"]
+    if pwa.manifest is not None:
+        parts.append(f"manifest {pwa.manifest} (served verbatim)")
+    else:
+        parts.append(f"theme {pwa.theme}")
+        parts.append(f"bg {pwa.bg}")
+        parts.append(f"icon {pwa.icon}" if pwa.icon is not None else "icon (bundled default)")
+        parts.append(f"display {pwa.display.value}")
+    if pwa.force:
+        parts.append("force")
+    if pwa.no_sw:
+        parts.append("no service worker")
+    return " · ".join(parts)
+
+
+def _print_source(source) -> None:
+    """Provenance block for a pulled app. Printed as its own section
+    because it answers a different question from the rest of the config:
+    not "how will this run" but "whose code is this, and have I agreed to
+    run it?"
+    """
+    plain.print(f"  source:         {source.url}")
+    plain.print(f"  commit:         {source.commit[:7]}")
+    if source.hf is not None:
+        sdk = source.hf.sdk or "unknown"
+        if source.hf.sdk_version:
+            sdk += f" {source.hf.sdk_version}"
+        if source.hf.python_version:
+            sdk += f" · python {source.hf.python_version}"
+        plain.print(f"  hf sdk:         {sdk}")
+    if source.env_requested:
+        plain.print(
+            f"  requests env:   {', '.join(source.env_requested)} "
+            "[dim](not granted — pass --env to grant)[/dim]"
+        )
+    if source.trusted_commit == source.commit:
+        plain.print(f"  trusted:        yes, at {source.commit[:7]}")
+    elif source.trusted_commit is None:
+        plain.print("  trusted:        [yellow]no — `serve` will ask before running it[/yellow]")
+    else:
+        plain.print(
+            f"  trusted:        [yellow]{source.trusted_commit[:7]} only — the code changed, "
+            "`serve` will ask again[/yellow]"
+        )
 
 
 def _print_registration(app_name: str, r: AppRegistration) -> None:
@@ -196,7 +268,10 @@ def _print_registration(app_name: str, r: AppRegistration) -> None:
     stdout.print(f"  anon:           {r.anon}")
     stdout.print(f"  env:            {', '.join(r.env_secrets) or '[dim](none)[/dim]'}")
     stdout.print(f"  guardrail:      {_or_none(r.guardrail)}")
+    stdout.print(f"  pwa:            {_describe_pwa(r.pwa)}")
     stdout.print(f"  registered_at:  {r.registered_at}")
+    if r.source is not None:
+        _print_source(r.source)
 
 
 @app_app.command("register")
@@ -253,6 +328,7 @@ def register(
             anon=values["anon"],
             env_secrets=tuple(values["env"]),
             guardrail=values["guardrail"],
+            pwa=values["pwa"],
         )
     except (AppRegistrationError, TargetDetectionError) as exc:
         error(str(exc))
@@ -311,6 +387,7 @@ def show(
         anon=values["anon"],
         env=values["env"],
         guardrail=values["guardrail"],
+        pwa=values["pwa"],
     )
     if merged["name"] is None:
         merged["name"] = app_name
@@ -326,16 +403,101 @@ def show(
         anon=merged["anon"],
         env_secrets=merged["env_secrets"],
         guardrail=merged["guardrail"],
+        pwa=merged["pwa"],
         registered_at=registered.registered_at,
     )
     _print_registration(app_name, preview)
+
+
+@app_app.command("delete")
+def delete(
+    app_name: Annotated[str, typer.Argument(help="Registered app name to delete.")],
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Skip the confirmation prompt."),
+    ] = False,
+) -> None:
+    """Remove a registered app *and* the source sidepage downloaded for it.
+
+    The destructive sibling of `unregister`, which only forgets the saved
+    config. `delete` also removes the app's managed directory — source,
+    model weights, everything `sidepage pull` put there.
+
+    **It will never delete a directory sidepage didn't create.** An app
+    registered against a path the user already had (`app register`,
+    `serve --autoregister`) has no managed source tree, so `delete`
+    removes its registry entry and leaves every file alone. Deleting
+    someone's own project because they typed `delete` instead of
+    `unregister` is not a mistake this command is willing to make.
+    """
+    registered = app_registry.get(app_name)
+    if registered is None:
+        error(f"no app named {app_name!r} is registered")
+        raise typer.Exit(1)
+
+    running = registry.get(app_name)
+    if running is not None and registry.is_alive(running.pid):
+        error(
+            f"{app_name!r} is currently running — `sidepage stop {app_name}` first, "
+            "then delete it."
+        )
+        raise typer.Exit(1)
+
+    managed = registered.source is not None and registered.source.managed
+    source_dir = app_source_dir(app_name) if managed else None
+    has_files = source_dir is not None and source_dir.exists()
+
+    stdout.print(f"  registry entry  {app_name}")
+    if has_files:
+        size = sum(f.stat().st_size for f in source_dir.rglob("*") if f.is_file())
+        stdout.print(f"  source tree     {source_dir} ({core_pull.format_bytes(size)})")
+    else:
+        stdout.print(
+            "  source tree     [dim](none — sidepage didn't download this app, "
+            "no files will be removed)[/dim]"
+        )
+
+    if not yes:
+        if not output.is_interactive():
+            error(
+                f"deleting {app_name!r} removes files and can't be undone. There's no terminal "
+                "here to confirm at — re-run with --yes if that's what you want."
+            )
+            raise typer.Exit(1)
+        if not typer.confirm("  delete?", default=False):
+            info("nothing was deleted")
+            return
+
+    removed: int | None = None
+    if managed:
+        try:
+            removed = core_pull.remove_source_tree(app_name)
+        except SourceError as exc:
+            error(str(exc))
+            raise typer.Exit(1) from exc
+
+    try:
+        app_registry.unregister(app_name)
+    except AppNotRegisteredError as exc:  # pragma: no cover - checked above
+        error(str(exc))
+        raise typer.Exit(1) from exc
+
+    if removed is not None:
+        success(f"deleted {app_name!r} — {core_pull.format_bytes(removed)} of source removed")
+    else:
+        success(f"deleted {app_name!r} (registry entry only — no downloaded source)")
 
 
 @app_app.command("unregister")
 def unregister(
     app_name: Annotated[str, typer.Argument(help="Registered app name to remove.")],
 ) -> None:
-    """Delete a registered app's saved config."""
+    """Forget a registered app's saved config, leaving files untouched.
+
+    For a `sidepage pull`ed app this leaves the downloaded source on disk
+    under `apps/<name>` with nothing pointing at it — use `sidepage app
+    delete` to remove both.
+    """
     try:
         app_registry.unregister(app_name)
     except AppNotRegisteredError as exc:

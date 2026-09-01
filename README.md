@@ -2,8 +2,8 @@
 
 Local-first hosting and tunneling for code, static sites, and notebooks.
 `sidepage serve` wraps almost anything — a script, a static site, a
-Streamlit or FastAPI app, a Python MCP server, a Jupyter notebook —
-behind a local reverse proxy and hands you a URL. `sidepage proxy` does
+Streamlit, FastAPI, or Gradio app, a Python MCP server, a Jupyter
+notebook — behind a local reverse proxy and hands you a URL. `sidepage proxy` does
 the same for a service you already have running (`npm run dev`, a
 container, anything already listening on a port) instead of one sidepage
 launches itself. `sidepage new` scaffolds a static site to get started.
@@ -85,13 +85,14 @@ run sidepage serve...`) or activate the venv first — see
 source-checkout path.
 
 `--type` is auto-detected from what you point at (`code`, `static`,
-`notebook`; within `code`, Streamlit/FastAPI/MCP are each recognized by
-import) — the four `sidepage serve app.py` lines above look identical
-because the actual dispatch happens by inspecting `app.py`'s content, not
-its filename. Want to try these against something real without writing
-your own app first? Clone this repo and swap in `tests/fixtures/static-
-site`, `tests/fixtures/streamlit-app/app.py`,
-`tests/fixtures/fastapi-app/app.py`, `tests/fixtures/mcp-app/app.py`, or
+`notebook`; within `code`, Streamlit/FastAPI/MCP/Gradio are each
+recognized by import) — the four `sidepage serve app.py` lines above look
+identical because the actual dispatch happens by inspecting `app.py`'s
+content, not its filename. Want to try these against something real
+without writing your own app first? Clone this repo and swap in
+`tests/fixtures/static-site`, `tests/fixtures/streamlit-app/app.py`,
+`tests/fixtures/fastapi-app/app.py`, `tests/fixtures/mcp-app/app.py`,
+`tests/fixtures/gradio-app/app.py`, or
 `tests/fixtures/notebook-app/notebook.ipynb`.
 
 Every `serve`/`proxy` call blocks the terminal until Ctrl+C (or `sidepage
@@ -129,6 +130,8 @@ Two things sit between "just run a script" and what `serve` does:
 | `sidepage new <name>` | Scaffold a static site. |
 | `sidepage app register "<invocation>" <name>` | Save a `serve` invocation under a short name. |
 | `sidepage app list` / `show <name>` / `unregister <name>` | Manage saved apps — see below. |
+| `sidepage app delete <name>` | Remove a saved app *and* any source sidepage downloaded for it. |
+| `sidepage pull <source>` | Fetch a Hugging Face Space and register it, without running it — see below. |
 | `sidepage promote <app-name>` | Widen an app's discovery scope. Not yet meaningful — only `local` scope exists today. |
 | `sidepage login` / `sidepage account status` | Not implemented — no Sidepage account backend to talk to yet. |
 
@@ -140,20 +143,27 @@ sidepage serve <target> [--type auto|code|static|notebook] [--name <app-name>]
                [--token <value>] [--env <SECRET_NAME>]...
                [--timeout <seconds>] [--idle-timeout <seconds>]
                [--peer <role>=<app-name>]...
-               [--pwa [--pwa-*]...] [--qr]
+               [--pwa [--pwa-*]...] [--qr] [--autoregister]
 ```
 
 - `--type` is usually inferred: `code` targets are auto-detected as
-  Streamlit, FastAPI, or a Python MCP server (official `mcp` SDK or the
-  third-party `fastmcp` package) and launched with their real launcher
-  (`streamlit run`, `uvicorn <module>:<app>`, or `uvicorn --factory
-  <module>:<mcp-var>.<app-method>`); anything else falls back to a
+  Streamlit, FastAPI, a Python MCP server (official `mcp` SDK or the
+  third-party `fastmcp` package), or Gradio, and launched with their real
+  launcher (`streamlit run`, `uvicorn <module>:<app>`, or `uvicorn
+  --factory` against a generated wrapper); anything else falls back to a
   generic `$PORT`-reading launch. `notebook` (`.ipynb`) targets get a
   full, editable Jupyter Lab instance with a live kernel.
   MCP servers are launched by bypassing their own entrypoint entirely
   (same trick as FastAPI) — a script whose `__main__` only calls
   `mcp.run()` (stdio, the default) still ends up served over real
   Streamable HTTP at `/mcp`, since that entrypoint is never executed.
+  Gradio gets the same bypass, and needs it more: the canonical Gradio
+  script calls `demo.launch()` at module level rather than inside
+  `if __name__ == "__main__":`, so sidepage neutralizes that call before
+  importing the module and mounts the app itself. A hardcoded
+  `launch(server_port=...)` or `share=True` therefore can't fight
+  sidepage's own port and tunnel. Verified against Gradio 6.x; older
+  majors are untested (`docs/OPEN_QUESTIONS.md` #18).
 - `--auth open|token` — `token` gates the app behind a header, query
   param, or browser cookie set by a gate page. (`network`/`oauth` parse
   but aren't built.)
@@ -165,6 +175,14 @@ sidepage serve <target> [--type auto|code|static|notebook] [--name <app-name>]
   [Timeouts, lazy start, and peers](#timeouts-lazy-start-and-peers) below.
 - `--peer <role>=<app-name>` — repeatable; wire one served app to
   another's URL. Same section below.
+- `--autoregister` — also save this invocation to the local app registry
+  once the app is actually up, so `sidepage serve <app-name>` replays it
+  later. Anything the registry can't hold
+  (`--token`/`--timeout`/`--idle-timeout`/`--peer`/`--qr`) is listed by
+  name rather than dropped quietly; re-running an already-registered,
+  identical config is a no-op that points you at the shorter command,
+  and a *different* config under the same name is refused before
+  anything starts.
 - `--pwa` / `--qr` — make the app installable to a phone home screen, and/or
   print a terminal QR code for the URL. See [PWA install and QR
   codes](#pwa-install-and-qr-codes) below.
@@ -233,9 +251,93 @@ sidepage app register "abc.py --auth token" abc-app
 sidepage serve abc-app
 ```
 
+Or skip the separate step — `sidepage serve abc.py --auth token
+--autoregister` saves the same entry once the app is serving:
+
+```bash
+sidepage serve abc.py --auth token --autoregister
+sidepage serve abc                                  # replays it
+```
+
+`--pwa`/`--pwa-*` are saved with the rest (an installed app's name, icon,
+and theme are part of what it *is*) and merge as one unit: any explicit
+`--pwa*` flag on a later `serve <app-name>` replaces the saved PWA config
+wholesale rather than field by field. `--timeout`/`--idle-timeout`/
+`--peer`/`--qr` are per-invocation and never stored; `--token` is refused
+outright at `app register` time and reported-and-dropped under
+`--autoregister`, since it's process-scoped and reissued every run.
+
 Override/merge semantics, the `--with` preview, and why a literal
 `--token` is refused at registration time are in
 [`docs/guides/registry.md`](docs/guides/registry.md).
+
+## Running someone else's app (`sidepage pull`)
+
+Fetch a Hugging Face Space, resolve how it would run, and register it —
+without executing any of it:
+
+```bash
+sidepage pull huggingface.co/spaces/Anvarbekkk/real-time-stock-predictor
+```
+
+```
+  pulled  real-time-stock-predictor
+  source  huggingface.co/spaces/Anvarbekkk/real-time-stock-predictor
+  commit  458cee6
+  sdk     gradio 5.29.0
+  entry   app.py
+  deps    requirements.txt (79 packages, not yet installed)
+  size    675.6 KB
+
+  nothing has been executed. review the code, then:
+    sidepage serve real-time-stock-predictor
+```
+
+`--dry-run` prints the same plan — including the total download size and
+the declared dependency file — having fetched nothing at all, which is the
+mode to use before pulling a Space that carries tens of gigabytes of model
+weights. `--json` emits it as one line for agents. `--as <name>` chooses
+the registered name; `--force` replaces an existing one.
+
+`pull` refuses what it can't run *before* downloading it: Docker Spaces,
+GPU and ZeroGPU hardware tiers, private and gated repos. Files are fetched
+over plain HTTPS at a pinned commit — no `git` or `git-lfs` needed — and
+every LFS file is checked against the digest the Hub declared beforehand.
+
+**Nothing is installed and nothing is executed by `pull`.** Dependencies
+resolve on the first `serve`, which for a heavy app is genuinely slow the
+first time. Requested environment variables are reported by name and
+granted only when you pass `--env`.
+
+### The confirmation gate
+
+`serve` runs code sidepage downloaded only after you approve the exact
+commit:
+
+```
+  about to run code sidepage downloaded
+  source   huggingface.co/spaces/Anvarbekkk/real-time-stock-predictor
+  commit   458cee6
+  sdk      gradio 5.29.0
+  entry    .../apps/real-time-stock-predictor/app.py
+
+  run it? [y/N]:
+```
+
+Approval is recorded against that commit, so a later `pull` that brings
+down different code asks again. With no terminal to prompt at — an agent,
+a CI job, a piped command — `serve` refuses outright rather than assuming
+yes; `--trust-remote-code` is the explicit waiver. This is the same
+warning Hugging Face puts in front of running a Space locally, and it
+applies here on a machine that also holds your secrets vault.
+
+```bash
+sidepage app delete real-time-stock-predictor   # removes the source too
+```
+
+`delete` removes the downloaded source tree; `unregister` only forgets the
+saved config. An app registered against a path you already had has no
+downloaded tree, and `delete` will never remove your own files.
 
 ## Bring your own domain
 

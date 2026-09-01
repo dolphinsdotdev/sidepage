@@ -31,6 +31,15 @@ inspecting the *unparsed* invocation string this module never sees.
 as-is — same reference-not-value rule the vault (`sidepage.core.secrets_vault`)
 and BYO-domain config (`sidepage.core.account`) already follow.
 
+**`--pwa`/`--pwa-*` are stored; `--timeout`/`--idle-timeout`/`--peer`/
+`--qr` are not.** The dividing line is whether a flag describes what the
+served app *is* or merely how this one run of it behaves. PWA settings
+are the former — an installed home-screen app's name, icon, and theme are
+part of its identity, so a saved config that dropped them wouldn't
+reproduce the app it was saved from. The others are per-invocation
+lifetime and display concerns with nothing to reproduce. `--token` is
+excluded for a third, stronger reason: it's a secret (see above).
+
 `target` is stored as an **absolute, resolved path** — not whatever
 relative string the user typed at registration time — so `sidepage serve
 <app-name>` works regardless of the current working directory of whatever
@@ -43,7 +52,7 @@ left ambiguous by accident.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -51,7 +60,45 @@ from sidepage.config.settings import app_registry_file, ensure_dirs
 from sidepage.core.auth import AuthTier
 from sidepage.core.directory_client import Scope
 from sidepage.core.exceptions import AppNotRegisteredError, AppRegistrationError
+from sidepage.core.hf import HfSpaceConfig
+from sidepage.core.pwa import PwaDisplay, PwaOptions
 from sidepage.core.target import TargetKind
+
+
+@dataclass(frozen=True)
+class AppSource:
+    """Where a registered app's code came from, when sidepage fetched it
+    rather than being pointed at something already on disk.
+
+    `None` on an ordinary `app register`/`--autoregister` entry — those
+    reference a path the user already had, and sidepage has no claim over
+    it. Present only for `sidepage pull`, which is also exactly the
+    condition under which `sidepage app delete` may remove files: `managed`
+    records that the tree under `apps_dir()` is sidepage's to delete, so a
+    locally-registered app can never have its source directory removed.
+
+    `trusted_commit` is the commit a human explicitly approved running.
+    It's compared against `commit` at every `serve` — a `pull` that brings
+    down different code leaves the two unequal and re-arms the prompt, so
+    approval attaches to the code that was reviewed rather than to the
+    name it was filed under.
+
+    `env_requested` is names only, scanned out of the entrypoint and never
+    resolved to values. Being listed here grants nothing.
+    """
+
+    kind: str  # "huggingface-space"
+    url: str
+    commit: str
+    managed: bool
+    env_requested: tuple[str, ...] = ()
+    trusted_commit: str | None = None
+    # Source-type-specific manifest. One field per supported source kind
+    # rather than a generic bag: a Space's `sdk`/`sdk_version`/`app_file`
+    # don't generalize, and pretending they do would make the next source
+    # type either distort its own vocabulary or quietly reuse fields that
+    # mean something different.
+    hf: HfSpaceConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -66,6 +113,95 @@ class AppRegistration:
     env_secrets: tuple[str, ...]
     guardrail: Path | None
     registered_at: str  # ISO 8601, UTC, "...Z" suffix
+    # `--pwa`/`--pwa-*` as one unit, or None when PWA mode is off. Stored
+    # (unlike `--timeout`/`--idle-timeout`/`--peer`/`--qr`, which stay
+    # per-invocation) because PWA settings change what the served app
+    # *is* to anyone who installs it — a saved config that silently
+    # dropped them wouldn't reproduce the app it was saved from. Merged
+    # as a unit too: see `sidepage.commands.app_registry.merge_with_registered`.
+    pwa: PwaOptions | None = None
+    # Provenance for `sidepage pull`ed apps; None for anything registered
+    # against a path the user already had. See `AppSource`.
+    source: AppSource | None = None
+
+
+def _source_to_json(source: AppSource | None) -> dict | None:
+    if source is None:
+        return None
+    return {
+        "kind": source.kind,
+        "url": source.url,
+        "commit": source.commit,
+        "managed": source.managed,
+        "env_requested": list(source.env_requested),
+        "trusted_commit": source.trusted_commit,
+        "hf": None
+        if source.hf is None
+        else {
+            "repo_id": source.hf.repo_id,
+            "sdk": source.hf.sdk,
+            "sdk_version": source.hf.sdk_version,
+            "app_file": source.hf.app_file,
+            "python_version": source.hf.python_version,
+            "hardware": source.hf.hardware,
+        },
+    }
+
+
+def _source_from_json(data: dict | None) -> AppSource | None:
+    if not data:
+        return None
+    hf_data = data.get("hf")
+    return AppSource(
+        kind=data["kind"],
+        url=data["url"],
+        commit=data["commit"],
+        managed=bool(data.get("managed")),
+        env_requested=tuple(data.get("env_requested") or ()),
+        trusted_commit=data.get("trusted_commit"),
+        hf=None
+        if not hf_data
+        else HfSpaceConfig(
+            repo_id=hf_data["repo_id"],
+            sdk=hf_data.get("sdk"),
+            sdk_version=hf_data.get("sdk_version"),
+            app_file=hf_data.get("app_file"),
+            python_version=hf_data.get("python_version"),
+            hardware=hf_data.get("hardware"),
+        ),
+    )
+
+
+def _pwa_to_json(pwa: PwaOptions | None) -> dict | None:
+    if pwa is None:
+        return None
+    return {
+        "name": pwa.name,
+        "short_name": pwa.short_name,
+        "theme": pwa.theme,
+        "bg": pwa.bg,
+        "icon": str(pwa.icon) if pwa.icon is not None else None,
+        "display": pwa.display.value,
+        "manifest": str(pwa.manifest) if pwa.manifest is not None else None,
+        "force": pwa.force,
+        "no_sw": pwa.no_sw,
+    }
+
+
+def _pwa_from_json(data: dict | None) -> PwaOptions | None:
+    if not data:
+        return None
+    return PwaOptions(
+        name=data.get("name"),
+        short_name=data.get("short_name"),
+        theme=data["theme"],
+        bg=data["bg"],
+        icon=Path(data["icon"]) if data.get("icon") else None,
+        display=PwaDisplay(data["display"]),
+        manifest=Path(data["manifest"]) if data.get("manifest") else None,
+        force=data.get("force", False),
+        no_sw=data.get("no_sw", False),
+    )
 
 
 def _to_json(r: AppRegistration) -> dict:
@@ -79,6 +215,8 @@ def _to_json(r: AppRegistration) -> dict:
         "anon": r.anon,
         "env": list(r.env_secrets),
         "guardrail": str(r.guardrail) if r.guardrail is not None else None,
+        "pwa": _pwa_to_json(r.pwa),
+        "source": _source_to_json(r.source),
         "registered_at": r.registered_at,
     }
 
@@ -94,8 +232,39 @@ def _from_json(data: dict) -> AppRegistration:
         anon=data.get("anon", False),
         env_secrets=tuple(data.get("env") or ()),
         guardrail=Path(data["guardrail"]) if data.get("guardrail") else None,
+        # `.get`, not `["pwa"]` — entries written before PWA became a
+        # stored field have no such key, and an old entry is a valid
+        # registration with PWA off, not a corrupt one.
+        pwa=_pwa_from_json(data.get("pwa")),
+        source=_source_from_json(data.get("source")),
         registered_at=data["registered_at"],
     )
+
+
+def same_config(a: AppRegistration, b: AppRegistration, *, default_name: str) -> bool:
+    """True if two registrations describe the same `serve` config.
+
+    Ignores `registered_at` (when a config was saved says nothing about
+    what it is) and treats an unset `name` as `default_name` — without
+    that second normalization, `serve <app-name> --autoregister` against
+    an app registered with no explicit `--name` would compare a stored
+    `name=None` against the live, resolved `name="<app-name>"` and call
+    two identical configs different.
+
+    Backs `--autoregister`'s "already registered with this exact config"
+    check (`sidepage.core.process.serve`), which is what keeps re-serving
+    the same app from either erroring or silently overwriting.
+    """
+
+    def _norm(r: AppRegistration) -> AppRegistration:
+        # `source` is deliberately excluded too: provenance records where
+        # code came from, not how it runs. A `serve <pulled-app>
+        # --autoregister` builds its candidate from flags alone and has no
+        # provenance to offer, so comparing it would report every pulled
+        # app as a conflict with itself.
+        return replace(r, registered_at="", name=r.name or default_name, source=None)
+
+    return _norm(a) == _norm(b)
 
 
 def _load() -> dict[str, dict]:
@@ -125,6 +294,9 @@ def register(
     anon: bool,
     env_secrets: tuple[str, ...],
     guardrail: Path | None,
+    pwa: PwaOptions | None = None,
+    source: AppSource | None = None,
+    replace_existing: bool = False,
 ) -> AppRegistration:
     """Save a fully-resolved `serve` config under `app_name`.
 
@@ -140,8 +312,19 @@ def register(
     doesn't silently overwrite; `sidepage app unregister` first, or pick a
     different name.
     """
+    # Same absolute-path reasoning as `target` (see module docstring), for
+    # the same reason: `--pwa-icon`/`--pwa-manifest` are usually typed as
+    # paths relative to wherever the user happened to be standing, and
+    # `sidepage serve <app-name>` can be run from anywhere later. Resolved
+    # here rather than at each call site so neither caller can forget.
+    if pwa is not None:
+        pwa = replace(
+            pwa,
+            icon=pwa.icon.resolve() if pwa.icon is not None else None,
+            manifest=pwa.manifest.resolve() if pwa.manifest is not None else None,
+        )
     store = _load()
-    if app_name in store:
+    if app_name in store and not replace_existing:
         raise AppRegistrationError(
             f"an app named {app_name!r} is already registered — "
             f"`sidepage app unregister {app_name}` it first, or pick a different name."
@@ -156,6 +339,8 @@ def register(
         anon=anon,
         env_secrets=env_secrets,
         guardrail=guardrail,
+        pwa=pwa,
+        source=source,
         registered_at=datetime.now(UTC).isoformat().replace("+00:00", "Z"),
     )
     store[app_name] = _to_json(registration)
@@ -181,6 +366,31 @@ def list_registered() -> list[str]:
     for a different reason here: `sidepage app show <app-name>` is the
     real per-entry inspection command, not a listing convenience."""
     return sorted(_load())
+
+
+def set_trusted_commit(app_name: str, commit: str) -> None:
+    """Record that a human approved running `app_name` at `commit`.
+
+    Written only after an explicit confirmation at `serve` time (see
+    `sidepage.commands.serve._require_source_trust`). Stored on the
+    registration rather than in a separate trust store so it can't drift
+    out of sync with the commit it refers to: `pull` rewrites the whole
+    entry, so newly downloaded code arrives with `commit` changed and
+    `trusted_commit` reset, and the prompt re-arms by construction.
+
+    Raises `sidepage.core.exceptions.AppNotRegisteredError` if `app_name`
+    isn't registered, and does nothing for an app with no provenance —
+    there's no remote code to trust.
+    """
+    store = _load()
+    if app_name not in store:
+        raise AppNotRegisteredError(f"no app named {app_name!r} is registered")
+    registration = _from_json(store[app_name])
+    if registration.source is None:
+        return
+    updated = replace(registration, source=replace(registration.source, trusted_commit=commit))
+    store[app_name] = _to_json(updated)
+    _save(store)
 
 
 def unregister(app_name: str) -> None:
