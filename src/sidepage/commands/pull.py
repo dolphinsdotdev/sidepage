@@ -22,6 +22,7 @@ reading them can't mistake a stranger's text for sidepage's own.
 from __future__ import annotations
 
 import json as json_lib
+from dataclasses import replace
 from typing import Annotated
 
 import typer
@@ -41,6 +42,29 @@ from sidepage.core.exceptions import (
 from sidepage.core.pull import RunPlan
 from sidepage.core.target import TargetKind
 from sidepage.output import error, info, plain, warn
+
+
+def _note_hardware_override(
+    plan: RunPlan, resolved: core_pull.ResolvedSource, ignore_hardware: bool
+) -> RunPlan:
+    """Record an overridden hardware gate on the plan itself.
+
+    Applied wherever a plan is built rather than once up front, because
+    `pull` re-plans against the downloaded directory and a note attached
+    only to the first plan would be silently dropped. An overridden pull
+    must never read as routine — the whole point of the flag is that the
+    user accepted a caveat, and the output has to keep saying so.
+    """
+    if not ignore_hardware or not resolved.space.hardware:
+        return plan
+    return replace(
+        plan,
+        warnings=(
+            *plan.warnings,
+            f"--ignore-hardware: provisioned for {resolved.space.hardware} on Hugging Face; "
+            "it will run on CPU here (MPS on Apple Silicon) and may be slow or run out of memory.",
+        ),
+    )
 
 
 def _emit_json(payload: dict) -> None:
@@ -171,6 +195,14 @@ def pull(
             "dependencies — without downloading or registering anything.",
         ),
     ] = False,
+    ignore_hardware: Annotated[
+        bool,
+        typer.Option(
+            "--ignore-hardware",
+            help="Pull a Space provisioned for GPU hardware anyway. It will run on CPU (or MPS "
+            "on Apple Silicon) and may be slow or exhaust memory.",
+        ),
+    ] = False,
     json_output: Annotated[
         bool,
         typer.Option("--json", help="Emit the plan as one JSON object."),
@@ -185,7 +217,7 @@ def pull(
     """
     try:
         resolved = core_pull.resolve_source(source)
-        hf.check_runnable(resolved.space)
+        hf.check_runnable(resolved.space, ignore_hardware=ignore_hardware)
 
         app_name = as_name or resolved.default_name
         if not core_pull.valid_app_name(app_name):
@@ -206,7 +238,9 @@ def pull(
 
         # Planned from metadata alone first: a hostile `app_file` or an
         # unsupported layout is refused here, before a byte is fetched.
-        plan = core_pull.plan_from_space(resolved.space)
+        plan = _note_hardware_override(
+            core_pull.plan_from_space(resolved.space), resolved, ignore_hardware
+        )
 
         if dry_run:
             if json_output:
@@ -228,7 +262,11 @@ def pull(
         # Re-planned against the real directory: this is the pass that sees
         # symlinks, counts the dependency file, and scans the entrypoint
         # for environment-variable names.
-        plan = core_pull.plan_from_space(resolved.space, app_dir=app_source_dir(app_name))
+        plan = _note_hardware_override(
+            core_pull.plan_from_space(resolved.space, app_dir=app_source_dir(app_name)),
+            resolved,
+            ignore_hardware,
+        )
 
         target = app_source_dir(app_name)
         if plan.target_kind is TargetKind.CODE and plan.entrypoint is not None:

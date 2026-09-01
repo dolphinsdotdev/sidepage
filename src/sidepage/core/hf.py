@@ -65,15 +65,31 @@ from sidepage.core.exceptions import SourceError, UnrunnableSourceError
 HF_API_BASE = "https://huggingface.co/api/spaces"
 HF_RESOLVE_BASE = "https://huggingface.co/spaces"
 
-# Hardware tiers `serve` can actually honor locally. An **allowlist, not a
+# Hardware tiers that need no second thought locally. An **allowlist, not a
 # denylist**: HF adds accelerator tiers regularly (`zero-a10g`, `t4-small`,
-# `l4x1`, `a100-large`, ...), and a denylist would silently let next
-# year's tier through and try to run a GPU-only Space on a laptop. Anything
-# not matching this prefix is refused by name, so a new tier produces a
-# clear "sidepage can't run <tier>" rather than a mysterious runtime
-# failure. Verified against live Spaces: `cpu-basic`, `cpu-upgrade` and
-# `cpu-xl` are real CPU tiers; `zero-a10g` is what a ZeroGPU Space
+# `l4x1`, `a100-large`, ...), and a denylist would silently let next year's
+# tier through. Verified against live Spaces: `cpu-basic`, `cpu-upgrade`
+# and `cpu-xl` are real CPU tiers; `zero-a10g` is what a ZeroGPU Space
 # (black-forest-labs/FLUX.1-dev) reports.
+#
+# **This is a caution, not a capability check** — a distinction worth being
+# precise about, because sidepage got it wrong first. The tier is what the
+# Space's owner *provisioned on Hugging Face*: a billing and scheduling
+# choice, not a statement about what the code requires. Two consequences:
+#
+#   - A GPU-tier Space usually still runs here. ZeroGPU apps import the
+#     `spaces` package and decorate entrypoints with `@spaces.GPU`, and
+#     that decorator is **inert off Hugging Face** — verified by installing
+#     `spaces` outside any HF environment, decorating a function, and
+#     calling it: it returns normally. The app then runs on whatever torch
+#     finds locally (CPU, or MPS on Apple Silicon).
+#   - Equally, a `cpu-basic` Space is not thereby *fast* here.
+#
+# So a non-CPU tier is a real warning — a Space provisioned for an A100
+# usually implies a model large enough to thrash or exhaust memory on a
+# laptop — but not a fact about runnability, and `pull --ignore-hardware`
+# exists to say so. Contrast `sdk: docker` and private/gated repos below,
+# which are structural and have no override.
 RUNNABLE_HARDWARE_PREFIX = "cpu"
 
 # SDKs with a real launcher behind them. `docker` is excluded on purpose
@@ -300,14 +316,21 @@ def fetch_space(owner: str, name: str, *, timeout: float = 30.0) -> HfSpace:
     )
 
 
-def check_runnable(space: HfSpace) -> None:
-    """Refuse a Space sidepage can't run, from metadata alone — called
+def check_runnable(space: HfSpace, *, ignore_hardware: bool = False) -> None:
+    """Refuse a Space sidepage shouldn't run, from metadata alone — called
     before any file is downloaded.
 
     Raises `sidepage.core.exceptions.UnrunnableSourceError` naming the
-    specific blocker. Everything checked here is a hard "no", not a
-    warning: see `runtime_warnings` for the conditions that are worth
-    telling the user about but shouldn't stop a pull.
+    specific blocker.
+
+    Two tiers of refusal, deliberately distinguished:
+
+      - **Structural**, with no override: `sdk: docker` (running it means
+        building and running a container, which sidepage doesn't do) and
+        private/gated repos (no Hub credentials exist to use).
+      - **Cautionary**, overridable with `ignore_hardware=True`: a non-CPU
+        hardware tier. See `RUNNABLE_HARDWARE_PREFIX` for why that's a
+        warning about likely resource use rather than a capability check.
     """
     if space.private or space.gated:
         which = "private" if space.private else "gated"
@@ -326,12 +349,17 @@ def check_runnable(space: HfSpace) -> None:
             f"{space.repo_id} declares sdk: {space.sdk or '(none)'}, which sidepage doesn't "
             f"support. Supported: {', '.join(sorted(SUPPORTED_SDKS))}. Nothing was downloaded."
         )
-    if space.hardware is not None and not space.hardware.startswith(RUNNABLE_HARDWARE_PREFIX):
+    if (
+        not ignore_hardware
+        and space.hardware is not None
+        and not space.hardware.startswith(RUNNABLE_HARDWARE_PREFIX)
+    ):
         raise UnrunnableSourceError(
-            f"{space.repo_id} requests {space.hardware} hardware — a GPU tier sidepage can't "
-            "provide on this machine. Spaces built for ZeroGPU also import the `spaces` package "
-            "and decorate their entrypoints, which only works on Hugging Face's own "
-            "infrastructure. Nothing was downloaded."
+            f"{space.repo_id} is provisioned for {space.hardware} on Hugging Face. That's the "
+            "owner's hosting choice rather than a hard requirement — it will most likely still "
+            "run here, on CPU (or MPS on Apple Silicon), just slowly, and a Space sized for that "
+            "tier may exhaust memory. Re-run with --ignore-hardware to pull it anyway. "
+            "Nothing was downloaded."
         )
 
 

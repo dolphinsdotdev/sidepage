@@ -299,10 +299,19 @@ mode to use before pulling a Space that carries tens of gigabytes of model
 weights. `--json` emits it as one line for agents. `--as <name>` chooses
 the registered name; `--force` replaces an existing one.
 
-`pull` refuses what it can't run *before* downloading it: Docker Spaces,
-GPU and ZeroGPU hardware tiers, private and gated repos. Files are fetched
-over plain HTTPS at a pinned commit — no `git` or `git-lfs` needed — and
-every LFS file is checked against the digest the Hub declared beforehand.
+`pull` decides what it will fetch *before* downloading anything. Docker
+Spaces and private/gated repos are refused outright — the first needs a
+container runtime sidepage doesn't have, the second needs Hub credentials
+it can't supply. A GPU or ZeroGPU tier is a **warning with an override**,
+not a wall: the tier is the owner's Hugging Face hosting choice, and a
+ZeroGPU app's `@spaces.GPU` decorator is inert off Hugging Face, so the
+Space usually does run locally — just on CPU, possibly slowly, and a
+Space sized for an A100 may exhaust memory. `--ignore-hardware` pulls it
+anyway and keeps saying so in the plan.
+
+Files are fetched over plain HTTPS at a pinned commit — no `git` or
+`git-lfs` needed — and every LFS file is checked against the digest the
+Hub declared beforehand.
 
 **Nothing is installed and nothing is executed by `pull`.** Dependencies
 resolve on the first `serve`, which for a heavy app is genuinely slow the

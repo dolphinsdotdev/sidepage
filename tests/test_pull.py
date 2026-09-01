@@ -219,12 +219,47 @@ def test_gpu_hardware_is_refused_by_name() -> None:
 
 def test_unknown_future_hardware_tier_is_refused_not_allowed() -> None:
     """The hardware check is an allowlist: a tier nobody has heard of yet
-    must fail closed, or next year's accelerator silently gets scheduled
-    onto someone's laptop."""
+    must warn, or next year's accelerator silently gets scheduled onto
+    someone's laptop."""
     payload = _space_payload()
     payload["runtime"]["hardware"]["requested"] = "quantum-xxl-2029"
     with pytest.raises(UnrunnableSourceError, match="quantum-xxl-2029"):
         hf.check_runnable(_space_from(payload))
+
+
+def test_hardware_refusal_is_overridable() -> None:
+    """The tier is the owner's Hugging Face hosting choice, not a fact
+    about this machine: a ZeroGPU Space's `@spaces.GPU` decorator is inert
+    off Hugging Face, so the app really does run locally, just on CPU. The
+    gate is a caution worth defaulting to, not a wall."""
+    payload = _space_payload()
+    payload["runtime"]["hardware"]["requested"] = "zero-a10g"
+    hf.check_runnable(_space_from(payload), ignore_hardware=True)  # does not raise
+
+
+def test_ignore_hardware_does_not_excuse_structural_blockers() -> None:
+    """Docker and private/gated are refusals about what sidepage can do at
+    all, not about how fast it would be — the override must not reach
+    them."""
+    with pytest.raises(UnrunnableSourceError, match="Docker Space"):
+        hf.check_runnable(_space_from(_space_payload(sdk="docker")), ignore_hardware=True)
+    with pytest.raises(UnrunnableSourceError, match="private"):
+        hf.check_runnable(_space_from(_space_payload(private=True)), ignore_hardware=True)
+
+
+def test_pull_ignore_hardware_pulls_and_says_so(sidepage_home: Path, fake_hub) -> None:
+    fake_hub["payload"]["runtime"]["hardware"]["requested"] = "zero-a10g"
+
+    refused = runner.invoke(app, ["pull", "hf:someone/demo-space"])
+    assert refused.exit_code == 1
+    assert "--ignore-hardware" in refused.output
+    assert app_registry.get("demo-space") is None
+
+    allowed = runner.invoke(app, ["pull", "hf:someone/demo-space", "--ignore-hardware"])
+    assert allowed.exit_code == 0, allowed.output
+    assert app_registry.get("demo-space") is not None
+    # An overridden pull must never read as routine.
+    assert "zero-a10g" in allowed.output
 
 
 @pytest.mark.parametrize("tier", ["cpu-basic", "cpu-upgrade", "cpu-xl"])

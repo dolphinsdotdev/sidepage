@@ -564,7 +564,22 @@ until `serve --env`.
 6. **No size ceiling.** `pull` reports the download size and `--dry-run`
    shows it without fetching, but nothing refuses an 80 GB Space. A
    threshold with an explicit override is the obvious next step.
-7. **Repository size is not runtime size, and the plan can't say so.**
+7. **The hardware gate reads `runtime.hardware.requested`, which is a
+   hosting choice, not a requirement.** Shipped as a hard refusal first;
+   corrected to a caution with `--ignore-hardware` after verifying that
+   `@spaces.GPU` is inert off Hugging Face — a ZeroGPU Space really does
+   run locally, on CPU. What sidepage would actually like to know is
+   "will this fit on this machine", and the tier is only a weak proxy:
+   it says nothing about model size, and a `cpu-basic` Space can still be
+   far too slow to use. A sharper signal is available and unused — the
+   dependency file and the LFS blob sizes are both visible in the
+   metadata *before* download, so "this Space carries 40 GB of weights"
+   is answerable directly rather than inferred from a billing tier. The
+   related idea of a declared local hardware profile (tell sidepage what
+   the machine has, let it decide) is deliberately not built: there's no
+   consumer for it yet beyond this one check, and inventing a hardware
+   description format for a single warning would be the wrong shape.
+8. **Repository size is not runtime size, and the plan can't say so.**
    Most Spaces are a few KB of code that call `snapshot_download` or
    `from_pretrained` on first request — `mlx-community/supertonic-3` is
    28 KB of repo and an unknown number of GB once running. `pull
