@@ -119,6 +119,7 @@ def _coerce_raw_params(raw: dict) -> dict:
         "auth": AuthTier(raw["auth"]),
         "scope": Scope(raw["scope"]),
         "anon": raw["anon"],
+        "no_suffix": raw["no_suffix"],
         "token": raw["token"],
         "env": list(raw["env"] or ()),
         "guardrail": Path(raw["guardrail"]) if raw["guardrail"] else None,
@@ -147,6 +148,7 @@ def merge_with_registered(
     env: list[str],
     guardrail: Path | None,
     pwa: PwaOptions | None = None,
+    no_suffix: bool = False,
 ) -> dict[str, Any]:
     """For each mergeable field, an explicit command-line value (source
     `COMMANDLINE` on `ctx`, per `ctx.get_parameter_source`) overrides the
@@ -176,7 +178,7 @@ def merge_with_registered(
 
     Returns a dict shaped as `ServeConfig`'s own keyword arguments
     (`target_kind`, `name`, `domain`, `auth`, `scope`, `anon`,
-    `env_secrets`, `guardrail`, `pwa`) — ready to splice into
+    `no_suffix`, `env_secrets`, `guardrail`, `pwa`) — ready to splice into
     `ServeConfig(target=..., token=..., **merged)`.
     """
     from sidepage.commands.serve import PWA_PARAM_FIELDS, ServeTargetType
@@ -196,6 +198,7 @@ def merge_with_registered(
         "auth": use("auth", auth, registered.auth),
         "scope": use("scope", scope, registered.scope),
         "anon": use("anon", anon, registered.anon),
+        "no_suffix": use("no_suffix", no_suffix, registered.no_suffix),
         "env_secrets": tuple(env) if _is_explicit(ctx, "env") else registered.env_secrets,
         "guardrail": use("guardrail", guardrail, registered.guardrail),
         "pwa": pwa if any(_is_explicit(ctx, f) for f in PWA_PARAM_FIELDS) else registered.pwa,
@@ -266,6 +269,7 @@ def _print_registration(app_name: str, r: AppRegistration) -> None:
     stdout.print(f"  auth:           {r.auth.value}")
     stdout.print(f"  scope:          {r.scope.value}")
     stdout.print(f"  anon:           {r.anon}")
+    stdout.print(f"  no_suffix:      {r.no_suffix}")
     stdout.print(f"  env:            {', '.join(r.env_secrets) or '[dim](none)[/dim]'}")
     stdout.print(f"  guardrail:      {_or_none(r.guardrail)}")
     stdout.print(f"  pwa:            {_describe_pwa(r.pwa)}")
@@ -326,6 +330,7 @@ def register(
             auth=values["auth"],
             scope=values["scope"],
             anon=values["anon"],
+            no_suffix=values["no_suffix"],
             env_secrets=tuple(values["env"]),
             guardrail=values["guardrail"],
             pwa=values["pwa"],
@@ -385,6 +390,7 @@ def show(
         auth=values["auth"],
         scope=values["scope"],
         anon=values["anon"],
+        no_suffix=values["no_suffix"],
         env=values["env"],
         guardrail=values["guardrail"],
         pwa=values["pwa"],
@@ -401,6 +407,7 @@ def show(
         auth=merged["auth"],
         scope=merged["scope"],
         anon=merged["anon"],
+        no_suffix=merged["no_suffix"],
         env_secrets=merged["env_secrets"],
         guardrail=merged["guardrail"],
         pwa=merged["pwa"],

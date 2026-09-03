@@ -8,6 +8,7 @@ each module rolling its own `print()` calls.
 
 from __future__ import annotations
 
+import json
 import sys
 
 from rich.console import Console
@@ -61,12 +62,37 @@ def not_implemented(command: str, *, implemented_by: str) -> None:
     )
 
 
+# `--json` mode. `info`/`warn`/`error` already write to stderr, so stdout
+# is nearly a clean channel already — `success` is the one helper that
+# doesn't, and this flag moves it. The point is that `sidepage serve
+# --json` can be parsed with `stdout | jq` without a caller having to
+# filter chrome out of the stream first, while every human-readable line
+# stays visible on stderr rather than being thrown away.
+_json_mode = False
+
+
+def set_json_mode(enabled: bool) -> None:
+    """Route `success` to stderr so stdout carries only machine-readable
+    output. Set once, at command entry, before anything prints."""
+    global _json_mode
+    _json_mode = enabled
+
+
+def json_line(payload: object) -> None:
+    """The one thing `--json` writes to stdout: a single line of JSON,
+    terminated, flushed. Deliberately `print` and not a Rich console —
+    Rich wraps, styles, and can insert soft line breaks into long values
+    (a tunnel URL is easily wide enough), any of which would corrupt a
+    stream something else is about to parse."""
+    print(json.dumps(payload, separators=(",", ":")), flush=True)
+
+
 def info(message: str) -> None:
     stderr.print(f"[cyan]info[/cyan] {message}")
 
 
 def success(message: str) -> None:
-    stdout.print(f"[green]✓[/green] {message}")
+    (stderr if _json_mode else stdout).print(f"[green]✓[/green] {message}")
 
 
 def warn(message: str) -> None:

@@ -64,7 +64,7 @@ from pathlib import Path
 
 import httpx
 
-from sidepage.config.settings import wrappers_dir
+from sidepage.config.settings import app_log_file, ensure_dirs, wrappers_dir
 from sidepage.core import (
     _platform,
     account,
@@ -103,7 +103,7 @@ from sidepage.core.token_runtime import (
     write_control_token_file,
     write_runtime_file,
 )
-from sidepage.output import error, info, stdout, success, warn
+from sidepage.output import error, info, json_line, plain, stdout, success, warn
 
 
 @dataclass(frozen=True)
@@ -115,6 +115,12 @@ class ServeConfig:
     auth: AuthTier
     scope: Scope
     anon: bool = False  # Quick Tunnel, no directory entry — orthogonal to `auth`
+    # --no-suffix: route BYO-domain apps at a bare `<app-name>.<domain>`
+    # instead of `<app-name>-<id>.<domain>`. Requires `--domain` — the
+    # dedupe id exists nowhere else (local serving has no hostname,
+    # `--anon` gets Cloudflare's), so `_validate_supported` rejects it
+    # rather than accepting a flag that would do nothing.
+    no_suffix: bool = False
     token: str | None = None  # explicit --token; None means env var or auto-generate
     env_secrets: tuple[str, ...] = ()  # v4 §9 — vault secret names for --env (repeatable)
     guardrail: Path | None = None  # parked, not built — see sidepage.core.guardrail
@@ -127,6 +133,11 @@ class ServeConfig:
     # (`sidepage.core.app_registry`) once it's actually serving. See
     # `_autoregister_preflight` / `_autoregister_commit` below.
     autoregister: bool = False
+    # --detach / --json (v5 §21). See `_serve_detached` and
+    # `_ready_payload` for what these actually change; both are handled
+    # generically enough that `proxy` carries the identical pair.
+    detach: bool = False
+    json_output: bool = False
 
 
 @dataclass(frozen=True)
@@ -149,6 +160,8 @@ class ProxyConfig:
     token: str | None = None
     timeout: float | None = None
     idle_timeout: float | None = None
+    detach: bool = False
+    json_output: bool = False
 
 
 # Both recognized MCP packages ship their own DNS-rebinding protection
@@ -671,6 +684,12 @@ _UNREGISTERABLE_FLAGS: tuple[tuple[str, str], ...] = (
     ("idle_timeout", "--idle-timeout"),
     ("peers", "--peer"),
     ("qr", "--qr"),
+    # Both are properties of *this* invocation's call site, not of the
+    # app: whether the caller wanted a terminal held open, and whether it
+    # wanted machine-readable output. Replaying a registration should not
+    # inherit either.
+    ("detach", "--detach"),
+    ("json_output", "--json"),
 )
 
 
@@ -703,6 +722,7 @@ def _pending_registration(
         auth=config.auth,
         scope=config.scope,
         anon=config.anon,
+        no_suffix=config.no_suffix,
         env_secrets=config.env_secrets,
         guardrail=config.guardrail,
         pwa=config.pwa,
@@ -779,11 +799,34 @@ def _autoregister_commit(
         auth=pending.auth,
         scope=pending.scope,
         anon=pending.anon,
+        no_suffix=pending.no_suffix,
         env_secrets=pending.env_secrets,
         guardrail=pending.guardrail,
         pwa=pending.pwa,
     )
     success(f"registered as {app_name!r} — replay it with `sidepage serve {app_name}`")
+
+
+def _assert_hostname_available(
+    no_suffix: bool, app_name: str, domain_config: account.DomainConfig | None
+) -> None:
+    """Pre-flight `app_name`'s BYO-domain hostname against the zone's DNS
+    (`sidepage.core.tunnel_manager.assert_hostname_available`), or do
+    nothing when there's no `--domain` — a local or `--anon` app claims no
+    name in anyone's zone. Shared verbatim by `serve` and `proxy`, which
+    both run it in the same slot: immediately after the local
+    already-running-name check, before anything is allocated or started.
+    """
+    if domain_config is None:
+        return
+    tunnel_manager.assert_hostname_available(
+        app_name,
+        domain_config.domain,
+        zone_id=domain_config.zone_id,
+        tunnel_id=domain_config.tunnel_id,
+        api_token_name=domain_config.api_token_name,
+        suffix=not no_suffix,
+    )
 
 
 def _validate_supported(config: ServeConfig) -> account.DomainConfig | None:
@@ -800,6 +843,12 @@ def _validate_supported(config: ServeConfig) -> account.DomainConfig | None:
         raise NotImplementedError(
             "--guardrail isn't implemented — parked, see sidepage.core.guardrail."
         )
+    if config.no_suffix and config.domain is None:
+        raise ValueError(
+            "--no-suffix only applies to --domain — it drops the dedupe id from the "
+            "hostname sidepage routes on your own domain. A local serve has no hostname "
+            "to shorten, and --anon's *.trycloudflare.com name is Cloudflare's to assign."
+        )
     return _validate_common(
         domain=config.domain,
         anon=config.anon,
@@ -810,9 +859,190 @@ def _validate_supported(config: ServeConfig) -> account.DomainConfig | None:
     )
 
 
+# --- `--detach` (v5 §21) -----------------------------------------------
+#
+# `serve`/`proxy` block until Ctrl+C or `sidepage stop`, which makes them
+# unusable from any caller that can't hold a terminal open — a CI step, an
+# agent harness, a dispatched task. `--detach` re-execs this same command
+# as a background child and returns once the app is actually up.
+#
+# The readiness signal is `registry.register()`, which the child calls at
+# the exact point every fact is known (port allocated, subprocess healthy,
+# tunnel open). That's the whole reason this belongs in sidepage rather
+# than in a wrapper script: an external wrapper can only scrape stdout for
+# something URL-shaped and guess, whereas the registry entry either exists
+# or doesn't. No regex, no false positive on a docs link in a startup log,
+# no false failure because an app logged the word "error".
+_DETACHED_CHILD_ENV = "SIDEPAGE_DETACHED_CHILD"
+
+# Generous because a first run resolves the target's dependencies through
+# `uv`, which can genuinely take minutes on a cold cache. Hitting this cap
+# is reported as "starting", not "failed" — the child is left running and
+# the caller is pointed at the log, since a slow resolve and a hang look
+# identical from out here and only one of them is worth killing.
+_DETACH_READY_TIMEOUT = 180.0
+
+
+def is_detached_child() -> bool:
+    """True inside the child a `--detach` parent spawned. The child runs
+    the ordinary blocking path — it must not detach again."""
+    return os.environ.get(_DETACHED_CHILD_ENV) == "1"
+
+
+def _detached_child_argv() -> list[str]:
+    """The current invocation, minus `--detach`, as a spawnable argv.
+
+    Rebuilt from `sys.argv` rather than reconstructed from the config
+    dataclass: the config is normalized and lossy (defaults resolved,
+    paths absolutized, `--type` inferred), so a reconstruction would
+    silently run something subtly different from what the user typed. The
+    interpreter and `-m sidepage` come from `sys.executable` and
+    `sidepage.__main__` so the child is guaranteed the same interpreter
+    and the same installed package as the parent.
+    """
+    args = [a for a in sys.argv[1:] if a != "--detach"]
+    return [sys.executable, "-m", "sidepage", *args]
+
+
+def _spawn_detached(app_name: str, *, json_output: bool) -> int:
+    """Run this command again in the background, wait for it to register
+    as running, and report. Returns the process exit code for the parent.
+
+    Never raises for a child-side failure — a failed launch is reported
+    through the same payload shape as a successful one, because the whole
+    point of `--detach` is to give a caller one parseable answer either
+    way.
+    """
+    ensure_dirs()
+    log_path = app_log_file(app_name)
+    child_env = {
+        **os.environ,
+        _DETACHED_CHILD_ENV: "1",
+        # Rich falls back to an 80-column width when its output isn't a
+        # terminal, and hard-wraps to it — which is how a child's log ends
+        # up with newlines inserted mid-word and mid-URL. That log is the
+        # only account of a failure, and `_log_tail` feeds it straight into
+        # the `error` field of a `failed` payload, so a wrapped message is
+        # a corrupted diagnostic, not a cosmetic issue. `COLUMNS` is the
+        # documented way to tell Rich otherwise.
+        "COLUMNS": "200",
+    }
+
+    # Detach properly on both platforms: a new session (POSIX) or a new
+    # process group with no console (Windows) means the child survives the
+    # parent exiting and never receives the parent's Ctrl+C.
+    popen_kwargs: dict[str, object] = {}
+    if _platform._WINDOWS:
+        popen_kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    with log_path.open("wb") as log:
+        child = subprocess.Popen(  # noqa: S603 — argv is our own, see _detached_child_argv
+            _detached_child_argv(),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env=child_env,
+            **popen_kwargs,  # type: ignore[arg-type]
+        )
+
+    deadline = time.time() + _DETACH_READY_TIMEOUT
+    while time.time() < deadline:
+        running = registry.get(app_name)
+        if running is not None:
+            payload = _ready_payload_from_registry(running, log_path=log_path)
+            _emit_payload(payload, json_output=json_output)
+            return 0
+        if child.poll() is not None:
+            # Exited before registering: a validation error, a failed
+            # dependency resolve, a port conflict. The log is the only
+            # account of why, so it's carried in the payload rather than
+            # leaving the caller to go find it.
+            payload = {
+                "status": "failed",
+                "app": app_name,
+                "pid": child.pid,
+                "exit_code": child.returncode,
+                "log": str(log_path),
+                "error": _log_tail(log_path),
+            }
+            _emit_payload(payload, json_output=json_output)
+            return 1
+        time.sleep(0.25)
+
+    payload = {
+        "status": "starting",
+        "app": app_name,
+        "pid": child.pid,
+        "log": str(log_path),
+        "note": (
+            f"no registry entry after {_DETACH_READY_TIMEOUT:g}s; still running. "
+            f"Check `sidepage status {app_name}` or the log."
+        ),
+    }
+    _emit_payload(payload, json_output=json_output)
+    return 0
+
+
+def _log_tail(path: Path, *, lines: int = 20) -> str:
+    try:
+        content = path.read_text(errors="replace")
+    except OSError:
+        return ""
+    return "\n".join(content.splitlines()[-lines:])
+
+
+def _ready_payload_from_registry(running: registry.RunningApp, *, log_path: Path | None) -> dict:
+    payload: dict = {
+        "status": "running",
+        "app": running.name,
+        "pid": running.pid,
+        "url": running.tunnel_url or running.url,
+        "local_url": running.url,
+        "tunnel_url": running.tunnel_url,
+    }
+    if log_path is not None:
+        payload["log"] = str(log_path)
+    return payload
+
+
+def _emit_payload(payload: dict, *, json_output: bool) -> None:
+    """One readiness report, in whichever form the caller asked for."""
+    if json_output:
+        json_line(payload)
+        return
+    status = payload["status"]
+    if status == "running":
+        success(f"{payload['app']} serving at {payload['url']}")
+        info(f"log: {payload['log']}")
+        info(f"`sidepage stop {payload['app']}` to tear it down")
+    elif status == "failed":
+        error(f"{payload['app']} failed to start — see {payload['log']}")
+        if payload.get("error"):
+            plain.print(payload["error"])
+    else:
+        warn(payload["note"])
+
+
 def serve(config: ServeConfig) -> None:
     """Start the app and block until interrupted. See module docstring for
-    what's real vs. not."""
+    what's real vs. not.
+
+    With `--detach`, returns as soon as the app is up (or has failed)
+    instead of blocking — see `_spawn_detached`.
+    """
+    if config.detach and not is_detached_child():
+        # Deliberately before any validation: the child re-runs every
+        # check itself, and duplicating them here would mean two places
+        # to keep in sync and two chances to disagree. A config error
+        # surfaces as a `failed` payload carrying the child's own error
+        # message, which is the same text an attached run would print.
+        app_name = config.name or config.target.resolve().stem or config.target.name
+        raise SystemExit(_spawn_detached(app_name, json_output=config.json_output))
+
     domain_config = _validate_supported(config)
 
     # Resolve to an absolute path up front — the wrapped subprocess runs
@@ -834,6 +1064,14 @@ def serve(config: ServeConfig) -> None:
             f"an app named {app_name!r} is already registered as running — "
             f"`sidepage stop {app_name}` it first, or pass --name for a different one."
         )
+    # The same question as the check above, asked of the one namespace
+    # this machine's registry can't see: the domain's own DNS. Raises
+    # NameCollisionError if the hostname is already pointed somewhere
+    # that isn't this domain's sidepage tunnel. Here rather than at
+    # tunnel-open time so a taken name is reported before a port is
+    # allocated or a subprocess spawned — `open_byo_tunnel` re-checks
+    # anyway, but that happens after the app is already up.
+    _assert_hostname_available(config.no_suffix, app_name, domain_config)
 
     # Checked here, before any port is allocated or subprocess spawned,
     # for the same reason as everything else above: a name already
@@ -889,7 +1127,7 @@ def serve(config: ServeConfig) -> None:
     # the wide-open fallback for this session," not "forgot to compute
     # it."
     if domain_config is not None:
-        routed_name = directory_client.check_name(app_name)
+        routed_name = directory_client.check_name(app_name, suffix=not config.no_suffix)
         public_origin: str | None = f"https://{routed_name}.{domain_config.domain}"
     elif config.anon:
         public_origin = None
@@ -1023,6 +1261,7 @@ def serve(config: ServeConfig) -> None:
             tunnel_id=domain_config.tunnel_id,
             api_token_name=domain_config.api_token_name,
             tunnel_token_name=domain_config.tunnel_token_name,
+            suffix=not config.no_suffix,
         )
         tunnel_url = tunnel.url
 
@@ -1051,6 +1290,24 @@ def serve(config: ServeConfig) -> None:
         )
     )
 
+    if config.json_output:
+        # Emitted at the same instant as the registry entry, so an
+        # attached `--json` run and a `--detach` parent report identical
+        # facts from the same moment. In a detached child this line lands
+        # at the top of the log, which makes the log self-describing.
+        json_line(
+            {
+                "status": "running",
+                "app": app_name,
+                "pid": os.getpid(),
+                "url": tunnel_url or local_url,
+                "local_url": local_url,
+                "tunnel_url": tunnel_url,
+                "auth": config.auth.value,
+                "token": token,
+            }
+        )
+
     success(f"{app_name} serving at {local_url}")
     if launcher is CodeLauncher.FASTAPI:
         info(f"API docs: {local_url}/docs (FastAPI's own Swagger UI — served automatically)")
@@ -1075,7 +1332,9 @@ def serve(config: ServeConfig) -> None:
             info("PWA: use --domain for a permanent install")
     if autoregister_pending:
         _autoregister_commit(config, app_name=app_name, target=target, target_kind=target_kind)
-    info("Ctrl+C to stop")
+    # A detached child has no terminal to Ctrl+C, and this line ends up
+    # in its log where a reader needs the command that actually works.
+    info(f"`sidepage stop {app_name}` to stop" if is_detached_child() else "Ctrl+C to stop")
     if config.qr:
         qr.print_qr(tunnel_url or local_url)
 
@@ -1129,6 +1388,12 @@ def proxy(config: ProxyConfig) -> None:
     (Origin/CSRF, localhost-trust security, OAuth/`--anon`) this prints a
     condensed version of at startup.
     """
+    if config.detach and not is_detached_child():
+        # Same reasoning as `serve`'s branch — validation belongs to the
+        # child alone. `proxy` needs no name resolution: --name is
+        # required by the time a ProxyConfig exists.
+        raise SystemExit(_spawn_detached(config.name, json_output=config.json_output))
+
     domain_config = _validate_common(
         domain=config.domain,
         anon=config.anon,
@@ -1144,6 +1409,9 @@ def proxy(config: ProxyConfig) -> None:
             f"an app named {app_name!r} is already registered as running — "
             f"`sidepage stop {app_name}` it first, or pass --name for a different one."
         )
+    # Same DNS pre-flight as `serve` — `proxy` has no `--no-suffix` of its
+    # own, so always the suffixed form. See `_assert_hostname_available`.
+    _assert_hostname_available(False, app_name, domain_config)
 
     token: str | None = None
     if config.auth is AuthTier.TOKEN:
@@ -1228,6 +1496,21 @@ def proxy(config: ProxyConfig) -> None:
         )
     )
 
+    if config.json_output:
+        json_line(
+            {
+                "status": "running",
+                "app": app_name,
+                "pid": os.getpid(),
+                "url": tunnel_url or local_url,
+                "local_url": local_url,
+                "tunnel_url": tunnel_url,
+                "auth": config.auth.value,
+                "token": token,
+                "upstream_port": config.port,
+            }
+        )
+
     success(f"{app_name} proxying 127.0.0.1:{config.port} -> {local_url}")
     if tunnel_url:
         success(f"public URL: {tunnel_url}")
@@ -1255,7 +1538,9 @@ def proxy(config: ProxyConfig) -> None:
             "--anon: this hostname changes every run — OAuth/SSO redirect URIs can't be "
             "registered against it; use --domain if your app does OAuth login"
         )
-    info("Ctrl+C to stop")
+    # A detached child has no terminal to Ctrl+C, and this line ends up
+    # in its log where a reader needs the command that actually works.
+    info(f"`sidepage stop {app_name}` to stop" if is_detached_child() else "Ctrl+C to stop")
 
     try:
         while True:

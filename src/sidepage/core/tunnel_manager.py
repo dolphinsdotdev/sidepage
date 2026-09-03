@@ -80,7 +80,11 @@ from sidepage.config.settings import (
 )
 from sidepage.core import _platform, registry, secrets_vault
 from sidepage.core.directory_client import check_name
-from sidepage.core.exceptions import CloudflaredResolutionError, TunnelError
+from sidepage.core.exceptions import (
+    CloudflaredResolutionError,
+    NameCollisionError,
+    TunnelError,
+)
 
 _TRYCLOUDFLARE_RE = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
 # Same precedented "eyeball the log for an obvious failure word" pattern
@@ -219,16 +223,105 @@ def _resolve_zone(domain: str, api_token: str) -> tuple[str, str]:
     return zone["id"], zone["account"]["id"]
 
 
-def _upsert_cname_record(zone_id: str, api_token: str, hostname: str, target: str) -> None:
-    """Create or update a proxied CNAME record for `hostname` pointing at
-    `target` (a `<tunnel-id>.cfargotunnel.com` hostname)."""
-    existing = _cf_request(
-        "GET",
-        f"/zones/{zone_id}/dns_records",
-        api_token,
-        params={"name": hostname, "type": "CNAME"},
+def _dns_records_for(zone_id: str, api_token: str, hostname: str) -> list[dict]:
+    """Every DNS record on `hostname`, whatever its type.
+
+    Deliberately unfiltered (the earlier `type=CNAME` filter is gone): an
+    `A` record on the name is every bit as much "this name is taken" as a
+    CNAME is, and a type-filtered lookup would have reported the name free
+    and then failed at record-creation time with a raw Cloudflare error.
+    """
+    data = _cf_request(
+        "GET", f"/zones/{zone_id}/dns_records", api_token, params={"name": hostname}
     )
-    records = existing.get("result") or []
+    return list(data.get("result") or [])
+
+
+def _foreign_records(records: list[dict], cname_target: str) -> list[dict]:
+    """The subset of `records` that isn't this domain's own sidepage
+    route: anything that isn't a CNAME pointing at `cname_target`
+    (`<tunnel-id>.cfargotunnel.com`).
+
+    That single comparison is the whole ownership test, and it holds
+    because a domain's tunnel id is stable for as long as it's configured
+    (`sidepage.core.account.configure_domain` is idempotent and never
+    provisions a second tunnel for the same domain). So a CNAME to our own
+    tunnel means *we* wrote it — this app restarting, and the upsert
+    ahead is a refresh. Anything else means someone else's record, and
+    overwriting it is exactly what must not happen silently.
+
+    The one thing this cannot see is a *different machine* that shares
+    this domain's tunnel token: its records are indistinguishable from
+    ours. `sidepage.core.registry` is per-machine, so nothing on the
+    Cloudflare side distinguishes them either — see
+    `assert_hostname_available`'s docstring for the limit as stated to
+    users.
+    """
+    return [
+        record
+        for record in records
+        if not (record.get("type") == "CNAME" and record.get("content") == cname_target)
+    ]
+
+
+def _assert_hostname_claimable(
+    zone_id: str, api_token: str, hostname: str, cname_target: str, *, suffixed: bool = True
+) -> list[dict]:
+    """Raise `sidepage.core.exceptions.NameCollisionError` if `hostname`
+    already carries a record that isn't sidepage's own route through
+    `cname_target`. Returns the existing records (possibly empty) so a
+    caller that's about to write can reuse them instead of re-fetching.
+
+    Pure read — no side effects — which is what lets `open_byo_tunnel`
+    call it as its first step, before starting the domain's shared
+    `cloudflared` process: a rejected claim then leaves nothing behind to
+    clean up.
+
+    `suffixed` only shapes the error text: "drop `--no-suffix`" is the
+    most useful next step when the dedupe id was opted out of, and
+    nonsense advice when it wasn't.
+    """
+    records = _dns_records_for(zone_id, api_token, hostname)
+    foreign = _foreign_records(records, cname_target)
+    if foreign:
+        _raise_name_taken(hostname, foreign, suffixed=suffixed)
+    return records
+
+
+def _raise_name_taken(hostname: str, foreign: list[dict], *, suffixed: bool) -> None:
+    record = foreign[0]
+    kind = record.get("type", "DNS")
+    content = record.get("content") or "something else"
+    ways_out = ["pick a different --name"]
+    if not suffixed:
+        ways_out.append("drop --no-suffix for the dedupe-suffixed hostname instead")
+    ways_out.append(f"delete the {kind} record for {hostname} in the Cloudflare dashboard")
+    raise NameCollisionError(
+        f"an app with this name already exists: {hostname} is taken — an existing "
+        f"{kind} record points it at {content}, which isn't this domain's sidepage "
+        "tunnel. Serving here would silently repoint it, so sidepage won't.\n"
+        f"To continue: {', or '.join((', '.join(ways_out[:-1]), ways_out[-1]))} "
+        "if it's stale."
+    )
+
+
+def _upsert_cname_record(
+    zone_id: str, api_token: str, hostname: str, target: str, *, suffixed: bool = True
+) -> None:
+    """Create or update a proxied CNAME record for `hostname` pointing at
+    `target` (a `<tunnel-id>.cfargotunnel.com` hostname).
+
+    Refuses to touch a record it doesn't recognize as its own
+    (`_foreign_records`), raising
+    `sidepage.core.exceptions.NameCollisionError` instead. This is the
+    un-bypassable half of that check — `assert_hostname_available` runs
+    the same test earlier, before `serve` launches anything, but every
+    path that would actually overwrite a record goes through here, so the
+    guard lives here too rather than only at the polite pre-flight.
+    """
+    records = _assert_hostname_claimable(
+        zone_id, api_token, hostname, target, suffixed=suffixed
+    )
     body = {"type": "CNAME", "name": hostname, "content": target, "proxied": True, "ttl": 1}
     if records:
         record_path = f"/zones/{zone_id}/dns_records/{records[0]['id']}"
@@ -453,6 +546,45 @@ def open_brokered_tunnel(app_name: str) -> TunnelHandle:
     raise NotImplementedError
 
 
+def assert_hostname_available(
+    app_name: str,
+    domain: str,
+    *,
+    zone_id: str,
+    tunnel_id: str,
+    api_token_name: str,
+    suffix: bool = True,
+) -> str:
+    """Pre-flight the hostname `app_name` would be routed at on `domain`,
+    raising `sidepage.core.exceptions.NameCollisionError` if the zone
+    already has a record for it that isn't this domain's own sidepage
+    route. Returns the hostname when it's claimable.
+
+    Called by `sidepage.core.process.serve`/`proxy` **before** a port is
+    allocated or anything is launched, so "that name is taken" arrives
+    like every other early validation error rather than after a slow app
+    boot. `open_byo_tunnel` re-checks at claim time (via
+    `_upsert_cname_record`), which is what actually makes the guarantee —
+    this is the early, friendly report of the same test.
+
+    **What it can't see**, stated plainly because the guarantee is
+    narrower than "no two apps can ever share a name": DNS is the only
+    authority available here, so this catches a name taken by a record
+    pointing anywhere *else* — another tunnel, an A record, a parked page.
+    It does not catch a second machine that shares this exact domain
+    config (same tunnel token): its records point at the same tunnel and
+    are indistinguishable from this machine's own. Nor can it stop a race
+    between two `serve` calls started at the same instant on different
+    machines — `_domain_lock` is per-machine.
+    """
+    api_token = secrets_vault.get_secret(api_token_name)
+    hostname = f"{check_name(app_name, suffix=suffix)}.{domain}"
+    _assert_hostname_claimable(
+        zone_id, api_token, hostname, f"{tunnel_id}.cfargotunnel.com", suffixed=suffix
+    )
+    return hostname
+
+
 def open_byo_tunnel(
     app_name: str,
     domain: str,
@@ -463,6 +595,7 @@ def open_byo_tunnel(
     tunnel_id: str,
     api_token_name: str,
     tunnel_token_name: str,
+    suffix: bool = True,
 ) -> TunnelHandle:
     """Route `app_name` through the domain's already-provisioned tunnel
     (`sidepage account domain set` must have run first — see
@@ -475,34 +608,58 @@ def open_byo_tunnel(
     `configure_domain` stored automatically at provisioning time.
 
     The hostname actually routed is `<app-name>-<id>.<domain>` (see
-    `sidepage.core.directory_client.check_name` for the stable `<id>`).
+    `sidepage.core.directory_client.check_name` for the stable `<id>`),
+    or a bare `<app-name>.<domain>` with `suffix=False` (`serve
+    --no-suffix`). Everything below is identical either way — the CNAME
+    upsert and the ingress rule are keyed on whatever hostname comes out,
+    and both are already idempotent per hostname, so an unsuffixed name
+    simply replaces its own previous route the way a suffixed one does.
+
+    A name held by someone *else* is refused, not overwritten: step 3
+    below raises `sidepage.core.exceptions.NameCollisionError` when the
+    zone already has a record for the hostname that isn't a CNAME to this
+    domain's tunnel. That check is what makes `suffix=False` safe enough
+    to offer — the dedupe id used to be the only thing standing between
+    two apps and one hostname; now DNS is asked directly. See
+    `assert_hostname_available` for what it still can't see (another
+    machine sharing this domain's tunnel token).
 
     Real, in order, all under `_domain_lock(domain)` so it can't race a
     concurrent `serve`/`stop` on the same domain:
       1. Resolve both secrets from the vault (raises
          `sidepage.core.exceptions.SecretNotFoundError` if either name
          isn't there).
-      2. Ensure the domain's shared `cloudflared` process is running,
+      2. Refuse the hostname outright if the zone already has a record for
+         it that isn't sidepage's own (`_assert_hostname_claimable` —
+         `NameCollisionError`). First because it's a pure read: a rejected
+         claim must not have started a `cloudflared` process it will never
+         tear down.
+      3. Ensure the domain's shared `cloudflared` process is running,
          starting it if this is the first app using this domain
          (`_ensure_shared_tunnel_running`).
-      3. Create or update a proxied CNAME record for the routed hostname.
-      4. Add (or replace) this hostname's ingress rule on the shared
+      4. Create or update the proxied CNAME record for the routed
+         hostname. `_upsert_cname_record` re-runs step 2's test itself —
+         it's the call that would do the overwriting, so the guard lives
+         there too rather than depending on callers to ask first.
+      5. Add (or replace) this hostname's ingress rule on the shared
          tunnel via GET-modify-PUT (`_upsert_ingress_rule`) — no restart
          of `cloudflared` needed, it picks up remotely-managed config
          changes on its own.
 
     Raises `TunnelError` for a Cloudflare API error or `cloudflared`
-    exiting immediately on first start.
+    exiting immediately on first start, and `NameCollisionError` for a
+    hostname held by someone else.
     """
     api_token = secrets_vault.get_secret(api_token_name)
     tunnel_token = secrets_vault.get_secret(tunnel_token_name)
 
-    hostname = f"{check_name(app_name)}.{domain}"
+    hostname = f"{check_name(app_name, suffix=suffix)}.{domain}"
     cname_target = f"{tunnel_id}.cfargotunnel.com"
 
     with _domain_lock(domain):
+        _assert_hostname_claimable(zone_id, api_token, hostname, cname_target, suffixed=suffix)
         _ensure_shared_tunnel_running(domain, tunnel_token)
-        _upsert_cname_record(zone_id, api_token, hostname, cname_target)
+        _upsert_cname_record(zone_id, api_token, hostname, cname_target, suffixed=suffix)
         _upsert_ingress_rule(
             account_id, tunnel_id, api_token, hostname, f"http://127.0.0.1:{listen_port}"
         )

@@ -91,7 +91,7 @@ from sidepage.core.process import serve as core_serve
 from sidepage.core.process import stop as core_stop
 from sidepage.core.pwa import PwaDisplay, PwaOptions
 from sidepage.core.target import TargetKind
-from sidepage.output import error, not_implemented, plain, warn
+from sidepage.output import error, not_implemented, plain, set_json_mode, warn
 
 
 def _require_source_trust(
@@ -261,7 +261,7 @@ def serve(
         str | None,
         typer.Option(
             "--name",
-            help="Human-legible prefix; a dedupe suffix is appended.",
+            help="Human-legible prefix; a dedupe suffix is appended unless --no-suffix.",
         ),
     ] = None,
     domain: Annotated[
@@ -269,10 +269,20 @@ def serve(
         typer.Option(
             "--domain",
             help="Bring-your-own-domain. Must match the domain already configured via "
-            "`sidepage account domain set`; served at <app-name>-<id>.<domain>. Default with "
+            "`sidepage account domain set`; served at <app-name>-<id>.<domain>, or a bare "
+            "<app-name>.<domain> with --no-suffix. Default with "
             "neither --domain nor --anon is local-only (no brokered tunnel — no backend exists).",
         ),
     ] = None,
+    no_suffix: Annotated[
+        bool,
+        typer.Option(
+            "--no-suffix",
+            help="Serve at a bare <app-name>.<domain> instead of <app-name>-<id>.<domain>. "
+            "--domain only. Fails loud if the zone already points that name somewhere "
+            "that isn't this domain's sidepage tunnel.",
+        ),
+    ] = False,
     auth: Annotated[
         AuthTier,
         typer.Option(
@@ -409,9 +419,30 @@ def serve(
             "registry doesn't store are listed explicitly rather than dropped silently.",
         ),
     ] = False,
+    detach: Annotated[
+        bool,
+        typer.Option(
+            "--detach",
+            "-d",
+            help="Start in the background and return once the app is actually serving "
+            "(or has failed), instead of blocking. Output is written to a log file whose "
+            "path is reported. Stop it with `sidepage stop <app-name>`.",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print one line of JSON to stdout describing the running app (url, pid, "
+            "auth, token). Human-readable output moves to stderr, so stdout stays "
+            "parseable. Works with or without --detach.",
+        ),
+    ] = False,
 ) -> None:
-    """Serve a target and expose it through a tunnel. Blocks the terminal;
-    Ctrl+C tears the tunnel down immediately."""
+    """Serve a target and expose it through a tunnel. Blocks the terminal
+    unless `--detach` is passed; Ctrl+C tears the tunnel down immediately."""
+    if json_output:
+        set_json_mode(True)
     try:
         peers = tuple(_parse_peer(p) for p in (peer or ()))
     except ValueError as exc:
@@ -474,6 +505,7 @@ def serve(
             auth=auth,
             scope=scope,
             anon=anon,
+            no_suffix=no_suffix,
             token=token,
             env_secrets=tuple(env or ()),
             guardrail=guardrail,
@@ -483,6 +515,8 @@ def serve(
             pwa=pwa_options,
             qr=qr,
             autoregister=autoregister,
+            detach=detach,
+            json_output=json_output,
         )
     else:
         # Before anything else in this branch: if this app's code was
@@ -503,6 +537,7 @@ def serve(
             auth=auth,
             scope=scope,
             anon=anon,
+            no_suffix=no_suffix,
             env=list(env or ()),
             guardrail=guardrail,
             pwa=pwa_options,
@@ -523,6 +558,8 @@ def serve(
             peers=peers,
             qr=qr,
             autoregister=autoregister,
+            detach=detach,
+            json_output=json_output,
             **merged,  # includes `pwa` — merged, not taken from this invocation unconditionally
         )
     try:

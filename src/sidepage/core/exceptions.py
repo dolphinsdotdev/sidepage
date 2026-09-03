@@ -24,10 +24,19 @@ class DirectoryError(SidepageError):
 
 
 class NameCollisionError(DirectoryError):
-    """Raised internally when assigning the `<app-name>-<4-char-id>` suffix
-    at `serve` time hits an already-taken fully-qualified name (practically
-    unlikely, per §3's 4-char dedupe suffix). No longer surfaced through a
-    standalone preview command — see `sidepage.core.directory_client.check_name`.
+    """A `serve`/`proxy` invocation's fully-qualified name is already taken
+    by something that isn't this app.
+
+    Real, and raised for BYO-domain hostnames by
+    `sidepage.core.tunnel_manager.assert_hostname_available` (pre-flight)
+    and `_upsert_cname_record` (at claim time). With no directory service
+    to ask, **the zone's own DNS records are the authority**: a record for
+    the hostname that isn't a CNAME to this domain's sidepage tunnel means
+    someone else owns the name, and claiming it would silently repoint
+    them. Practically unlikely for the default `<app-name>-<4-char-id>`
+    form (§3's dedupe suffix is exactly what makes it unlikely), and the
+    expected failure for `serve --no-suffix`, which trades that suffix
+    away for a bare `<app-name>.<domain>`.
     """
 
 

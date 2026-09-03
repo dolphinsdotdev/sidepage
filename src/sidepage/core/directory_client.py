@@ -2,7 +2,10 @@
 `sidepage ls`, and `sidepage status` (spec v3 §3, §5, §10).
 
 Naming model (§3): `<app-name>-<4-char-id>.<domain>.<tld>` — collision-proof
-by construction, human prefix kept for legibility. The directory entry is
+by construction, human prefix kept for legibility. `serve --no-suffix`
+opts out of the id for BYO-domain apps only (see `check_name`), trading
+that guarantee for a bare `<app-name>.<domain>` on a zone the user
+already owns. The directory entry is
 the identity root for a named app: owner, creation time, scope, and
 teardown/health status all live there, not just DNS.
 
@@ -79,7 +82,7 @@ def _save_bindings(bindings: dict[str, str]) -> None:
     name_bindings_file().write_text(json.dumps(bindings))
 
 
-def check_name(app_name: str) -> str:
+def check_name(app_name: str, *, suffix: bool = True) -> str:
     """Assign (or look up a previously-assigned) `<app-name>-<4-char-id>`
     for `app_name`. Called internally by `sidepage.core.tunnel_manager.open_byo_tunnel`
     when building the hostname to route — not exposed as its own CLI
@@ -87,7 +90,21 @@ def check_name(app_name: str) -> str:
 
     The id is generated once per `app_name` and persisted locally, so
     repeated `serve` calls for the same app name get the same hostname
-    (and don't need a new DNS record each time)."""
+    (and don't need a new DNS record each time).
+
+    `suffix=False` (`serve --no-suffix`, BYO-domain only) returns
+    `app_name` unchanged: on a domain the user owns, the whole point of
+    the dedupe id — collision-proofing a shared namespace — is something
+    they may reasonably not want, because they'd rather have
+    `app.example.com` than `app-a1b2.example.com` and they're the only
+    one assigning names in that zone. Nothing is read or written to the
+    bindings file in that case: the mapping is only meaningful for the
+    suffixed form, and an app that never uses its id shouldn't burn one
+    (or, worse, have a stored id silently reappear if `--no-suffix` is
+    later dropped from the invocation — it just uses the same id it
+    always would have)."""
+    if not suffix:
+        return app_name
     bindings = _load_bindings()
     suffix = bindings.get(app_name)
     if suffix is None:

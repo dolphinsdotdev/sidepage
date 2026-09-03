@@ -176,6 +176,24 @@ def test_serve_domain_and_anon_mutually_exclusive() -> None:
     assert "mutually exclusive" in result.output
 
 
+def test_serve_no_suffix_without_domain_rejected() -> None:
+    """--no-suffix only means anything for a BYO-domain hostname — without
+    --domain there's no hostname to shorten, so it's rejected up front
+    rather than silently accepted and ignored."""
+    result = runner.invoke(app, ["serve", "definitely-does-not-exist.py", "--no-suffix"])
+    assert result.exit_code == 1, result.output
+    assert "--no-suffix only applies to --domain" in _flat(result.output)
+
+
+def test_serve_no_suffix_with_anon_rejected() -> None:
+    """--anon can't be combined with --domain, so --no-suffix + --anon is
+    rejected for the same reason as --no-suffix alone: Cloudflare assigns
+    the Quick Tunnel hostname, not sidepage."""
+    result = runner.invoke(app, ["serve", "definitely-does-not-exist.py", "--anon", "--no-suffix"])
+    assert result.exit_code == 1, result.output
+    assert "--no-suffix only applies to --domain" in _flat(result.output)
+
+
 def test_serve_non_local_scope_rejected() -> None:
     result = runner.invoke(
         app, ["serve", "definitely-does-not-exist.py", "--scope", "web"]

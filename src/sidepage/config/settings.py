@@ -115,6 +115,22 @@ def tunnel_pid_file(domain: str) -> Path:
     return tunnels_dir() / f"{domain}.pid"
 
 
+# --- Detached app logs — real, used by sidepage.core.process for
+# `serve`/`proxy --detach`. A detached child outlives the parent that
+# spawned it and has no terminal to write to, so its stdout/stderr are
+# redirected here for the same reason `tunnel_log_file` exists: an unread
+# pipe eventually blocks the writer, and a real file is the only thing
+# left to inspect when a detached app fails after the parent has already
+# exited. The path is reported in the parent's own output so the caller
+# never has to guess where it went. ---
+def logs_dir() -> Path:
+    return state_dir() / "logs"
+
+
+def app_log_file(app_name: str) -> Path:
+    return logs_dir() / f"{app_name}.log"
+
+
 # --- Generated launch wrapper modules — real, used by
 # sidepage.core.process for the launchers that can't be started from a
 # bare `<module>:<attr>` import string (MCP, Gradio). Previously written
@@ -197,5 +213,6 @@ def ensure_dirs() -> None:
         runtime_dir(),
         tunnels_dir(),
         wrappers_dir(),
+        logs_dir(),
     ):
         d.mkdir(parents=True, exist_ok=True, mode=0o700)

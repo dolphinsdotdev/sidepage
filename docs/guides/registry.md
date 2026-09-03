@@ -69,7 +69,7 @@ warning --autoregister won't save --timeout, --qr — `sidepage serve dash`
 
 | Flag | Stored? | Why |
 |---|---|---|
-| `--type`, `--name`, `--domain`, `--auth`, `--scope`, `--anon`, `--env` | Yes | Describe what the app is and how it's reached |
+| `--type`, `--name`, `--domain`, `--no-suffix`, `--auth`, `--scope`, `--anon`, `--env` | Yes | Describe what the app is and how it's reached |
 | `--pwa`, `--pwa-*` | Yes | An installed app's name, icon, and theme are part of its identity — a saved config that dropped them wouldn't reproduce the app it was saved from |
 | `--timeout`, `--idle-timeout`, `--peer`, `--qr` | No | Describe how *one run* behaves, not what the app is |
 | `--token` | Never | Process-scoped secret, reissued every run |

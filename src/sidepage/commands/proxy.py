@@ -35,7 +35,7 @@ from sidepage.core.auth import AuthTier
 from sidepage.core.directory_client import Scope
 from sidepage.core.process import ProxyConfig
 from sidepage.core.process import proxy as core_proxy
-from sidepage.output import error
+from sidepage.output import error, set_json_mode
 
 
 def proxy(
@@ -101,6 +101,24 @@ def proxy(
             "message; torn down automatically once no traffic arrives within this window.",
         ),
     ] = None,
+    detach: Annotated[
+        bool,
+        typer.Option(
+            "--detach",
+            "-d",
+            help="Start in the background and return once the proxy is up (or has failed), "
+            "instead of blocking. Output goes to a log file whose path is reported. Stop it "
+            "with `sidepage stop <app-name>` — which does not stop the service on --port.",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="Print one line of JSON to stdout describing the running proxy. "
+            "Human-readable output moves to stderr. Works with or without --detach.",
+        ),
+    ] = False,
     target_type: Annotated[
         str | None,
         typer.Option(
@@ -192,6 +210,8 @@ def proxy(
     or gRPC won't work through this command.
 
     """
+    if json_output:
+        set_json_mode(True)
     if target_type is not None:
         error(
             "--type doesn't apply to `proxy` — there's no file to detect a type from; "
@@ -247,6 +267,8 @@ def proxy(
         token=token,
         timeout=timeout,
         idle_timeout=idle_timeout,
+        detach=detach,
+        json_output=json_output,
     )
     try:
         core_proxy(config)

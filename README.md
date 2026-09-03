@@ -139,7 +139,7 @@ Two things sit between "just run a script" and what `serve` does:
 
 ```bash
 sidepage serve <target> [--type auto|code|static|notebook] [--name <app-name>]
-               [--auth open|token] [--anon | --domain <domain>]
+               [--auth open|token] [--anon | --domain <domain>] [--no-suffix]
                [--token <value>] [--env <SECRET_NAME>]...
                [--timeout <seconds>] [--idle-timeout <seconds>]
                [--peer <role>=<app-name>]...
@@ -171,6 +171,9 @@ sidepage serve <target> [--type auto|code|static|notebook] [--name <app-name>]
   the wrapped process's environment. Fails loud if the name isn't stored.
 - `--anon` / `--domain` are mutually exclusive — see [How it
   works](#how-it-works).
+- `--no-suffix` — `--domain` only; serve at a bare `<app-name>.<domain>`
+  instead of `<app-name>-<id>.<domain>`. See [Bring your own
+  domain](#bring-your-own-domain).
 - `--timeout <seconds>` / `--idle-timeout <seconds>` — auto-teardown; see
   [Timeouts, lazy start, and peers](#timeouts-lazy-start-and-peers) below.
 - `--peer <role>=<app-name>` — repeatable; wire one served app to
@@ -361,18 +364,63 @@ sidepage serve app.py --domain example.com
 
 One-time setup needs a scoped Cloudflare API token; every app served
 under the same domain then shares that one Cloudflare Tunnel — no new
-resources or tokens per app. Token scopes and the shared-tunnel model are
+resources or tokens per app.
+
+Apps land at `<app-name>-<id>.example.com`, where `<id>` is a stable
+4-char dedupe suffix. On a domain you own, `--no-suffix` drops it:
+
+```bash
+sidepage serve app.py --domain example.com --name docs --no-suffix
+# https://docs.example.com
+```
+
+Either way, a hostname the zone already points somewhere else is refused
+(`an app with this name already exists`) rather than silently repointed.
+Token scopes, the shared-tunnel model, and the limits of that check are
 in [`docs/guides/byo-domain.md`](docs/guides/byo-domain.md).
 
 ## For agents and harnesses
 
-[`skills/sidepage-serve/`](skills/sidepage-serve/) is a packaged [Claude
-Skill](https://docs.claude.com/en/docs/claude-code/skills) that teaches an
-agent to drive `sidepage serve`/`sidepage proxy` safely — most importantly,
-how to background them and get structured JSON back instead of hanging,
-since neither command has a daemon mode and both block until Ctrl+C or
-`sidepage stop`. Copy or symlink that directory into wherever your harness
-looks for skills (e.g. `~/.claude/skills/`).
+`serve` and `proxy` block by default, which is right for a terminal and
+wrong for anything automated. Pass **`--detach --json`** and they return
+as soon as the app is genuinely serving — or has definitively failed —
+with one parseable line on stdout:
+
+```bash
+sidepage serve app.py --name demo --anon --detach --json
+```
+
+```json
+{"status":"running","app":"demo","pid":12345,"url":"https://random-words.trycloudflare.com","local_url":"http://127.0.0.1:8501","tunnel_url":"https://random-words.trycloudflare.com","log":"~/.local/state/sidepage/logs/demo.log"}
+```
+
+Readiness is the registry entry the serving process writes once the port,
+subprocess, and tunnel are all up — not a URL-shaped string spotted in a
+log — so `"running"` means serving. A failed launch reports the real
+error and exits 1. Every human-readable line moves to stderr under
+`--json`, so stdout pipes straight into a parser. Stop it with `sidepage
+stop <app-name>`.
+
+### Claude Code plugin
+
+This repo is also a [plugin
+marketplace](https://code.claude.com/docs/en/plugin-marketplaces). In
+Claude Code:
+
+```
+/plugin marketplace add kalpi-4/sidepage
+```
+
+then `/plugin install sidepage@sidepage`. That installs
+[`plugin/skills/sidepage-serve/`](plugin/skills/sidepage-serve/), a
+[Skill](https://code.claude.com/docs/en/skills) teaching an agent when to
+reach for `serve` vs `proxy`, which flags matter, and the caveats worth
+surfacing before pointing a tunnel at something. It bundles no
+executables — the CLI does the work — so it also installs cleanly under
+organization settings. `claude plugin update sidepage` upgrades it.
+
+For any other harness, copy or symlink `plugin/skills/sidepage-serve/`
+into wherever it looks for skills (e.g. `~/.claude/skills/`).
 
 ## Development
 

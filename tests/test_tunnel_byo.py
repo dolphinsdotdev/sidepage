@@ -32,7 +32,7 @@ import pytest
 
 from sidepage.core import _platform as _real_platform
 from sidepage.core import registry, secrets_vault, tunnel_manager
-from sidepage.core.exceptions import TunnelError
+from sidepage.core.exceptions import NameCollisionError, TunnelError
 from sidepage.core.tunnel_manager import decode_tunnel_token
 
 # Captured before any test monkeypatches httpx.Client — every fake client
@@ -304,7 +304,13 @@ def test_provision_byo_domain_missing_zone_raises(
 
 
 def _open(
-    transport: _StatefulCloudflareTransport, provisioned, app_name: str, port: int, *, domain: str
+    transport: _StatefulCloudflareTransport,
+    provisioned,
+    app_name: str,
+    port: int,
+    *,
+    domain: str,
+    suffix: bool = True,
 ) -> tunnel_manager.TunnelHandle:
     return tunnel_manager.open_byo_tunnel(
         app_name,
@@ -315,6 +321,7 @@ def _open(
         tunnel_id=provisioned.tunnel_id,
         api_token_name=f"api-tok-{domain}",
         tunnel_token_name=f"tunnel-tok-{domain}",
+        suffix=suffix,
     )
 
 
@@ -384,6 +391,227 @@ def test_open_byo_tunnel_two_apps_share_one_ingress_config(
     hostnames = {r["hostname"] for r in ingress if "hostname" in r}
     assert hostnames == {h1.hostname, h2.hostname}
     assert ingress[-1] == {"service": "http_status:404"}
+
+
+def test_open_byo_tunnel_no_suffix_routes_bare_hostname(
+    sidepage_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`serve --no-suffix`: the routed hostname is `<app>.<domain>` exactly,
+    with the CNAME and ingress rule keyed on that same bare name."""
+    transport, provisioned = _provision(monkeypatch)
+
+    handle = _open(transport, provisioned, "myapp", 4321, domain="example.com", suffix=False)
+
+    assert handle.hostname == "myapp.example.com"
+    assert handle.url == "https://myapp.example.com"
+    assert "myapp.example.com" in transport.dns_records
+
+    ingress = transport.tunnels[provisioned.tunnel_id]["ingress"]
+    assert {"hostname": "myapp.example.com", "service": "http://127.0.0.1:4321"} in ingress
+    assert ingress[-1] == {"service": "http_status:404"}
+
+
+def test_open_byo_tunnel_no_suffix_leaves_name_binding_unassigned(
+    sidepage_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unsuffixed app never consumes a dedupe id — so dropping
+    `--no-suffix` later gives it the id it would have had all along,
+    rather than one silently burned by an earlier unsuffixed run."""
+    from sidepage.config.settings import name_bindings_file
+
+    transport, provisioned = _provision(monkeypatch)
+    _open(transport, provisioned, "bareapp", 4321, domain="example.com", suffix=False)
+    assert not name_bindings_file().exists()
+
+    suffixed = _open(transport, provisioned, "bareapp", 4321, domain="example.com")
+    assert suffixed.hostname != "bareapp.example.com"
+    assert suffixed.hostname.startswith("bareapp-")
+
+
+def test_open_byo_tunnel_suffixed_and_bare_names_coexist(
+    sidepage_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two apps on one domain, one unsuffixed — neither upsert wipes the
+    other's rule, same GET-modify-PUT contract as two suffixed apps."""
+    transport, provisioned = _provision(monkeypatch)
+    bare = _open(transport, provisioned, "app-one", 5001, domain="example.com", suffix=False)
+    suffixed = _open(transport, provisioned, "app-two", 5002, domain="example.com")
+
+    ingress = transport.tunnels[provisioned.tunnel_id]["ingress"]
+    hostnames = {r["hostname"] for r in ingress if "hostname" in r}
+    assert hostnames == {"app-one.example.com", suffixed.hostname}
+    assert bare.hostname == "app-one.example.com"
+    assert ingress[-1] == {"service": "http_status:404"}
+
+
+# --- name collisions: DNS is the authority, and it's checked before claiming ---
+
+
+def _seed_foreign_record(transport, hostname: str, **overrides) -> dict:
+    """A DNS record on `hostname` that sidepage didn't write — the thing a
+    collision check has to notice and refuse to overwrite."""
+    record = {
+        "id": "rec-foreign",
+        "type": "CNAME",
+        "name": hostname,
+        "content": "someone-elses-tunnel.cfargotunnel.com",
+        **overrides,
+    }
+    transport.dns_records[hostname] = record
+    return record
+
+
+def _available(provisioned, app_name: str, *, domain: str, suffix: bool = True) -> str:
+    return tunnel_manager.assert_hostname_available(
+        app_name,
+        domain,
+        zone_id=provisioned.zone_id,
+        tunnel_id=provisioned.tunnel_id,
+        api_token_name=f"api-tok-{domain}",
+        suffix=suffix,
+    )
+
+
+def test_open_byo_tunnel_refuses_a_hostname_pointed_somewhere_else(
+    sidepage_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CNAME on the name that points at a *different* tunnel isn't ours
+    to take — claiming it would silently repoint whoever owns it."""
+    transport, provisioned = _provision(monkeypatch)
+    _seed_foreign_record(transport, "docs.example.com")
+
+    with pytest.raises(NameCollisionError, match="already exists"):
+        _open(transport, provisioned, "docs", 4321, domain="example.com", suffix=False)
+
+    # The foreign record is intact and no route was added for it.
+    assert transport.dns_records["docs.example.com"]["id"] == "rec-foreign"
+    assert transport.dns_records["docs.example.com"]["content"].startswith("someone-elses")
+    ingress = transport.tunnels[provisioned.tunnel_id]["ingress"]
+    assert not [r for r in ingress if r.get("hostname") == "docs.example.com"]
+
+
+def test_refused_claim_does_not_start_the_shared_cloudflared_process(
+    sidepage_home: Path, monkeypatch: pytest.MonkeyPatch, pid_tracker: _PidTracker
+) -> None:
+    """The claim check runs before the shared process is started, so a
+    rejected name leaves no `cloudflared` behind that nothing will ever
+    tear down."""
+    transport, provisioned = _provision(monkeypatch)
+    _seed_foreign_record(transport, "docs.example.com")
+
+    spawned = []
+    real_popen = subprocess.Popen
+
+    def counting_popen(*a, **k):
+        proc = real_popen(*a, **k)
+        spawned.append(proc)
+        pid_tracker.alive.add(proc.pid)
+        return proc
+
+    monkeypatch.setattr(subprocess, "Popen", counting_popen)
+
+    with pytest.raises(NameCollisionError):
+        _open(transport, provisioned, "docs", 4321, domain="example.com", suffix=False)
+
+    assert spawned == []
+
+
+def test_open_byo_tunnel_refuses_a_hostname_held_by_a_non_cname_record(
+    sidepage_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An A record holds the name just as firmly as a CNAME does — the
+    lookup is deliberately not type-filtered."""
+    transport, provisioned = _provision(monkeypatch)
+    _seed_foreign_record(transport, "docs.example.com", type="A", content="203.0.113.7")
+
+    with pytest.raises(NameCollisionError, match="203.0.113.7"):
+        _open(transport, provisioned, "docs", 4321, domain="example.com", suffix=False)
+
+
+def test_open_byo_tunnel_accepts_its_own_record_on_restart(
+    sidepage_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The ownership test is "CNAME to *this* domain's tunnel" — so an app
+    restarting onto the record it wrote last time is not a collision."""
+    transport, provisioned = _provision(monkeypatch)
+    first = _open(transport, provisioned, "docs", 4321, domain="example.com", suffix=False)
+    second = _open(transport, provisioned, "docs", 5555, domain="example.com", suffix=False)
+
+    assert first.hostname == second.hostname == "docs.example.com"
+    ingress = transport.tunnels[provisioned.tunnel_id]["ingress"]
+    assert {"hostname": "docs.example.com", "service": "http://127.0.0.1:5555"} in ingress
+
+
+def test_suffixed_hostname_collision_is_caught_too(
+    sidepage_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Not a `--no-suffix`-only guard: a suffixed `<app>-<id>` name that
+    somehow already exists (a stale record, or an unsuffixed app that
+    happens to be named exactly that) is refused on the same test."""
+    from sidepage.core.directory_client import check_name
+
+    transport, provisioned = _provision(monkeypatch)
+    routed = check_name("myapp")  # assigns and persists the id serve would use
+    _seed_foreign_record(transport, f"{routed}.example.com")
+
+    with pytest.raises(NameCollisionError, match=routed):
+        _open(transport, provisioned, "myapp", 4321, domain="example.com")
+
+
+def test_collision_message_only_suggests_dropping_no_suffix_when_it_was_used(
+    sidepage_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """"Drop --no-suffix" is the most useful next step for an unsuffixed
+    collision and nonsense advice for a suffixed one, so the message says
+    it only in the first case."""
+    from sidepage.core.directory_client import check_name
+
+    transport, provisioned = _provision(monkeypatch)
+    _seed_foreign_record(transport, "docs.example.com")
+    _seed_foreign_record(transport, f"{check_name('myapp')}.example.com")
+
+    with pytest.raises(NameCollisionError) as unsuffixed:
+        _open(transport, provisioned, "docs", 4321, domain="example.com", suffix=False)
+    assert "drop --no-suffix" in str(unsuffixed.value)
+
+    with pytest.raises(NameCollisionError) as suffixed:
+        _open(transport, provisioned, "myapp", 4321, domain="example.com")
+    assert "--no-suffix" not in str(suffixed.value)
+    assert "pick a different --name" in str(suffixed.value)
+
+
+def test_assert_hostname_available_returns_the_hostname_when_free(
+    sidepage_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, provisioned = _provision(monkeypatch)
+    assert _available(provisioned, "docs", domain="example.com", suffix=False) == "docs.example.com"
+
+
+def test_assert_hostname_available_raises_before_anything_is_written(
+    sidepage_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-flight `serve` runs before allocating a port or launching:
+    it must report the collision without mutating DNS or ingress."""
+    transport, provisioned = _provision(monkeypatch)
+    _seed_foreign_record(transport, "docs.example.com")
+
+    with pytest.raises(NameCollisionError):
+        _available(provisioned, "docs", domain="example.com", suffix=False)
+
+    assert transport.dns_records["docs.example.com"]["id"] == "rec-foreign"
+    assert transport.tunnels[provisioned.tunnel_id]["ingress"] == []
+
+
+def test_assert_hostname_available_ignores_a_free_name_on_a_busy_domain(
+    sidepage_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Other apps' records on the same domain are none of this name's
+    business — the lookup is per-hostname, not per-zone."""
+    transport, provisioned = _provision(monkeypatch)
+    _open(transport, provisioned, "other-app", 5001, domain="example.com")
+    _seed_foreign_record(transport, "unrelated.example.com")
+
+    assert _available(provisioned, "docs", domain="example.com", suffix=False) == "docs.example.com"
 
 
 # --- shared cloudflared process: spawned once, killed only when unused ---

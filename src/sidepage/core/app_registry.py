@@ -113,6 +113,11 @@ class AppRegistration:
     env_secrets: tuple[str, ...]
     guardrail: Path | None
     registered_at: str  # ISO 8601, UTC, "...Z" suffix
+    # `--no-suffix` — stored for the same reason `domain` is: it decides
+    # the hostname the app answers on (`<app-name>.<domain>` rather than
+    # `<app-name>-<id>.<domain>`), so a saved config that dropped it
+    # would replay at a different URL than the one it was saved from.
+    no_suffix: bool = False
     # `--pwa`/`--pwa-*` as one unit, or None when PWA mode is off. Stored
     # (unlike `--timeout`/`--idle-timeout`/`--peer`/`--qr`, which stay
     # per-invocation) because PWA settings change what the served app
@@ -213,6 +218,7 @@ def _to_json(r: AppRegistration) -> dict:
         "auth": r.auth.value,
         "scope": r.scope.value,
         "anon": r.anon,
+        "no_suffix": r.no_suffix,
         "env": list(r.env_secrets),
         "guardrail": str(r.guardrail) if r.guardrail is not None else None,
         "pwa": _pwa_to_json(r.pwa),
@@ -230,6 +236,10 @@ def _from_json(data: dict) -> AppRegistration:
         auth=AuthTier(data["auth"]),
         scope=Scope(data["scope"]),
         anon=data.get("anon", False),
+        # `.get` for the same reason as `pwa` below: entries written
+        # before `--no-suffix` existed are valid registrations with it
+        # off, not corrupt ones.
+        no_suffix=data.get("no_suffix", False),
         env_secrets=tuple(data.get("env") or ()),
         guardrail=Path(data["guardrail"]) if data.get("guardrail") else None,
         # `.get`, not `["pwa"]` — entries written before PWA became a
@@ -294,6 +304,7 @@ def register(
     anon: bool,
     env_secrets: tuple[str, ...],
     guardrail: Path | None,
+    no_suffix: bool = False,
     pwa: PwaOptions | None = None,
     source: AppSource | None = None,
     replace_existing: bool = False,
@@ -337,6 +348,7 @@ def register(
         auth=auth,
         scope=scope,
         anon=anon,
+        no_suffix=no_suffix,
         env_secrets=env_secrets,
         guardrail=guardrail,
         pwa=pwa,

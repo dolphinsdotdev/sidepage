@@ -157,6 +157,28 @@ def test_preflight_tolerates_a_registration_saved_without_an_explicit_name(
     )
 
 
+def test_preflight_treats_no_suffix_as_part_of_the_config(sidepage_home: Path) -> None:
+    """`--no-suffix` decides the hostname the app answers on, so a stored
+    entry without it isn't the same config as an invocation with it —
+    autoregister must report the conflict rather than reuse the entry."""
+    target = (FIXTURES / "static-site").resolve()
+    _register_static("suffixed", target)
+    with pytest.raises(ValueError, match="already registered with a different config"):
+        _autoregister_preflight(
+            _config(target, no_suffix=True),
+            app_name="suffixed",
+            target=target,
+            target_kind=TargetKind.STATIC,
+        )
+
+
+def test_no_suffix_is_not_reported_as_unregisterable() -> None:
+    """Unlike `--timeout`/`--qr`/`--peer`, `--no-suffix` is stored — it
+    must not show up in the "won't be saved" warning."""
+    target = FIXTURES / "static-site"
+    assert _unregisterable_flags_in_use(_config(target, no_suffix=True)) == []
+
+
 # --- unregisterable flags are reported, never silently dropped ---
 
 
