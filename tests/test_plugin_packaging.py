@@ -11,8 +11,12 @@ checked from the file tree alone.
 from __future__ import annotations
 
 import json
+import re
+import subprocess
 import tomllib
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).parent.parent
 MARKETPLACE = REPO_ROOT / ".claude-plugin" / "marketplace.json"
@@ -74,6 +78,64 @@ def test_plugin_ships_no_executables() -> None:
         if p.is_file() and (p.suffix in {".sh", ".bash", ".ps1"} or p.stat().st_mode & 0o111)
     ]
     assert not executables, executables
+
+
+def _github_slug_from_remote() -> str | None:
+    """`owner/repo` for `origin`, or None when there's nothing to compare
+    against — no git, no checkout (an sdist install), no remote, or a
+    remote that isn't GitHub. All of those are legitimate places to run
+    the suite, so they skip rather than fail."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    # https://github.com/owner/repo(.git) and git@github.com:owner/repo(.git)
+    match = re.search(r"github\.com[/:]([^/]+/[^/\s]+?)(?:\.git)?$", result.stdout.strip())
+    return match.group(1) if match else None
+
+
+def test_manifest_urls_match_the_git_remote() -> None:
+    """Every published URL has to name the repo people can actually add.
+
+    This exists because they once didn't: the slug was inferred from the
+    git *user* name rather than the remote, so `/plugin marketplace add`
+    pointed at a repo that wasn't this one — and nothing in the suite
+    noticed, because the manifests were internally consistent and valid.
+    Internal consistency is not the property that matters here.
+    """
+    slug = _github_slug_from_remote()
+    if slug is None:
+        pytest.skip("no GitHub origin remote to compare against")
+
+    expected = f"https://github.com/{slug}"
+    found: list[tuple[str, str]] = [
+        ("marketplace.owner.url", _marketplace()["owner"].get("url", "")),
+        ("plugin.author.url", _plugin()["author"].get("url", "")),
+        ("plugin.homepage", _plugin().get("homepage", "")),
+        ("plugin.repository", _plugin().get("repository", "")),
+    ]
+    wrong = [(field, url) for field, url in found if url and url != expected]
+    assert not wrong, f"expected {expected}, got: {wrong}"
+
+
+def test_readme_install_command_names_this_repo() -> None:
+    """The line users copy verbatim. A wrong slug here sends them to
+    someone else's repository, or to a 404."""
+    slug = _github_slug_from_remote()
+    if slug is None:
+        pytest.skip("no GitHub origin remote to compare against")
+
+    readme = (REPO_ROOT / "README.md").read_text()
+    commands = re.findall(r"/plugin marketplace add ([^\s`]+)", readme)
+    assert commands, "README no longer documents `/plugin marketplace add`"
+    assert all(c == slug for c in commands), f"expected {slug}, found {commands}"
 
 
 def test_skill_documents_the_non_blocking_path() -> None:

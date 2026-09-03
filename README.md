@@ -11,6 +11,7 @@ Everything shipped is tested end to end; anything needing a cloud backend that
 doesn't exist yet says "not implemented" rather than failing silently ([Project
 status](#project-status)).
 
+
 ## Install
 
 ```bash
@@ -114,7 +115,7 @@ subprocess, and tunnel are all up — not a URL spotted in a log — so
 
 This repo is also a [plugin
 marketplace](https://code.claude.com/docs/en/plugin-marketplaces): in
-Claude Code, `/plugin marketplace add kalpi-4/sidepage` then `/plugin
+Claude Code, `/plugin marketplace add dolphinsdotdev/sidepage` then `/plugin
 install sidepage@sidepage`. That installs
 [`plugin/skills/sidepage-serve/`](plugin/skills/sidepage-serve/), a
 [Skill](https://code.claude.com/docs/en/skills) teaching an agent when to
