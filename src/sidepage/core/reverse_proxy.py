@@ -649,7 +649,12 @@ def _build_proxy_app(
             start_upstream()
 
             def _poll_ready() -> None:
-                resolved = check_upstream_ready(upstream_port)
+                # No deadline: this app's first run may be installing a
+                # large dependency tree, and giving up on it would strand
+                # the proxy on its holding page permanently (see
+                # `check_upstream_ready`). The thread is a daemon, so it
+                # dies with the process at teardown either way.
+                resolved = check_upstream_ready(upstream_port, timeout=None)
                 if resolved is not None:
                     upstream_host.host = resolved
                     ready.set()
@@ -851,7 +856,7 @@ class UpstreamAddress:
         self.host = "127.0.0.1"
 
 
-def check_upstream_ready(upstream_port: int, *, timeout: float = 20.0) -> str | None:
+def check_upstream_ready(upstream_port: int, *, timeout: float | None = 20.0) -> str | None:
     """Real HTTP GET readiness check — not a bare TCP connect, since some
     frameworks (Streamlit included) bind the socket before they're
     actually ready to serve.
@@ -863,10 +868,22 @@ def check_upstream_ready(upstream_port: int, *, timeout: float = 20.0) -> str | 
     way it can for `serve`'s own targets) bind IPv6 loopback only.
     Returns whichever host actually answered, or `None` if neither did
     within `timeout` — never guesses.
+
+    `timeout=None` polls indefinitely, which is what the lazy-start path
+    uses. A wall-clock limit is the wrong shape there: the wrapped
+    process's first run resolves and installs its whole dependency tree
+    through `uv`, and a real app can legitimately take many minutes
+    (a pulled Hugging Face Space pinning TensorFlow, say). With a fixed
+    deadline, that app's readiness poll gives up while `uv` is still
+    working and **never retries** — the app comes up perfectly and the
+    proxy serves its "starting…" holding page forever. Observed exactly
+    that against a real pulled Space whose dependency install ran past
+    20s. Polling until it answers costs one cheap request every 200ms
+    against a loopback port and cannot get stuck in that state.
     """
-    deadline = time.monotonic() + timeout
+    deadline = None if timeout is None else time.monotonic() + timeout
     with httpx.Client(timeout=1.0) as client:
-        while time.monotonic() < deadline:
+        while deadline is None or time.monotonic() < deadline:
             for host in _LOOPBACK_CANDIDATES:
                 try:
                     client.get(f"http://{host}:{upstream_port}/")

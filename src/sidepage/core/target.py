@@ -6,13 +6,13 @@ app-type list (streamlit/api/mcp) with a wrapping model that doesn't care
 what's inside the process:
 
   - **code**     — any HTTP-serving process. Real support here covers
-                   Streamlit, FastAPI, and Python MCP servers specifically
-                   (detected by scanning the source for a recognizable
-                   import) plus a generic Python fallback that assumes the
-                   app reads `$PORT` — building a launcher for every
-                   possible framework is out of scope; this covers the
-                   frameworks actually asked for and degrades honestly for
-                   anything else.
+                   Streamlit, FastAPI, Python MCP servers, and Gradio
+                   specifically (detected by scanning the source for a
+                   recognizable import) plus a generic Python fallback
+                   that assumes the app reads `$PORT` — building a
+                   launcher for every possible framework is out of scope;
+                   this covers the frameworks actually asked for and
+                   degrades honestly for anything else.
   - **static**    — a directory, `index.html` as entry. See
                     `sidepage.core.static`.
   - **notebook**  — a `.ipynb`, served as a full, editable Jupyter Lab
@@ -63,6 +63,27 @@ port (`bind(0)`) and injects it into the wrapped process:
     package (class `FastMCP`, method `.http_app()`). Both default to
     mounting at `/mcp`, verified against the actually-resolvable current
     releases of each package rather than assumed from memory.
+  - Gradio: `uvicorn <wrapper-module>:make_app --factory --host 127.0.0.1
+    --port <port>`, the same generated-wrapper approach MCP uses (see
+    `sidepage.core.process._write_launch_wrapper`) and for a stronger
+    version of the same reason. The canonical Gradio script ends with a
+    bare, *unguarded* `demo.launch()` at module level — not tucked inside
+    `if __name__ == "__main__":` the way FastAPI/MCP scripts conventionally
+    are — so merely importing the module to reach its ASGI app would block
+    forever on Gradio's own blocking server. The generated wrapper
+    neutralizes `Blocks.launch` before importing the target (capturing the
+    Blocks object it was called on), then hands that object to Gradio's
+    supported `gradio.mount_gradio_app()` entrypoint. That also disarms a
+    hardcoded `launch(server_port=...)`/`share=True`/`ssr_mode=True`,
+    none of which sidepage could otherwise override.
+
+    Injecting `GRADIO_SERVER_PORT` instead was rejected on evidence, not
+    taste: Gradio treats that env var as the *start* of a 100-port search
+    (`GRADIO_NUM_PORTS`), so a busy port silently moves the app to a
+    different one sidepage isn't proxying — and an explicit
+    `launch(server_port=...)` in the script ignores the env var outright.
+    Verified against gradio 6.26.0; see `docs/OPEN_QUESTIONS.md` for what
+    hasn't been checked on older majors.
   - Generic Python: `$PORT` env var, on the assumption the app reads
     `os.environ.get("PORT", ...)`.
 """
@@ -90,6 +111,7 @@ class CodeLauncher(StrEnum):
     STREAMLIT = "streamlit"
     FASTAPI = "fastapi"
     MCP = "mcp"
+    GRADIO = "gradio"
     GENERIC_PYTHON = "generic_python"  # assumes $PORT
 
 
@@ -146,17 +168,24 @@ def _has_mcp_import(source: str) -> bool:
 
 def detect_code_launcher(target: Path) -> CodeLauncher:
     """Scan `target`'s source for a recognizable framework import.
-    Streamlit, FastAPI, and MCP apps get real launcher-specific port
-    injection; everything else falls back to the generic `$PORT`
+    Streamlit, FastAPI, MCP, and Gradio apps get real launcher-specific
+    port injection; everything else falls back to the generic `$PORT`
     convention.
 
-    Checked in this order — Streamlit, then FastAPI, then MCP — so a
-    script that mounts an MCP server *inside* a FastAPI app (a common real
-    pattern, e.g. `app.mount("/mcp", mcp_server.streamable_http_app())`)
-    is still correctly detected as FASTAPI: the top-level ASGI app to
-    actually launch is the FastAPI one, and `uvicorn <module>:app` already
-    serves everything mounted on it, MCP sub-route included. Only a
-    standalone MCP script with no FastAPI import falls through to MCP.
+    Checked in this order — Streamlit, then FastAPI, then MCP, then
+    Gradio — so a script that mounts an MCP server *inside* a FastAPI app
+    (a common real pattern, e.g. `app.mount("/mcp",
+    mcp_server.streamable_http_app())`) is still correctly detected as
+    FASTAPI: the top-level ASGI app to actually launch is the FastAPI one,
+    and `uvicorn <module>:app` already serves everything mounted on it,
+    MCP sub-route included. Only a standalone MCP script with no FastAPI
+    import falls through to MCP.
+
+    Gradio sits after FastAPI for exactly that same reason: a script that
+    already calls `gradio.mount_gradio_app(app, demo, ...)` onto its own
+    FastAPI instance wants *that* app served, not a second, separate mount
+    of the same Blocks (which is what the GRADIO launcher would build).
+    Only a standalone Gradio script falls through to GRADIO.
     """
     try:
         source = target.read_text(errors="ignore")
@@ -168,6 +197,8 @@ def detect_code_launcher(target: Path) -> CodeLauncher:
         return CodeLauncher.FASTAPI
     if _has_mcp_import(source):
         return CodeLauncher.MCP
+    if "import gradio" in source or "from gradio" in source:
+        return CodeLauncher.GRADIO
     return CodeLauncher.GENERIC_PYTHON
 
 

@@ -81,6 +81,9 @@ from sidepage.commands import (
     setup,
     usage,
 )
+from sidepage.commands import (
+    pull as pull_cmd,
+)
 
 app = typer.Typer(
     name="sidepage",
@@ -131,6 +134,11 @@ app.command("stop")(serve.stop)
 # (sidepage.core.process.stop` is target-agnostic, keyed on the registry
 # pid) rather than declaring a second one. See sidepage.commands.proxy.
 app.command("proxy")(proxy.proxy)
+
+# Not a numbered spec section — fetches a remote app (Hugging Face
+# Spaces today) into sidepage's own managed directory and registers it,
+# without executing any of it. See sidepage.commands.pull.
+app.command("pull")(pull_cmd.pull)
 
 # §5 — discovery & scope
 app.command("promote")(scope.promote)

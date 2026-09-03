@@ -224,6 +224,72 @@ def test_cli_show_with_preview_does_not_mutate_registration(sidepage_home: Path)
     assert unchanged.scope is Scope.LOCAL
 
 
+def test_cli_register_stores_no_suffix(sidepage_home: Path) -> None:
+    """`--no-suffix` changes the hostname a registered app answers on, so
+    it's part of the saved config (like `--domain`), not a per-invocation
+    flag the registry drops."""
+    reg = runner.invoke(
+        app,
+        [
+            "app",
+            "register",
+            f"{FIXTURES / 'static-site'} --domain example.com --no-suffix",
+            "bare-app",
+        ],
+    )
+    assert reg.exit_code == 0, reg.output
+
+    stored = app_registry.get("bare-app")
+    assert stored is not None
+    assert stored.no_suffix is True
+
+    shown = runner.invoke(app, ["app", "show", "bare-app"])
+    assert "no_suffix:      True" in shown.output
+
+
+def test_no_suffix_defaults_false_on_entries_written_before_the_flag(
+    sidepage_home: Path,
+) -> None:
+    """An entry stored before `--no-suffix` existed has no such key — it's
+    a valid registration with the flag off, not a corrupt one."""
+    import json
+
+    from sidepage.config.settings import app_registry_file
+
+    app_registry.register(
+        "legacy-app",
+        target=(FIXTURES / "static-site").resolve(),
+        target_kind=TargetKind.STATIC,
+        name=None,
+        domain=None,
+        auth=AuthTier.OPEN,
+        scope=Scope.LOCAL,
+        anon=False,
+        env_secrets=(),
+        guardrail=None,
+    )
+    store = json.loads(app_registry_file().read_text())
+    del store["legacy-app"]["no_suffix"]
+    app_registry_file().write_text(json.dumps(store))
+
+    fetched = app_registry.get("legacy-app")
+    assert fetched is not None
+    assert fetched.no_suffix is False
+
+
+def test_cli_show_with_previews_no_suffix_override(sidepage_home: Path) -> None:
+    invocation = f"{FIXTURES / 'static-site'} --domain example.com"
+    runner.invoke(app, ["app", "register", invocation, "suffix-preview"])
+
+    preview = runner.invoke(app, ["app", "show", "suffix-preview", "--with", "--no-suffix"])
+    assert preview.exit_code == 0, preview.output
+    assert "no_suffix:      True" in preview.output
+
+    stored = app_registry.get("suffix-preview")
+    assert stored is not None
+    assert stored.no_suffix is False  # preview never mutates the base config
+
+
 # --- Parser reuse: the spec's core design claim ---
 
 

@@ -1,0 +1,15 @@
+{
+  "name": "sidepage",
+  "owner": {
+    "name": "Kalpit B",
+    "url": "https://github.com/dolphinsdotdev/sidepage"
+  },
+  "description": "Local-first hosting and tunneling for small apps, notebooks, and MCP servers",
+  "plugins": [
+    {
+      "name": "sidepage",
+      "source": "./plugin",
+      "description": "Serve a local app, script, notebook, or running dev server and get back a shareable URL"
+    }
+  ]
+}

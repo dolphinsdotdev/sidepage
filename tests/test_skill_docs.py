@@ -1,4 +1,4 @@
-"""Drift check for `skills/sidepage-serve/SKILL.md` against the actual CLI.
+"""Drift check for `plugin/skills/sidepage-serve/SKILL.md` against the actual CLI.
 
 SKILL.md makes narrative claims about flag names (`--peer`, `--idle-timeout`,
 `--with`, ...) that can silently go stale as `src/sidepage/commands/` evolves
@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 
 COMMANDS_DIR = Path(__file__).parent.parent / "src" / "sidepage" / "commands"
-SKILL_MD = Path(__file__).parent.parent / "skills" / "sidepage-serve" / "SKILL.md"
+SKILL_MD = Path(__file__).parent.parent / "plugin" / "skills" / "sidepage-serve" / "SKILL.md"
 
 # Flags SKILL.md legitimately mentions that aren't sidepage's own: typer's
 # built-in --help, and flags on other programs shown in example commands
@@ -46,7 +46,7 @@ def test_skill_md_flags_still_exist_on_the_cli(capsys) -> None:
     stale = sorted(mentioned - declared)
     if stale:
         print(
-            "\nskills/sidepage-serve/SKILL.md mentions flags that no longer "
+            "\nplugin/skills/sidepage-serve/SKILL.md mentions flags that no longer "
             "resolve to a typer.Option in src/sidepage/commands/ — CLI may "
             "have renamed or removed them, or this is a legitimate new "
             "non-sidepage flag to add to KNOWN_NON_SIDEPAGE_FLAGS in "
