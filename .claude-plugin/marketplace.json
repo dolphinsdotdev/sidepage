@@ -2,7 +2,7 @@
   "name": "sidepage",
   "owner": {
     "name": "Kalpit B",
-    "url": "https://github.com/kalpi-4/sidepage"
+    "url": "https://github.com/dolphinsdotdev/sidepage"
   },
   "description": "Local-first hosting and tunneling for small apps, notebooks, and MCP servers",
   "plugins": [
