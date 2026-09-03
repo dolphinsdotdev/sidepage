@@ -900,11 +900,16 @@ def _detached_child_argv() -> list[str]:
     `sidepage.__main__` so the child is guaranteed the same interpreter
     and the same installed package as the parent.
     """
-    args = [a for a in sys.argv[1:] if a != "--detach"]
+    # `--qr` is dropped along with `--detach`: the child's stdout is a log
+    # file, where `print_tty` can only fail and log a warning. The parent
+    # is the one attached to a terminal, so it renders the code itself
+    # once it knows the URL — see `_spawn_detached`.
+    dropped = {"--detach", "-d", "--qr"}
+    args = [a for a in sys.argv[1:] if a not in dropped]
     return [sys.executable, "-m", "sidepage", *args]
 
 
-def _spawn_detached(app_name: str, *, json_output: bool) -> int:
+def _spawn_detached(app_name: str, *, json_output: bool, want_qr: bool = False) -> int:
     """Run this command again in the background, wait for it to register
     as running, and report. Returns the process exit code for the parent.
 
@@ -955,6 +960,11 @@ def _spawn_detached(app_name: str, *, json_output: bool) -> int:
         if running is not None:
             payload = _ready_payload_from_registry(running, log_path=log_path)
             _emit_payload(payload, json_output=json_output)
+            if want_qr:
+                # Under --json stdout is reserved for the one machine-
+                # readable line, so the code goes to stderr with the rest
+                # of the human-facing output.
+                qr.print_qr(payload["url"], out=sys.stderr if json_output else None)
             return 0
         if child.poll() is not None:
             # Exited before registering: a validation error, a failed
@@ -1041,7 +1051,9 @@ def serve(config: ServeConfig) -> None:
         # surfaces as a `failed` payload carrying the child's own error
         # message, which is the same text an attached run would print.
         app_name = config.name or config.target.resolve().stem or config.target.name
-        raise SystemExit(_spawn_detached(app_name, json_output=config.json_output))
+        raise SystemExit(
+            _spawn_detached(app_name, json_output=config.json_output, want_qr=config.qr)
+        )
 
     domain_config = _validate_supported(config)
 
@@ -1336,7 +1348,11 @@ def serve(config: ServeConfig) -> None:
     # in its log where a reader needs the command that actually works.
     info(f"`sidepage stop {app_name}` to stop" if is_detached_child() else "Ctrl+C to stop")
     if config.qr:
-        qr.print_qr(tunnel_url or local_url)
+        # stderr under --json, for the same reason as the detached path:
+        # stdout carries the one parseable line and nothing else.
+        qr.print_qr(
+            tunnel_url or local_url, out=sys.stderr if config.json_output else None
+        )
 
     # §20 timeout / idle-timeout: both checked right here in the existing
     # blocking loop, both exiting through the same `break` -> `finally:

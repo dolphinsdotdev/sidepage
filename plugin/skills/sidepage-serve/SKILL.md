@@ -171,12 +171,12 @@ Key flags to reason about before launching `serve`:
   output) — use `--domain` if the user wants the icon to survive restarts.
 - **`--qr`** — prints a terminal QR code for the resulting URL. Independent
   of `--pwa`; pass it any time the user is going to want to scan a link
-  onto a phone rather than type it. Only useful when run directly in an
-  interactive terminal you can show the user — it degrades to a warning
-  (no crash) if stdout isn't a real tty, which includes a `--detach`
-  child, whose output goes to a log file. So don't combine it with
-  `--detach`: hand back the plain `url` from the JSON instead, or run
-  attached if the user specifically wants a scannable code on screen.
+  onto a phone rather than type it. Combines fine with `--detach --json`:
+  the code is rendered by the foreground command you ran, not by the
+  backgrounded app, and under `--json` it goes to stderr so the payload on
+  stdout stays parseable. It needs a real terminal to draw into, so it
+  degrades to a warning (no crash) when output is piped or redirected —
+  in that case hand back the plain `url` from the JSON instead.
 
 ```bash
 sidepage serve app.py --name demo --anon --pwa --pwa-name "Demo" --detach --json

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import sys
 from contextlib import contextmanager
+from typing import TextIO
 
 import qrcode
 
@@ -28,23 +29,27 @@ def _standard_terminal_output():
         sys.stdout.flush()
 
 
-def print_qr(url: str) -> None:
-    """Print a compact QR code for `url` to stdout using the terminal's
-    own block-character rendering (`print_tty`) — no image file, no
-    external renderer.
+def print_qr(url: str, *, out: TextIO | None = None) -> None:
+    """Print a compact QR code for `url` using the terminal's own
+    block-character rendering (`print_tty`) — no image file, no external
+    renderer. Defaults to stdout; pass `out` to send it elsewhere.
 
-    `print_tty()` itself raises `OSError` outright when stdout isn't a
+    `print_tty()` itself raises `OSError` outright when its stream isn't a
     real tty (piped output, output redirected to a file, a non-interactive
     CI runner) — verified live, not assumed. `--qr` failing that way would
     otherwise take the rest of a perfectly working `serve` down with it;
     caught here and downgraded to a warning instead; every command that
     matters (the actual URL) was already printed before this runs.
+
+    `out` exists for `--json`, where stdout is reserved for the single
+    machine-readable line and a QR code is human-facing chrome that
+    belongs on stderr with the rest of it.
     """
     qr = qrcode.QRCode(version=1, box_size=1, border=1)
     qr.add_data(url)
     qr.make(fit=True)
     try:
         with _standard_terminal_output():
-            qr.print_tty()
+            qr.print_tty(out)
     except OSError:
-        warn("--qr: stdout isn't a terminal, can't render a QR code here")
+        warn("--qr: output isn't a terminal, can't render a QR code here")

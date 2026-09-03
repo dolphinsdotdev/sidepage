@@ -246,6 +246,76 @@ def test_detach_and_json_are_not_persisted_by_autoregister(env: dict[str, str]) 
         _stop("d-autoreg", env)
 
 
+# `qrcode.print_tty` draws with ANSI background-colour runs, not block
+# characters — this is the escape it emits for a light module.
+_QR_MARKER = "\x1b[1;47m"
+
+
+def _run_on_pty(args: list[str], env: dict[str, str]) -> str:
+    """Run the CLI with stdout/stderr attached to a real pty and return
+    everything it wrote. `--qr` refuses to render off a terminal, so a
+    plain pipe would prove nothing about whether it works."""
+    import pty
+
+    pid, fd = pty.fork()
+    if pid == 0:  # child
+        os.environ.update(env)
+        os.execv(SIDEPAGE_BIN, [SIDEPAGE_BIN, *args])
+    chunks = []
+    while True:
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:  # pty closes with EIO when the child exits
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+    os.waitpid(pid, 0)
+    return b"".join(chunks).decode(errors="replace")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="pty is POSIX-only")
+def test_detach_renders_the_qr_from_the_parent(env: dict[str, str]) -> None:
+    """The child's stdout is a log file, where a QR can only fail. The
+    parent is the process actually attached to a terminal, so it renders
+    the code itself once the URL is known."""
+    try:
+        out = _run_on_pty(
+            ["serve", str(STATIC_SITE), "--name", "d-qr", "--detach", "--qr"], env
+        )
+        assert _QR_MARKER in out, "no QR rendered on the parent's terminal"
+        assert "can't render a QR code" not in out
+    finally:
+        _stop("d-qr", env)
+
+
+def test_qr_never_reaches_stdout_under_json(env: dict[str, str]) -> None:
+    """A QR code on stdout would corrupt the one line `--json` promises,
+    so it goes to stderr with the rest of the human-facing output."""
+    result = _cli(
+        ["serve", str(STATIC_SITE), "--name", "d-qrjson", "--detach", "--qr", "--json"], env
+    )
+    try:
+        lines = [line for line in result.stdout.splitlines() if line.strip()]
+        assert len(lines) == 1, result.stdout
+        json.loads(lines[0])
+        assert _QR_MARKER not in result.stdout
+    finally:
+        _stop("d-qrjson", env)
+
+
+def test_qr_is_not_passed_to_the_detached_child(env: dict[str, str]) -> None:
+    """If `--qr` reached the child it would try to draw into a log file,
+    fail, and leave a misleading warning there."""
+    result = _cli(["serve", str(STATIC_SITE), "--name", "d-qrlog", "--detach", "--qr"], env)
+    try:
+        assert result.returncode == 0, result.stdout + result.stderr
+        log = Path(env["SIDEPAGE_HOME"]) / "state" / "logs" / "d-qrlog.log"
+        assert "can't render a QR code" not in log.read_text()
+    finally:
+        _stop("d-qrlog", env)
+
+
 def test_stop_is_reported_by_status_after_detached_start(env: dict[str, str]) -> None:
     start = _cli(["serve", str(STATIC_SITE), "--name", "d-stop", "--detach", "--json"], env)
     payload = json.loads(start.stdout)
