@@ -90,9 +90,11 @@ at spawn time for every framework it has a real launcher for.
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import threading
 import time
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -104,14 +106,22 @@ import websockets
 from starlette.applications import Starlette
 from starlette.datastructures import Headers
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from starlette.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from starlette.routing import Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from sidepage.config.settings import ensure_dirs, runtime_dir
+from sidepage.core import pwa as pwa_module
 from sidepage.core import registry
 from sidepage.core.exceptions import PeerNotFoundError
+from sidepage.output import info
 
 _HOP_BY_HOP = {
     "connection",
@@ -124,6 +134,38 @@ _HOP_BY_HOP = {
     "upgrade",
     "content-length",
     "host",
+}
+
+# WS-specific exclusions on top of _HOP_BY_HOP for proxy_ws's outbound
+# headers: `websockets.connect` generates its own Sec-WebSocket-Key/
+# -Version/-Extensions for the handshake it performs, and
+# Sec-WebSocket-Protocol is negotiated via `subprotocols=` (see
+# proxy_ws) rather than forwarded as a raw header — passing any of these
+# through `additional_headers` too would just duplicate/conflict with
+# what the library sets itself.
+#
+# `origin` is excluded for the same reason `host` already is (see
+# `override_host=False` in `_forwarded_headers`'s docstring): the
+# upstream connection's literal Host is always `127.0.0.1:<port>`, never
+# whatever public hostname the browser actually used, so the browser's
+# real Origin is *guaranteed* to mismatch it. Forwarding it anyway
+# doesn't make the connection more legitimate — it just hands a
+# framework that validates Origin-against-Host (reproduced live:
+# Streamlit's Tornado WS handler, `server.enableCORS`'s default) a
+# reason to reject every single WS-based app served through `--domain`/
+# `--anon`, full stop. Sidepage's own reverse proxy + `--auth` gate is
+# the actual trust boundary here, exactly like the MCP host wrapper's
+# `enable_dns_rebinding_protection=False` and Jupyter's
+# `--ServerApp.disable_check_xsrf=True` (see `sidepage.core.process`) —
+# Streamlit gets the equivalent treatment via `--server.enableCORS
+# false` in its own launch flags, not just this header omission alone.
+_WS_HOP_BY_HOP = _HOP_BY_HOP | {
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-extensions",
+    "sec-websocket-protocol",
+    "sec-websocket-accept",
+    "origin",
 }
 
 _COOKIE_NAME = "sidepage_session"
@@ -287,6 +329,209 @@ class AuthGateMiddleware:
         await response(scope, receive, send)
 
 
+def _pwa_routes(runtime: pwa_module.PwaRuntime) -> list[Route]:
+    """The five synthetic routes spec §3 lists, registered ahead of the
+    catch-all in both `_build_static_app` and `_build_proxy_app` — plain
+    list order is enough for sidepage's routes to win over anything the
+    wrapped app also serves at the same path (no extra precedence logic
+    needed), which is what every route-precedence guarantee here actually
+    rests on. `/sw.js` isn't included at all when `runtime.sw_js is None`
+    (`--pwa-no-sw`) — nothing to serve, and no reason to shadow a path the
+    app might have a real use for.
+    """
+
+    async def manifest(request: Request) -> Response:
+        return Response(runtime.manifest_bytes, media_type="application/manifest+json")
+
+    async def sw(request: Request) -> Response:
+        return Response(
+            runtime.sw_js,
+            media_type="application/javascript",
+            headers={"Service-Worker-Allowed": "/"},
+        )
+
+    async def icon_192(request: Request) -> Response:
+        return Response(runtime.icon_192, media_type="image/png")
+
+    async def icon_512(request: Request) -> Response:
+        return Response(runtime.icon_512, media_type="image/png")
+
+    async def offline(request: Request) -> HTMLResponse:
+        return HTMLResponse(runtime.offline_html)
+
+    routes = [
+        Route("/manifest.webmanifest", manifest, methods=["GET"]),
+        Route("/icon-192.png", icon_192, methods=["GET"]),
+        Route("/icon-512.png", icon_512, methods=["GET"]),
+        Route("/_sidepage/offline.html", offline, methods=["GET"]),
+    ]
+    if runtime.sw_js is not None:
+        routes.append(Route("/sw.js", sw, methods=["GET"]))
+    return routes
+
+
+_STATIC_PWA_SHADOW_PATHS = (
+    "manifest.webmanifest",
+    "sw.js",
+    "icon-192.png",
+    "icon-512.png",
+    "_sidepage/offline.html",
+)
+
+
+def _log_shadowed_static_pwa_paths(static_root: Path, runtime: pwa_module.PwaRuntime) -> None:
+    """Spec §3: "if the wrapped app already serves any of these paths,
+    sidepage wins. Log a single line noting the shadowed path." Real,
+    synchronous detection for static targets only — a plain file-existence
+    check under `static_root`, essentially free at startup. Code/notebook
+    (proxied) targets don't get this: detecting a shadow there needs a
+    live probe against a subprocess that, under lazy start (spec v5 §21
+    Tier 1), may not even be running yet — sidepage's own routes still win
+    either way (that's the precedence guarantee itself, unaffected by
+    whether this logging fires), just without the diagnostic line for that
+    target kind.
+    """
+    for rel in _STATIC_PWA_SHADOW_PATHS:
+        if rel == "sw.js" and runtime.sw_js is None:
+            continue
+        if (static_root / rel).is_file():
+            info(f"pwa: {rel} is also served by the app itself — sidepage's own route wins")
+
+
+def _decompress_for_injection(body: bytes, content_encoding: str) -> bytes | None:
+    """Best-effort decompression of the one buffered HTML document
+    `PwaInjectionMiddleware` is about to rewrite — returns `None` for an
+    encoding it doesn't know how to reverse (`br`, `zstd`, anything
+    malformed), signalling "don't touch this, replay it exactly as
+    received" rather than guessing or crashing.
+
+    Deliberately response-side and scoped to this one document, not a
+    blanket `Accept-Encoding: identity` on the outbound request the way
+    an earlier version of this worked: forcing every proxied request
+    uncompressed also forced every *static asset* uncompressed — a
+    framework's often multi-MB JS/CSS bundle included — which cost
+    nothing on loopback but reproduced live as several minutes to load a
+    real app over an actual BYO-domain tunnel on a phone. Nothing this
+    function does affects any request/response this middleware doesn't
+    already buffer.
+    """
+    encoding = content_encoding.lower()
+    if encoding in ("", "identity"):
+        return body
+    if encoding in ("gzip", "x-gzip"):
+        try:
+            return gzip.decompress(body)
+        except OSError:
+            return None
+    if encoding == "deflate":
+        # Ambiguous in the wild: some servers send zlib-wrapped deflate
+        # (RFC 1950, what `zlib.decompress` expects directly), some send
+        # raw deflate (RFC 1951, no zlib header) — try the common case
+        # first, fall back to the raw form.
+        try:
+            return zlib.decompress(body)
+        except zlib.error:
+            try:
+                return zlib.decompressobj(-zlib.MAX_WBITS).decompress(body)
+            except zlib.error:
+                return None
+    return None  # br, zstd, ... — not attempted, no dependency for it
+
+
+class PwaInjectionMiddleware:
+    """Raw ASGI middleware, same shape as `ActivityMiddleware`/
+    `AuthGateMiddleware` above — the single implementation of spec §6's
+    injection procedure, shared by both the in-process static-file path
+    and the proxied-upstream path (wraps whichever `Starlette` app
+    `_build_static_app`/`_build_proxy_app` built, before `AuthGateMiddleware`
+    wraps *that* — see `start_proxy`). Wrapping inside the auth gate,
+    not outside, is deliberate: an unauthenticated `--auth token` gate
+    page is returned by `AuthGateMiddleware` itself and never reaches this
+    middleware at all, so it's never buffered or rewritten — there's
+    nothing PWA-relevant about a login form.
+
+    Only ever buffers a response that's status 200 and `Content-Type`
+    starting with `text/html` — everything else, SSE and every static
+    asset included, passes straight through message-by-message, exactly
+    as if this middleware weren't here at all, no buffering, whatever its
+    `Content-Encoding` (compression is handled per-document here, on the
+    response side, once the whole body is in hand — see
+    `_decompress_for_injection`). If that decompression can't be done (an
+    encoding this doesn't recognize, or a body that doesn't actually
+    match the `Content-Encoding` it claimed), or the decompressed body
+    has no `<head>` tag to inject into, the original bytes and headers
+    are replayed completely unmodified — injection only ever happens once
+    both are known to have succeeded.
+    """
+
+    def __init__(self, app, runtime: pwa_module.PwaRuntime) -> None:
+        self.app = app
+        self.runtime = runtime
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        start_message: dict | None = None
+        body_chunks: list[bytes] = []
+        candidate = False
+
+        async def wrapped_send(message: dict) -> None:
+            nonlocal start_message, candidate
+
+            if message["type"] == "http.response.start":
+                headers = Headers(raw=message.get("headers", []))
+                content_type = headers.get("content-type", "")
+                candidate = message["status"] == 200 and content_type.lower().startswith(
+                    "text/html"
+                )
+                if not candidate:
+                    await send(message)
+                    return
+                start_message = message
+                return  # held back until the full body is known
+
+            if message["type"] == "http.response.body":
+                if not candidate:
+                    await send(message)
+                    return
+                body_chunks.append(message.get("body", b""))
+                if message.get("more_body", False):
+                    return  # still streaming in — keep buffering
+                raw_body = b"".join(body_chunks)
+                assert start_message is not None
+                content_encoding = Headers(raw=start_message.get("headers", [])).get(
+                    "content-encoding", ""
+                )
+                decompressed = _decompress_for_injection(raw_body, content_encoding)
+
+                if decompressed is None or not pwa_module.has_head_tag(decompressed):
+                    # Can't safely rewrite — replay exactly what came in.
+                    await send(start_message)
+                    await send({"type": "http.response.body", "body": raw_body, "more_body": False})
+                    return
+
+                injected = pwa_module.inject_head_tags(decompressed, self.runtime)
+                # Re-served as identity: re-compressing would need an
+                # extra dependency for no real benefit — this is the one
+                # (typically small) HTML shell document being rewritten,
+                # never a real app's actual static assets.
+                dropped_headers = {"content-length", "content-encoding"}
+                rewritten_headers = [
+                    (k, v)
+                    for k, v in start_message.get("headers", [])
+                    if k.decode("latin-1").lower() not in dropped_headers
+                ]
+                await send({**start_message, "headers": rewritten_headers})
+                await send({"type": "http.response.body", "body": injected, "more_body": False})
+                return
+
+            await send(message)
+
+        await self.app(scope, receive, wrapped_send)
+
+
 def counts_path(app_name: str) -> Path:
     ensure_dirs()
     return runtime_dir() / f"{app_name}-usage.json"
@@ -346,14 +591,22 @@ def _build_static_app(
     token: str | None,
     stop_requested: threading.Event,
     control_token: str | None,
+    pwa: pwa_module.PwaRuntime | None = None,
 ):
-    app = Starlette(
-        routes=[
-            Route("/__sidepage_auth", _auth_post_handler(token), methods=["POST"]),
-            _stop_route(stop_requested, control_token),
-        ]
-    )
+    routes = [
+        Route("/__sidepage_auth", _auth_post_handler(token), methods=["POST"]),
+        _stop_route(stop_requested, control_token),
+    ]
+    if pwa is not None:
+        # Ahead of the StaticFiles mount below, so these five paths always
+        # win over an identically-named file the static site itself ships
+        # (spec §3) — plain route-list order is the whole precedence
+        # mechanism, no extra matching logic needed.
+        routes = routes + _pwa_routes(pwa)
+    app = Starlette(routes=routes)
     app.mount("/", StaticFiles(directory=str(static_root), html=True))
+    if pwa is not None:
+        app = PwaInjectionMiddleware(app, pwa)
     return AuthGateMiddleware(app, auth=auth, token=token)
 
 
@@ -371,6 +624,7 @@ def _build_proxy_app(
     control_token: str | None,
     start_upstream: Callable[[], None] | None = None,
     peers: tuple[tuple[str, str], ...] = (),
+    pwa: pwa_module.PwaRuntime | None = None,
 ):
     client = httpx.AsyncClient(timeout=30.0)
 
@@ -395,7 +649,12 @@ def _build_proxy_app(
             start_upstream()
 
             def _poll_ready() -> None:
-                resolved = check_upstream_ready(upstream_port)
+                # No deadline: this app's first run may be installing a
+                # large dependency tree, and giving up on it would strand
+                # the proxy on its holding page permanently (see
+                # `check_upstream_ready`). The thread is a daemon, so it
+                # dies with the process at teardown either way.
+                resolved = check_upstream_ready(upstream_port, timeout=None)
                 if resolved is not None:
                     upstream_host.host = resolved
                     ready.set()
@@ -423,6 +682,17 @@ def _build_proxy_app(
         if request.url.query:
             upstream_url += f"?{request.url.query}"
         headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
+        # Compression is left completely alone here, deliberately —
+        # PwaInjectionMiddleware decompresses/re-encodes only the one
+        # (typically small) HTML document it actually rewrites, on the
+        # response side. An earlier version of this forced
+        # Accept-Encoding to "identity" on *every* proxied request when
+        # `pwa` was enabled, which also forced every static asset (a
+        # framework's often multi-MB JS/CSS bundle included) to transfer
+        # uncompressed — fine on loopback, but reproduced live as a
+        # several-minutes-to-load app over a real BYO-domain tunnel on a
+        # phone. Never worth it for assets this middleware doesn't even
+        # touch.
         client_host = request.client.host if request.client is not None else None
         _forwarded_headers(headers, request.headers, client_host, override_host=True)
         body = await request.body()
@@ -445,19 +715,44 @@ def _build_proxy_app(
 
     async def proxy_ws(websocket: WebSocket) -> None:
         _ensure_started()
-        await websocket.accept()
-        activity.touch()
-        counts["ws_connections"] = counts.get("ws_connections", 0) + 1
-        _persist_counts(app_name, counts)
         upstream_url = f"ws://{upstream_host.host}:{upstream_port}{websocket.url.path}"
-        ws_headers: dict[str, str] = {}
+        # Forward the client's real headers (Origin, Cookie, ...), not an
+        # empty dict — matches proxy_http's `headers = {k: v for k, v in
+        # request.headers.items() ...}` starting point. WS-handshake-only
+        # header names are excluded: `websockets.connect` sets
+        # Sec-WebSocket-Key/-Version/-Extensions itself, and
+        # Sec-WebSocket-Protocol is handled below via `subprotocols=`
+        # instead of a raw header, so the client's requested list can
+        # actually be negotiated rather than just echoed blind.
+        ws_headers = {
+            k: v for k, v in websocket.headers.items() if k.lower() not in _WS_HOP_BY_HOP
+        }
         client_host = websocket.client.host if websocket.client is not None else None
         _forwarded_headers(ws_headers, websocket.headers, client_host, override_host=False)
+        requested_subprotocols = websocket.scope.get("subprotocols") or None
 
         try:
             async with websockets.connect(
-                upstream_url, additional_headers=ws_headers
+                upstream_url, additional_headers=ws_headers, subprotocols=requested_subprotocols
             ) as upstream_ws:
+                # Accept the client side only *after* the upstream
+                # handshake has actually completed, and with whichever
+                # subprotocol upstream selected — accepting blind (no
+                # subprotocol) is what broke every WS-based app that
+                # negotiates one (Streamlit's frontend requests
+                # `["streamlit", ...]` and requires the server's 101
+                # response to echo one back per RFC 6455; without a match
+                # the *browser itself* aborts the connection immediately,
+                # before either side ever sends a single message —
+                # reproduced live: `created` -> `error` -> `close code=
+                # 1006`, with no `send` in between). Connecting upstream
+                # first also means a client the upstream never accepts at
+                # all (still starting, refused, ...) is never told
+                # "connected" only to be abruptly dropped a moment later.
+                await websocket.accept(subprotocol=upstream_ws.subprotocol)
+                activity.touch()
+                counts["ws_connections"] = counts.get("ws_connections", 0) + 1
+                _persist_counts(app_name, counts)
 
                 async def client_to_upstream() -> None:
                     try:
@@ -505,6 +800,13 @@ def _build_proxy_app(
         # whole — same auth tier as the rest of this app, no separate gate.
         Route("/.sidepage/peers.json", peers_json, methods=["GET"]),
         _stop_route(stop_requested, control_token),
+    ]
+    if pwa is not None:
+        # Same reasoning as _build_static_app: ahead of the WS/HTTP
+        # catch-alls below, so these five paths always win over anything
+        # the wrapped app itself serves there (spec §3).
+        routes = routes + _pwa_routes(pwa)
+    routes += [
         WebSocketRoute("/{path:path}", proxy_ws),
         Route(
             "/{path:path}",
@@ -516,6 +818,8 @@ def _build_proxy_app(
         ),
     ]
     app = Starlette(routes=routes)
+    if pwa is not None:
+        app = PwaInjectionMiddleware(app, pwa)
     return AuthGateMiddleware(app, auth=auth, token=token)
 
 
@@ -552,7 +856,7 @@ class UpstreamAddress:
         self.host = "127.0.0.1"
 
 
-def check_upstream_ready(upstream_port: int, *, timeout: float = 20.0) -> str | None:
+def check_upstream_ready(upstream_port: int, *, timeout: float | None = 20.0) -> str | None:
     """Real HTTP GET readiness check — not a bare TCP connect, since some
     frameworks (Streamlit included) bind the socket before they're
     actually ready to serve.
@@ -564,10 +868,22 @@ def check_upstream_ready(upstream_port: int, *, timeout: float = 20.0) -> str | 
     way it can for `serve`'s own targets) bind IPv6 loopback only.
     Returns whichever host actually answered, or `None` if neither did
     within `timeout` — never guesses.
+
+    `timeout=None` polls indefinitely, which is what the lazy-start path
+    uses. A wall-clock limit is the wrong shape there: the wrapped
+    process's first run resolves and installs its whole dependency tree
+    through `uv`, and a real app can legitimately take many minutes
+    (a pulled Hugging Face Space pinning TensorFlow, say). With a fixed
+    deadline, that app's readiness poll gives up while `uv` is still
+    working and **never retries** — the app comes up perfectly and the
+    proxy serves its "starting…" holding page forever. Observed exactly
+    that against a real pulled Space whose dependency install ran past
+    20s. Polling until it answers costs one cheap request every 200ms
+    against a loopback port and cannot get stuck in that state.
     """
-    deadline = time.monotonic() + timeout
+    deadline = None if timeout is None else time.monotonic() + timeout
     with httpx.Client(timeout=1.0) as client:
-        while time.monotonic() < deadline:
+        while deadline is None or time.monotonic() < deadline:
             for host in _LOOPBACK_CANDIDATES:
                 try:
                     client.get(f"http://{host}:{upstream_port}/")
@@ -589,6 +905,7 @@ def start_proxy(
     control_token: str | None = None,
     start_upstream: Callable[[], None] | None = None,
     peers: tuple[tuple[str, str], ...] = (),
+    pwa: pwa_module.PwaRuntime | None = None,
 ) -> ProxyHandle:
     """Start the local reverse proxy. Exactly one of `upstream_port`
     (proxy to a wrapped subprocess) or `static_root` (serve in-process)
@@ -613,6 +930,12 @@ def start_proxy(
     passing it explicitly gets) leaves the route permanently unreachable
     rather than open, so tests/callers that don't care about this are
     unaffected.
+
+    `pwa`, if given (spec: `--pwa`), wires the five synthetic routes and
+    `PwaInjectionMiddleware` into whichever app gets built — see
+    `_build_static_app`/`_build_proxy_app`/`PwaInjectionMiddleware` for the
+    actual mechanics. `None` (the default) leaves every code path here
+    byte-for-byte what it was before PWA support existed.
     """
     if (upstream_port is None) == (static_root is None):
         raise ValueError("exactly one of upstream_port or static_root is required")
@@ -621,12 +944,15 @@ def start_proxy(
     activity = ActivityTracker()
     stop_requested = threading.Event()
     if static_root is not None:
+        if pwa is not None:
+            _log_shadowed_static_pwa_paths(static_root, pwa)
         app = _build_static_app(
             static_root,
             auth=auth,
             token=token,
             stop_requested=stop_requested,
             control_token=control_token,
+            pwa=pwa,
         )
         ready.set()
     else:
@@ -645,6 +971,7 @@ def start_proxy(
             control_token=control_token,
             start_upstream=start_upstream,
             peers=peers,
+            pwa=pwa,
         )
 
         if start_upstream is None:

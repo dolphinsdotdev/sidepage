@@ -115,14 +115,34 @@ def tunnel_pid_file(domain: str) -> Path:
     return tunnels_dir() / f"{domain}.pid"
 
 
-# --- Generated MCP host wrapper modules — real, used by
-# sidepage.core.process for CodeLauncher.MCP targets. Previously written
+# --- Detached app logs — real, used by sidepage.core.process for
+# `serve`/`proxy --detach`. A detached child outlives the parent that
+# spawned it and has no terminal to write to, so its stdout/stderr are
+# redirected here for the same reason `tunnel_log_file` exists: an unread
+# pipe eventually blocks the writer, and a real file is the only thing
+# left to inspect when a detached app fails after the parent has already
+# exited. The path is reported in the parent's own output so the caller
+# never has to guess where it went. ---
+def logs_dir() -> Path:
+    return state_dir() / "logs"
+
+
+def app_log_file(app_name: str) -> Path:
+    return logs_dir() / f"{app_name}.log"
+
+
+# --- Generated launch wrapper modules — real, used by
+# sidepage.core.process for the launchers that can't be started from a
+# bare `<module>:<attr>` import string (MCP, Gradio). Previously written
 # next to the target script itself; moved here so the deterministic
 # filename can never collide with a same-named file the target's own
 # directory happens to contain (see the fixture that used to get its
-# `_sidepage_mcp_wrapper_app.py` clobbered/deleted every `serve` run). ---
-def mcp_wrappers_dir() -> Path:
-    return state_dir() / "mcp_wrappers"
+# `_sidepage_mcp_wrapper_app.py` clobbered/deleted every `serve` run).
+# Contents are regenerated on every `serve` and removed at teardown, so
+# renaming this directory needs no migration — a stale `mcp_wrappers/`
+# left by an older version is inert. ---
+def wrappers_dir() -> Path:
+    return state_dir() / "wrappers"
 
 
 # --- Name bindings (§3) — real, used by sidepage.core.directory_client.
@@ -131,6 +151,24 @@ def mcp_wrappers_dir() -> Path:
 # rather than a fresh id (and a fresh DNS record) every time. ---
 def name_bindings_file() -> Path:
     return config_dir() / "name_bindings.json"
+
+
+# --- Pulled application source trees — real, used by sidepage.core.pull
+# for `sidepage pull`. One directory per app, holding a remote source's
+# actual files (code, model weights, requirements). Deliberately under
+# sidepage's own state root rather than the user's cwd: `pull` downloads
+# code sidepage didn't write, and dropping that into whatever directory
+# the user happened to be standing in would make it far too easy to
+# confuse someone else's code for your own. This is also the *only*
+# directory `sidepage app delete` will ever remove files from — an app
+# registered against a path the user already had is never deleted, only
+# unregistered. ---
+def apps_dir() -> Path:
+    return state_dir() / "apps"
+
+
+def app_source_dir(app_name: str) -> Path:
+    return apps_dir() / app_name
 
 
 # --- Local app registry (registry spec v2) — real, used by
@@ -174,6 +212,7 @@ def ensure_dirs() -> None:
         state_dir(),
         runtime_dir(),
         tunnels_dir(),
-        mcp_wrappers_dir(),
+        wrappers_dir(),
+        logs_dir(),
     ):
         d.mkdir(parents=True, exist_ok=True, mode=0o700)

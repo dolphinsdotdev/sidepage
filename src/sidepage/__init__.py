@@ -6,4 +6,4 @@ command wiring, help text, and options are real; the underlying behavior
 lives in `sidepage.core` as commented placeholders until the SDK is built.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.3"

@@ -435,3 +435,195 @@ private, underscore-prefixed module path that could change across Typer
 releases.
 
 **Affects:** `sidepage.core.app_registry`, `sidepage.commands.app_registry`, `sidepage.commands.serve`
+
+---
+
+### 18. Gradio serving: real, verified against 6.x only — older majors untested
+
+`sidepage serve` recognizes Gradio targets (`sidepage.core.target.CodeLauncher.GRADIO`)
+and launches them through a generated wrapper module that neutralizes
+`gradio.Blocks.launch` before importing the target, then mounts whichever
+Blocks it captured via Gradio's own `gradio.mount_gradio_app()` — see
+`sidepage.core.process._GRADIO_WRAPPER_SOURCE`. Verified end to end
+against **gradio 6.26.0**: the UI renders and a real prediction round trip
+completes through sidepage's own reverse proxy
+(`tests/test_serve_gradio.py`, against `tests/fixtures/gradio-app` — whose
+`demo.launch(server_port=8123)` is module-level and unguarded, and whose
+hardcoded port is confirmed never bound).
+
+Three findings worth recording, each of which decided the design:
+
+- **`GRADIO_SERVER_PORT` injection was rejected on evidence.** Gradio
+  treats that variable as the *start* of a 100-port search
+  (`GRADIO_NUM_PORTS`, `gradio/http_server.py`), so a busy port silently
+  moves the app somewhere sidepage isn't proxying — and an explicit
+  `launch(server_port=...)` in the script ignores the env var entirely.
+  Same class of problem as FastAPI scripts hardcoding `uvicorn.run(...)`,
+  which is why both get the bypass treatment.
+- **`gradio.routes.App.create_app(blocks)` alone is not enough.** Served
+  directly under `uvicorn --factory`, its API routes answer but `GET /`
+  returns 500 — the index template renders against a `config` that is
+  only populated by the launch/mount path (`jinja2.UndefinedError: 'None'
+  has no attribute 'get'`). `mount_gradio_app` is the supported
+  entrypoint and does that setup.
+- **Gradio needs no CORS/Host relaxation**, unlike every other wrapped
+  framework here (Streamlit, Jupyter, both MCP packages). Its
+  `CustomCORSMiddleware` only rejects when the `Host` the wrapped process
+  sees is a loopback alias, and in that case the browser's `Origin` is
+  that same loopback address. `strict_cors` is deliberately left at its
+  default; the reasoning is recorded in `process.py` so the absent bypass
+  doesn't read as an oversight.
+
+**Still open:** only gradio 6.26.0 has actually been run. `mount_gradio_app`
+is long-standing public API and `ssr_mode` exists on it in 6.x, but
+whether the wrapper works unchanged against gradio 4.x and 5.x is
+untested, and `Blocks.launch`'s `(app, local_url, share_url)` return shape
+(which the capturing stand-in mimics) has not been checked on those
+majors either. The `--with gradio` requirement is deliberately left
+unpinned, matching every other launcher's package spec, so a target whose
+own `requirements.txt` pins an older Gradio will resolve to that version —
+i.e. the untested path is reachable today, it just isn't claimed as
+supported. Resolution is to run the existing fixtures against one older
+major and either widen the claim or pin a floor.
+
+**Affects:** `sidepage.core.target`, `sidepage.core.process`, `sidepage.core.ecosystem`
+
+---
+
+### 19. `sidepage pull`: remote sources, and the security surface they open
+
+`sidepage pull <source>` fetches a Hugging Face Space into
+`SIDEPAGE_HOME/apps/<name>`, resolves a run plan, registers it with
+provenance, and prints the plan. It executes nothing. `serve` then gates
+execution behind a per-commit confirmation
+(`sidepage.commands.serve._require_source_trust`). Verified end to end
+against a live Space (`Anvarbekkk/real-time-stock-predictor`).
+
+**Findings that decided the design**, all verified rather than assumed:
+
+- **The metadata API answers every gating question before any content is
+  downloaded** — `sdk`, `sdk_version`, `app_file`, commit sha, requested
+  hardware tier, upstream stage, private/gated, and the full file list
+  with per-file sizes and LFS digests. That's what makes "refuse a Docker
+  or GPU Space without fetching it" and "report the download size first"
+  possible rather than aspirational.
+- **`git clone` was rejected on evidence.** On a machine without
+  `git-lfs` installed, cloning an LFS-backed Space *succeeds* and leaves
+  every model weight as a ~130-byte text pointer; the app then fails at
+  runtime with a nonsensical error. Reproduced directly. Fetching over
+  `resolve/<sha>/<path>` returns the real bytes, needs neither `git` nor
+  `git-lfs`, and lets each large file be checked against the sha256 the
+  API declared beforehand.
+- **A nonexistent Space returns `401`, not `404`** — the Hub answers
+  identically for missing and private repos so it doesn't leak which
+  private ones exist. Surfacing its raw "Invalid username or password"
+  would send someone hunting for credentials they don't need.
+- **Hardware is allowlisted (`cpu-*`), not denylisted.** Verified tiers:
+  `cpu-basic`, `cpu-upgrade`, `cpu-xl` runnable; `zero-a10g` is ZeroGPU.
+  A denylist would silently pass whatever accelerator tier ships next.
+
+**Deliberately not done** (each a decision, not an oversight): no version
+tracking — `pull` always fetches the source's current state, there's no
+`--ref` and no pinning; no dependency installation or resolution —
+sidepage is the installer, not the dependency manager, so a Space's
+`sdk_version` is displayed but never forced onto the launcher, and a slow
+first `serve` for an 80-package TensorFlow app is the app's own weight;
+no secret granting — requested env names are displayed, nothing is bound
+until `serve --env`.
+
+**Open items, carried deliberately:**
+
+1. **Symlink containment is enforced, but the general "shortcut" surface
+   isn't closed.** `pull.safe_relative_path` resolves an `app_file` and
+   refuses one landing outside the app directory, symlinks included. Not
+   yet considered: hardlinks, a repo shipping a `.pth` file that mutates
+   `sys.path` at interpreter start, a `sitecustomize.py`, or a
+   `pyproject.toml`/`requirements.txt` whose *contents* point at a local
+   path or a VCS URL. Sidepage hands the dependency file to `uv`
+   unexamined by design, so a hostile requirements file is currently a
+   real, unmitigated path. The trust gate is what stands between that and
+   execution — which is why the gate is per-commit and refuses
+   non-interactively rather than being a one-time formality.
+2. **The env-name scan is a heuristic.** `os.environ[...]`/`os.getenv(...)`
+   with a literal name only. A name built at runtime isn't reported, and
+   a name in dead code is. It exists to make a request *visible*, never
+   to be exhaustive — nothing is granted on its basis either way.
+3. **No Hub authentication**, so private and gated Spaces are refused
+   rather than supported. Adding it means holding an HF token, which
+   belongs in the vault by name like every other credential — the design
+   is obvious, it just isn't built.
+4. **Only Hugging Face.** GitHub, MCP registry names, and local paths are
+   recognized well enough to refuse with a specific message. GitHub in
+   particular will need a genuinely different transport (git), which is
+   why source-specific knowledge lives in `sidepage.core.hf` rather than
+   in `pull`'s generic plumbing.
+5. **Gradio version fidelity is now on the critical path**, not a filed
+   caveat. Real Spaces pin `4.43.0`, `5.25.2`, `5.29.0` — see #18. A
+   pulled Space whose `requirements.txt` pins Gradio 4.x will exercise
+   the wrapper against a major that has never been tested.
+6. **No size ceiling.** `pull` reports the download size and `--dry-run`
+   shows it without fetching, but nothing refuses an 80 GB Space. A
+   threshold with an explicit override is the obvious next step.
+7. **The hardware gate reads `runtime.hardware.requested`, which is a
+   hosting choice, not a requirement.** Shipped as a hard refusal first;
+   corrected to a caution with `--ignore-hardware` after verifying that
+   `@spaces.GPU` is inert off Hugging Face — a ZeroGPU Space really does
+   run locally, on CPU. What sidepage would actually like to know is
+   "will this fit on this machine", and the tier is only a weak proxy:
+   it says nothing about model size, and a `cpu-basic` Space can still be
+   far too slow to use. A sharper signal is available and unused — the
+   dependency file and the LFS blob sizes are both visible in the
+   metadata *before* download, so "this Space carries 40 GB of weights"
+   is answerable directly rather than inferred from a billing tier. The
+   related idea of a declared local hardware profile (tell sidepage what
+   the machine has, let it decide) is deliberately not built: there's no
+   consumer for it yet beyond this one check, and inventing a hardware
+   description format for a single warning would be the wrong shape.
+8. **Trust is recorded per commit, but nothing verifies the files still
+   match it.** `serve` compares `trusted_commit` to `commit` and stays
+   quiet when they agree — yet the tree under `apps/<name>` is ordinary
+   files on disk that anything can edit. Demonstrated by editing a pulled
+   app's `app.py` in place: `sidepage app show` still reports
+   `trusted: yes, at 63cd28a` for code that is no longer what was
+   reviewed. Benign when the user edits their own pulled app on purpose
+   (the case it came up in), and not a privilege boundary — anything that
+   can write there can already run code as the user. But it does mean the
+   gate's guarantee is narrower than "the code you approved is the code
+   that runs": it is "the commit you approved is still the commit
+   recorded". Closing it means hashing the tree at pull time and checking
+   it at serve time, which is cheap and not yet built.
+9. **Repository size is not runtime size, and the plan can't say so.**
+   Most Spaces are a few KB of code that call `snapshot_download` or
+   `from_pretrained` on first request — `mlx-community/supertonic-3` is
+   28 KB of repo and an unknown number of GB once running. `pull
+   --dry-run` honestly reports what *it* will fetch; it cannot report
+   what the app will fetch when it runs, and shouldn't pretend to. Worth
+   stating in the output rather than leaving a user to infer that "28 KB"
+   means the whole cost.
+
+**Two bugs found by pulling a real Space and running it**, both of which
+only surface once sidepage is asked to run code it didn't write:
+
+- **A third Gradio script shape defeated the wrapper.** Beyond the
+  unguarded `demo.launch()` and the guarded one, real Spaces use a
+  *factory*: `def build_ui(): ... return demo` with
+  `if __name__ == "__main__": build_ui().launch()`. Nothing at module
+  level ever holds a Blocks, so both an import and a namespace scan find
+  nothing (`JacobPEvans/mlx-benchmarks-viewer`). Fixed by running the
+  target the way `python <file>` would — `runpy.run_path(...,
+  run_name="__main__")` with `launch` already patched — which is also
+  exactly what Hugging Face itself does to an `app_file`, so it's the
+  most faithful emulation rather than a new special case.
+- **The upstream readiness poll gave up after 20 seconds, permanently.**
+  `check_upstream_ready` had a fixed deadline and was never retried, so
+  any app whose first run installs a large dependency tree came up fine
+  while the proxy served its "starting…" holding page *forever*. Latent
+  before `pull` — a local Streamlit app resolves in seconds — and
+  guaranteed after it, since pulled Spaces routinely pin heavy stacks.
+  The lazy-start path now polls without a deadline; a wall-clock limit
+  was simply the wrong shape for "waiting on `uv`".
+
+**Affects:** `sidepage.core.hf`, `sidepage.core.pull`,
+`sidepage.commands.pull`, `sidepage.commands.serve`,
+`sidepage.core.app_registry`, `sidepage.core.process`,
+`sidepage.core.reverse_proxy`

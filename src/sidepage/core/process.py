@@ -9,8 +9,8 @@ the wrapped process, starts the local reverse proxy
 until interrupted.
 
 **What's real vs. not**, since this orchestrates every other module: static,
-Streamlit-flavored, FastAPI-flavored, MCP-flavored (Python), and notebook
-(Jupyter Lab) targets, `open`/`token` auth, `--env` secret injection,
+Streamlit-flavored, FastAPI-flavored, MCP-flavored (Python), Gradio-flavored,
+and notebook (Jupyter Lab) targets, `open`/`token` auth, `--env` secret injection,
 `--anon` tunneling, and `--domain` BYO tunneling (see
 `sidepage.core.tunnel_manager.open_byo_tunnel`) all actually work.
 Non-local `--scope`, `network`/`oauth` auth, and
@@ -64,12 +64,16 @@ from pathlib import Path
 
 import httpx
 
-from sidepage.config.settings import mcp_wrappers_dir
+from sidepage.config.settings import app_log_file, ensure_dirs, wrappers_dir
 from sidepage.core import (
     _platform,
     account,
+    app_registry,
+    directory_client,
     ecosystem,
     notebook,
+    pwa,
+    qr,
     registry,
     secrets_vault,
     tunnel_manager,
@@ -99,7 +103,7 @@ from sidepage.core.token_runtime import (
     write_control_token_file,
     write_runtime_file,
 )
-from sidepage.output import error, info, stdout, success, warn
+from sidepage.output import error, info, json_line, plain, stdout, success, warn
 
 
 @dataclass(frozen=True)
@@ -111,12 +115,29 @@ class ServeConfig:
     auth: AuthTier
     scope: Scope
     anon: bool = False  # Quick Tunnel, no directory entry — orthogonal to `auth`
+    # --no-suffix: route BYO-domain apps at a bare `<app-name>.<domain>`
+    # instead of `<app-name>-<id>.<domain>`. Requires `--domain` — the
+    # dedupe id exists nowhere else (local serving has no hostname,
+    # `--anon` gets Cloudflare's), so `_validate_supported` rejects it
+    # rather than accepting a flag that would do nothing.
+    no_suffix: bool = False
     token: str | None = None  # explicit --token; None means env var or auto-generate
     env_secrets: tuple[str, ...] = ()  # v4 §9 — vault secret names for --env (repeatable)
     guardrail: Path | None = None  # parked, not built — see sidepage.core.guardrail
     timeout: float | None = None  # v5 §20 — absolute lifetime in seconds, from started_at
     idle_timeout: float | None = None  # v5 §20 — seconds since last proxied traffic
     peers: tuple[tuple[str, str], ...] = ()  # v5 --peer: (role, app_name) pairs, repeatable
+    pwa: pwa.PwaOptions | None = None  # --pwa; None means PWA mode is off
+    qr: bool = False  # --qr — print a terminal QR code for the resulting URL
+    # --autoregister: save this invocation to the app registry
+    # (`sidepage.core.app_registry`) once it's actually serving. See
+    # `_autoregister_preflight` / `_autoregister_commit` below.
+    autoregister: bool = False
+    # --detach / --json (v5 §21). See `_serve_detached` and
+    # `_ready_payload` for what these actually change; both are handled
+    # generically enough that `proxy` carries the identical pair.
+    detach: bool = False
+    json_output: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,6 +160,8 @@ class ProxyConfig:
     token: str | None = None
     timeout: float | None = None
     idle_timeout: float | None = None
+    detach: bool = False
+    json_output: bool = False
 
 
 # Both recognized MCP packages ship their own DNS-rebinding protection
@@ -217,62 +240,232 @@ _MCP_WRAPPER_SOURCE: dict[McpPackage, str] = {
 }
 
 
-def _mcp_wrapper_path(app_name: str) -> Path:
-    """Deterministic per-app path for the generated wrapper module (see
-    `_write_mcp_host_wrapper`) — recomputed by `serve`'s `_teardown` to
-    clean it up without threading extra state through the closure.
+# Gradio's script conventions are the reason this launcher needs a
+# generated wrapper at all, and it's a stronger reason than MCP's. A
+# FastAPI or MCP script conventionally guards its own server startup
+# behind `if __name__ == "__main__":`, so importing the module to reach
+# its ASGI app is safe. Gradio's own documentation does the opposite —
+# the canonical example ends with a bare, unguarded `demo.launch()` at
+# module level — so a plain import would start Gradio's blocking server
+# and never return.
+#
+# **The wrapper runs the target the way `python <file>` would**
+# (`runpy.run_path(..., run_name="__main__")`), with `Blocks.launch`
+# already patched to a capturing no-op. That's deliberately the same
+# thing Hugging Face Spaces does to an `app_file`, which makes it the
+# most faithful possible emulation — and it is what handles all three
+# script shapes found in the wild, where importing the module only
+# handles the first two:
+#
+#   1. unguarded `demo.launch()` at module level  (Gradio's own docs)
+#   2. `demo` at module level, `launch()` inside a `__main__` guard
+#   3. a *factory*: `def build_ui(): ... return demo`, with
+#      `if __name__ == "__main__": build_ui().launch()`
+#
+# Shape 3 defeats both an import and a namespace scan — the Blocks is a
+# local inside the factory, and nothing at module level ever holds one.
+# Found the hard way, by pulling a real Space
+# (`JacobPEvans/mlx-benchmarks-viewer`) and watching this wrapper fail on
+# it. Running the file as `__main__` fixes it without special-casing:
+# whatever the author's own entrypoint does, `launch` captures the Blocks
+# it lands on. `SystemExit` is caught because a guard is allowed to end
+# in `sys.exit()`, and by then the capture has already happened.
+#
+# The capture also neutralizes a hardcoded `server_port=` (which would
+# otherwise ignore sidepage's allocated port entirely), `share=True` (an
+# unwanted second, Gradio-hosted tunnel), and `ssr_mode=True` (a Node
+# sidecar on a second port, breaking the one-port contract every layer
+# downstream assumes). `launch()`'s real return is a `(app, local_url,
+# share_url)` triple, so the stand-in returns one too — scripts that
+# unpack it keep working.
+#
+# `mount_gradio_app` is Gradio's own supported embedding entrypoint, and
+# it is what does the Blocks setup `launch()` would otherwise have done.
+# Calling the lower-level `routes.App.create_app(blocks)` directly does
+# not: it serves the API routes fine but `GET /` returns 500 (the
+# template renders against a `config` that is never populated), verified
+# live against gradio 6.26.0.
+#
+# **No CORS/Host bypass here, deliberately** — unlike every other wrapped
+# framework in this module (Streamlit's `--server.enableCORS`, Jupyter's
+# `--ServerApp.disable_check_xsrf`, MCP's `enable_dns_rebinding_protection`
+# above). Gradio's `CustomCORSMiddleware` only rejects anything when the
+# `Host` *the wrapped process sees* is a loopback alias, and in that case
+# the browser's `Origin` is that same loopback address, so it passes;
+# behind `--domain`/`--anon` the Host is the public hostname, which the
+# check ignores outright. Verified live (a real prediction round-trip
+# through sidepage's own reverse proxy). If a future reader finds this
+# suspicious by comparison with the launchers above: the difference is
+# real, and `strict_cors` should stay at its default.
+_GRADIO_WRAPPER_SOURCE = (
+    "import runpy\n"
+    "import sys\n"
+    "sys.path.insert(0, {target_parent!r})\n"
+    "\n"
+    "import gradio\n"
+    "from fastapi import FastAPI\n"
+    "\n"
+    "_launched = []\n"
+    "\n"
+    "\n"
+    "def _capture_launch(self, *args, **kwargs):\n"
+    "    _launched.append((self, kwargs))\n"
+    "    return None, '', ''\n"
+    "\n"
+    "\n"
+    "gradio.Blocks.launch = _capture_launch\n"
+    "\n"
+    "\n"
+    "def _resolve_blocks():\n"
+    "    try:\n"
+    "        namespace = runpy.run_path({target_path!r}, run_name='__main__')\n"
+    "    except SystemExit:\n"
+    "        namespace = {{}}\n"
+    "    if _launched:\n"
+    "        return _launched[-1]\n"
+    "    found = {{\n"
+    "        name: value\n"
+    "        for name, value in namespace.items()\n"
+    "        if isinstance(value, gradio.Blocks)\n"
+    "    }}\n"
+    "    if 'demo' in found:\n"
+    "        return found['demo'], {{}}\n"
+    "    if len(found) == 1:\n"
+    "        return next(iter(found.values())), {{}}\n"
+    "    if not found:\n"
+    "        raise RuntimeError(\n"
+    "            {target_name!r} + ': no gradio app found. sidepage runs this file the way "
+    "`python <file>` would, with .launch() neutralized, and serves whichever "
+    "Blocks/Interface it was called on \u2014 or a module-level one named `demo` if it is "
+    "never called.'\n"
+    "        )\n"
+    "    raise RuntimeError(\n"
+    "        {target_name!r} + ': found several gradio apps (' + ', '.join(sorted(found))\n"
+    "        + ') and none named `demo`. Call .launch() on the one to serve, or name "
+    "it `demo`.'\n"
+    "    )\n"
+    "\n"
+    "\n"
+    "\n"
+    "# Presentation options an author passes to `.launch()` that\n"
+    "# `mount_gradio_app` also accepts. Gradio 6 moved `css` (and friends)\n"
+    "# off `Blocks` onto the launcher, so a Space that styles itself the\n"
+    "# documented way loses all of it unless they are forwarded here.\n"
+    "_FORWARDED = (\n"
+    "    'css', 'css_paths', 'js', 'head', 'head_paths', 'theme', 'i18n',\n"
+    "    'allowed_paths', 'blocked_paths', 'favicon_path', 'auth',\n"
+    "    'auth_message', 'max_file_size', 'pwa',\n"
+    ")\n"
+    "\n"
+    "\n"
+    "def make_app():\n"
+    "    blocks, launch_kwargs = _resolve_blocks()\n"
+    "    forwarded = {{k: v for k, v in launch_kwargs.items() if k in _FORWARDED}}\n"
+    "    return gradio.mount_gradio_app(\n"
+    "        FastAPI(), blocks, path='/', ssr_mode=False, **forwarded\n"
+    "    )\n"
+)
 
-    Lives under `sidepage.config.settings.mcp_wrappers_dir()`, not next to
-    the target script: `serve` requires `app_name` to be unique among
+
+# Launchers that can't be started from a bare `<module>:<attr>` import
+# string and so generate a wrapper module (see `_write_launch_wrapper`).
+# `serve`'s `_teardown` consults this to know whether there's a generated
+# file to clean up, instead of testing each launcher by name.
+_WRAPPER_LAUNCHERS = frozenset({CodeLauncher.MCP, CodeLauncher.GRADIO})
+
+
+def _wrapper_path(app_name: str, launcher: CodeLauncher) -> Path:
+    """Deterministic per-app, per-launcher path for a generated wrapper
+    module (see `_write_launch_wrapper`) — recomputed by `serve`'s
+    `_teardown` to clean it up without threading extra state through the
+    closure.
+
+    Lives under `sidepage.config.settings.wrappers_dir()`, not next to the
+    target script: `serve` requires `app_name` to be unique among
     currently-running apps (checked up front), so keying on it here can't
     collide the way keying on `target.stem` next to the target could — two
     unrelated targets named `app.py` in different directories used to both
     want `_sidepage_mcp_wrapper_app.py` in *their own* directory, which was
     fine until one of them was a directory the user also tracks in git
     (see `tests/fixtures/mcp-app`, whose committed fixture file this exact
-    collision used to clobber and then delete on every `serve`/teardown)."""
-    return mcp_wrappers_dir() / f"_sidepage_mcp_wrapper_{app_name}.py"
+    collision used to clobber and then delete on every `serve`/teardown).
+
+    The launcher name is part of the filename so two launchers can never
+    want the same path for one app name. A hyphen in `app_name` is fine:
+    uvicorn resolves its import string through `importlib.import_module`,
+    which accepts any module name that maps to a file on `--app-dir`, not
+    only valid Python identifiers."""
+    return wrappers_dir() / f"_sidepage_{launcher.value}_wrapper_{app_name}.py"
 
 
-def _write_mcp_host_wrapper(
-    target: Path, app_name: str, package: McpPackage, app_var: str, app_method: str
-) -> Path:
-    """Writes a small module under `mcp_wrappers_dir()` that imports the
-    user's MCP server variable, calls the real app-builder method with the
-    package's built-in Host/Origin allowlisting turned off, and wraps the
-    result in permissive CORS middleware (see the `_MCP_WRAPPER_SOURCE`
-    comment above for why both are necessary and safe).
+def _write_launch_wrapper(app_name: str, launcher: CodeLauncher, source: str) -> Path:
+    """Write `source` as the generated wrapper module for `app_name`.
 
     Living outside `target`'s own directory means the plain cwd-based
-    import resolution the bare `<module>:<app>` reference relies on
-    elsewhere in this function no longer applies — the generated source
-    itself `sys.path.insert(0, ...)`s `target.parent` before importing the
-    user's module, and `_build_code_launch_argv`'s MCP branch passes
-    uvicorn `--app-dir` pointing at *this* module's directory instead, so
-    the import resolves regardless of the subprocess's cwd.
+    import resolution a bare `<module>:<app>` reference relies on
+    elsewhere no longer applies — every wrapper source below
+    `sys.path.insert(0, ...)`s `target.parent` before importing the user's
+    module, and `_build_code_launch_argv` passes uvicorn `--app-dir`
+    pointing at *this* directory instead, so the import resolves
+    regardless of the subprocess's cwd.
 
     Regenerated fresh on every `serve` call, not reused across runs, and
-    removed again by `serve`'s `_teardown` — see `_mcp_wrapper_path`.
+    removed again by `serve`'s `_teardown` — see `_wrapper_path`.
     """
-    source = _MCP_WRAPPER_SOURCE[package].format(
-        target_parent=str(target.parent), module=target.stem, app_var=app_var, app_method=app_method
-    )
-    wrapper_path = _mcp_wrapper_path(app_name)
+    wrapper_path = _wrapper_path(app_name, launcher)
     wrapper_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     wrapper_path.write_text(source)
     return wrapper_path
 
 
+def _write_mcp_host_wrapper(
+    target: Path, app_name: str, package: McpPackage, app_var: str, app_method: str
+) -> Path:
+    """Writes a wrapper module that imports the user's MCP server
+    variable, calls the real app-builder method with the package's
+    built-in Host/Origin allowlisting turned off, and wraps the result in
+    permissive CORS middleware (see the `_MCP_WRAPPER_SOURCE` comment
+    above for why both are necessary and safe)."""
+    source = _MCP_WRAPPER_SOURCE[package].format(
+        target_parent=str(target.parent), module=target.stem, app_var=app_var, app_method=app_method
+    )
+    return _write_launch_wrapper(app_name, CodeLauncher.MCP, source)
+
+
+def _write_gradio_wrapper(target: Path, app_name: str) -> Path:
+    """Writes a wrapper module that neutralizes `Blocks.launch`, imports
+    the user's module, and mounts whichever Blocks it finds on a fresh
+    FastAPI app (see the `_GRADIO_WRAPPER_SOURCE` comment above for why
+    each of those steps is load-bearing)."""
+    source = _GRADIO_WRAPPER_SOURCE.format(
+        target_parent=str(target.parent), target_path=str(target), target_name=target.name
+    )
+    return _write_launch_wrapper(app_name, CodeLauncher.GRADIO, source)
+
+
 def _build_code_launch_argv(
-    target: Path, launcher: CodeLauncher, port: int, app_name: str
+    target: Path,
+    launcher: CodeLauncher,
+    port: int,
+    app_name: str,
+    public_origin: str | None,
 ) -> list[str]:
+    """`public_origin` is the one real origin this app will actually be
+    reachable at — `https://<app>-<id>.<domain>` for `--domain`,
+    `http://127.0.0.1:<listen_port>` for a plain local serve, or `None`
+    for `--anon` (the `*.trycloudflare.com` hostname isn't assigned until
+    `cloudflared` reports it, *after* this function's caller launches the
+    subprocess — see `sidepage.core.process.serve`). Used to allowlist
+    exactly that origin instead of wildcarding Origin/CORS wide open,
+    where the launcher supports it — see the `STREAMLIT` branch below.
+    """
     if launcher is CodeLauncher.STREAMLIT:
         # extra_packages=["streamlit"] guarantees the launcher's own
         # detected requirement is present even if the target's own
         # requirements.txt doesn't declare it — see sidepage.core.ecosystem
         # for why that matters in practice.
         runner = ecosystem.resolve_python_runner(target.parent, extra_packages=["streamlit"])
-        return runner + [
+        argv = runner + [
             "streamlit",
             "run",
             str(target),
@@ -283,6 +476,45 @@ def _build_code_launch_argv(
             "--server.address",
             "127.0.0.1",
         ]
+        # Streamlit's own Tornado WebSocket handler rejects a connection
+        # whenever Origin doesn't match Host by default
+        # (server.enableCORS's default) — and through sidepage's reverse
+        # proxy, Origin is always the real public hostname while Host is
+        # always 127.0.0.1:<port>, so that mismatch is guaranteed, not
+        # occasional. Reproduced live as every WS-based render silently
+        # failing behind --domain/--anon ("Rejecting WebSocket connection
+        # with disallowed Origin or Host header").
+        #
+        # When the real origin is known (--domain, or a plain local
+        # serve), allowlist exactly that one origin instead of opening
+        # CORS to everywhere — verified live (a real Streamlit server, a
+        # WS handshake with the allowlisted Origin succeeding, a
+        # different Origin getting a real 403) that
+        # `--server.corsAllowedOrigins` does real per-origin enforcement,
+        # not just silence the warning. `--server.enableCORS` is passed
+        # explicitly either way rather than relying on its default (which
+        # is already `true`) — this module doesn't leave a
+        # security-relevant flag to "whatever the wrapped framework
+        # currently defaults to."
+        #
+        # `--anon` (public_origin is None) keeps the wide-open fallback:
+        # the tunnel hostname genuinely isn't known yet at launch time,
+        # so there's nothing narrower to allowlist against. Same
+        # trust-boundary reasoning as the MCP host wrapper's
+        # enable_dns_rebinding_protection=False and Jupyter's
+        # --ServerApp.disable_check_xsrf=True covers that gap for ephemeral
+        # sessions: sidepage's own proxy + --auth gate is what actually
+        # gates access, not Streamlit's Origin check.
+        if public_origin is not None:
+            argv += [
+                "--server.enableCORS",
+                "true",
+                "--server.corsAllowedOrigins",
+                public_origin,
+            ]
+        else:
+            argv += ["--server.enableCORS", "false"]
+        return argv
 
     if launcher is CodeLauncher.FASTAPI:
         # Launched via `uvicorn <module>:<app>`, not by running the script
@@ -327,8 +559,8 @@ def _build_code_launch_argv(
         # module that calls the real app-builder itself, with that
         # protection turned off, and uvicorn serves *that* module's
         # `make_app` factory instead. That module lives under
-        # `mcp_wrappers_dir()`, not next to `target` (see
-        # `_write_mcp_host_wrapper`) — `--app-dir` points uvicorn's own
+        # `wrappers_dir()`, not next to `target` (see
+        # `_write_launch_wrapper`) — `--app-dir` points uvicorn's own
         # import at that directory since the subprocess's cwd is still
         # `target.parent`, not the wrapper's directory.
         package = detect_mcp_package(target)
@@ -338,6 +570,40 @@ def _build_code_launch_argv(
             target.parent, extra_packages=[package.value, "uvicorn"]
         )
         wrapper_path = _write_mcp_host_wrapper(target, app_name, package, app_var, app_method)
+        return runner + [
+            "uvicorn",
+            f"{wrapper_path.stem}:make_app",
+            "--factory",
+            "--app-dir",
+            str(wrapper_path.parent),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+        ]
+
+    if launcher is CodeLauncher.GRADIO:
+        # Same generated-wrapper + `uvicorn --factory` shape as MCP above,
+        # for a stronger version of the same reason: a Gradio script's
+        # `demo.launch()` is conventionally *unguarded* at module level,
+        # so there is no safe way to import the module and reach its ASGI
+        # app without first neutralizing that call. See
+        # `_GRADIO_WRAPPER_SOURCE` for what the wrapper does and why each
+        # step is load-bearing.
+        #
+        # `public_origin` is deliberately unused here — Gradio needs no
+        # origin allowlisting to work behind this proxy, the one wrapped
+        # framework in this module that doesn't. That's verified, not
+        # assumed; the reasoning is recorded on `_GRADIO_WRAPPER_SOURCE`.
+        #
+        # `fastapi` isn't in `extra_packages` even though the wrapper
+        # imports it: it's a hard dependency of `gradio` itself, the same
+        # way the MCP branch above relies on `starlette` arriving with the
+        # MCP package rather than naming it separately.
+        runner = ecosystem.resolve_python_runner(
+            target.parent, extra_packages=["gradio", "uvicorn"]
+        )
+        wrapper_path = _write_gradio_wrapper(target, app_name)
         return runner + [
             "uvicorn",
             f"{wrapper_path.stem}:make_app",
@@ -404,6 +670,165 @@ def _validate_common(
     return domain_config
 
 
+# `--autoregister` flags that describe how *this one run* behaves rather
+# than what the served app is, so `sidepage.core.app_registry` has nowhere
+# to put them. Reported by name at startup instead of dropped silently —
+# a saved config the user believes is complete, but which quietly loses
+# an auth token or a lifetime limit, is exactly the kind of silent
+# divergence this codebase refuses everywhere else. Keyed by the
+# `ServeConfig` field, valued by the user-facing flag name, with a
+# predicate for "was this actually set on this invocation".
+_UNREGISTERABLE_FLAGS: tuple[tuple[str, str], ...] = (
+    ("token", "--token"),
+    ("timeout", "--timeout"),
+    ("idle_timeout", "--idle-timeout"),
+    ("peers", "--peer"),
+    ("qr", "--qr"),
+    # Both are properties of *this* invocation's call site, not of the
+    # app: whether the caller wanted a terminal held open, and whether it
+    # wanted machine-readable output. Replaying a registration should not
+    # inherit either.
+    ("detach", "--detach"),
+    ("json_output", "--json"),
+)
+
+
+def _unregisterable_flags_in_use(config: ServeConfig) -> list[str]:
+    """Which `_UNREGISTERABLE_FLAGS` this invocation actually passed —
+    truthiness is the test, which is correct for every one of them: `None`
+    for the two timeouts and the token, an empty tuple for `--peer`, and
+    `False` for the `--qr` switch all mean "not passed."""
+    return [flag for field, flag in _UNREGISTERABLE_FLAGS if getattr(config, field)]
+
+
+def _pending_registration(
+    config: ServeConfig, *, target: Path, target_kind: TargetKind
+) -> app_registry.AppRegistration:
+    """The `AppRegistration` this invocation would save under
+    `--autoregister`. Built from the *resolved* config — concrete
+    `target`/`target_kind`, not whatever `--type auto` was typed as — so
+    it's directly comparable with an already-stored entry.
+
+    `registered_at` is a placeholder here: this object is only ever used
+    for comparison (`app_registry.same_config` ignores that field) or as
+    the argument list for a real `app_registry.register` call, which
+    stamps its own timestamp.
+    """
+    return app_registry.AppRegistration(
+        target=target,
+        target_kind=target_kind,
+        name=config.name,
+        domain=config.domain,
+        auth=config.auth,
+        scope=config.scope,
+        anon=config.anon,
+        no_suffix=config.no_suffix,
+        env_secrets=config.env_secrets,
+        guardrail=config.guardrail,
+        pwa=config.pwa,
+        registered_at="",
+    )
+
+
+def _autoregister_preflight(
+    config: ServeConfig, *, app_name: str, target: Path, target_kind: TargetKind
+) -> bool:
+    """Decide — before anything is launched — whether `--autoregister`
+    should write after startup, and report anything it can't save.
+
+    Returns `True` to write once the app is up, `False` when an identical
+    entry already exists and there's nothing to do.
+
+    Raises `ValueError` when a *different* config is already registered
+    under this name. That's the one genuinely ambiguous case: silently
+    overwriting would replace a config the user may have hand-tuned with
+    `sidepage app register`, and silently keeping the old one would leave
+    them believing this invocation was saved when it wasn't. Run here,
+    before any port is allocated or subprocess spawned, so it fails
+    immediately rather than after a slow boot.
+    """
+    unregisterable = _unregisterable_flags_in_use(config)
+    if unregisterable:
+        them = "it" if len(unregisterable) == 1 else "them"
+        warn(
+            f"--autoregister won't save {', '.join(unregisterable)} — "
+            f"`sidepage serve {app_name}` won't replay {them}, "
+            "pass them on the command line again."
+        )
+    if config.token is not None:
+        info(
+            "--token specifically is never stored: it's process-scoped and a fresh one is "
+            "issued on each serve."
+        )
+
+    existing = app_registry.get(app_name)
+    if existing is None:
+        return True
+
+    candidate = _pending_registration(config, target=target, target_kind=target_kind)
+    if app_registry.same_config(existing, candidate, default_name=app_name):
+        warn(
+            f"reusing existing app, next time use `sidepage serve {app_name}` — "
+            f"{app_name!r} is already registered with this exact config."
+        )
+        return False
+
+    raise ValueError(
+        f"an app named {app_name!r} is already registered with a different config — "
+        f"`sidepage app show {app_name}` to compare, `sidepage app unregister {app_name}` "
+        "to replace it, or pass --name to register this one under a different name."
+    )
+
+
+def _autoregister_commit(
+    config: ServeConfig, *, app_name: str, target: Path, target_kind: TargetKind
+) -> None:
+    """Save this invocation to the app registry. Called only after the app
+    is genuinely up and serving — a config that failed to start is never
+    worth persisting — and only when `_autoregister_preflight` already
+    cleared the name, so the duplicate-name rejection inside
+    `app_registry.register` can't fire here.
+    """
+    pending = _pending_registration(config, target=target, target_kind=target_kind)
+    app_registry.register(
+        app_name,
+        target=pending.target,
+        target_kind=pending.target_kind,
+        name=pending.name,
+        domain=pending.domain,
+        auth=pending.auth,
+        scope=pending.scope,
+        anon=pending.anon,
+        no_suffix=pending.no_suffix,
+        env_secrets=pending.env_secrets,
+        guardrail=pending.guardrail,
+        pwa=pending.pwa,
+    )
+    success(f"registered as {app_name!r} — replay it with `sidepage serve {app_name}`")
+
+
+def _assert_hostname_available(
+    no_suffix: bool, app_name: str, domain_config: account.DomainConfig | None
+) -> None:
+    """Pre-flight `app_name`'s BYO-domain hostname against the zone's DNS
+    (`sidepage.core.tunnel_manager.assert_hostname_available`), or do
+    nothing when there's no `--domain` — a local or `--anon` app claims no
+    name in anyone's zone. Shared verbatim by `serve` and `proxy`, which
+    both run it in the same slot: immediately after the local
+    already-running-name check, before anything is allocated or started.
+    """
+    if domain_config is None:
+        return
+    tunnel_manager.assert_hostname_available(
+        app_name,
+        domain_config.domain,
+        zone_id=domain_config.zone_id,
+        tunnel_id=domain_config.tunnel_id,
+        api_token_name=domain_config.api_token_name,
+        suffix=not no_suffix,
+    )
+
+
 def _validate_supported(config: ServeConfig) -> account.DomainConfig | None:
     """Validate `config` and resolve `--domain` against the persisted BYO
     configuration, all before `serve` does anything else — including
@@ -418,6 +843,12 @@ def _validate_supported(config: ServeConfig) -> account.DomainConfig | None:
         raise NotImplementedError(
             "--guardrail isn't implemented — parked, see sidepage.core.guardrail."
         )
+    if config.no_suffix and config.domain is None:
+        raise ValueError(
+            "--no-suffix only applies to --domain — it drops the dedupe id from the "
+            "hostname sidepage routes on your own domain. A local serve has no hostname "
+            "to shorten, and --anon's *.trycloudflare.com name is Cloudflare's to assign."
+        )
     return _validate_common(
         domain=config.domain,
         anon=config.anon,
@@ -428,9 +859,202 @@ def _validate_supported(config: ServeConfig) -> account.DomainConfig | None:
     )
 
 
+# --- `--detach` (v5 §21) -----------------------------------------------
+#
+# `serve`/`proxy` block until Ctrl+C or `sidepage stop`, which makes them
+# unusable from any caller that can't hold a terminal open — a CI step, an
+# agent harness, a dispatched task. `--detach` re-execs this same command
+# as a background child and returns once the app is actually up.
+#
+# The readiness signal is `registry.register()`, which the child calls at
+# the exact point every fact is known (port allocated, subprocess healthy,
+# tunnel open). That's the whole reason this belongs in sidepage rather
+# than in a wrapper script: an external wrapper can only scrape stdout for
+# something URL-shaped and guess, whereas the registry entry either exists
+# or doesn't. No regex, no false positive on a docs link in a startup log,
+# no false failure because an app logged the word "error".
+_DETACHED_CHILD_ENV = "SIDEPAGE_DETACHED_CHILD"
+
+# Generous because a first run resolves the target's dependencies through
+# `uv`, which can genuinely take minutes on a cold cache. Hitting this cap
+# is reported as "starting", not "failed" — the child is left running and
+# the caller is pointed at the log, since a slow resolve and a hang look
+# identical from out here and only one of them is worth killing.
+_DETACH_READY_TIMEOUT = 180.0
+
+
+def is_detached_child() -> bool:
+    """True inside the child a `--detach` parent spawned. The child runs
+    the ordinary blocking path — it must not detach again."""
+    return os.environ.get(_DETACHED_CHILD_ENV) == "1"
+
+
+def _detached_child_argv() -> list[str]:
+    """The current invocation, minus `--detach`, as a spawnable argv.
+
+    Rebuilt from `sys.argv` rather than reconstructed from the config
+    dataclass: the config is normalized and lossy (defaults resolved,
+    paths absolutized, `--type` inferred), so a reconstruction would
+    silently run something subtly different from what the user typed. The
+    interpreter and `-m sidepage` come from `sys.executable` and
+    `sidepage.__main__` so the child is guaranteed the same interpreter
+    and the same installed package as the parent.
+    """
+    # `--qr` is dropped along with `--detach`: the child's stdout is a log
+    # file, where `print_tty` can only fail and log a warning. The parent
+    # is the one attached to a terminal, so it renders the code itself
+    # once it knows the URL — see `_spawn_detached`.
+    dropped = {"--detach", "-d", "--qr"}
+    args = [a for a in sys.argv[1:] if a not in dropped]
+    return [sys.executable, "-m", "sidepage", *args]
+
+
+def _spawn_detached(app_name: str, *, json_output: bool, want_qr: bool = False) -> int:
+    """Run this command again in the background, wait for it to register
+    as running, and report. Returns the process exit code for the parent.
+
+    Never raises for a child-side failure — a failed launch is reported
+    through the same payload shape as a successful one, because the whole
+    point of `--detach` is to give a caller one parseable answer either
+    way.
+    """
+    ensure_dirs()
+    log_path = app_log_file(app_name)
+    child_env = {
+        **os.environ,
+        _DETACHED_CHILD_ENV: "1",
+        # Rich falls back to an 80-column width when its output isn't a
+        # terminal, and hard-wraps to it — which is how a child's log ends
+        # up with newlines inserted mid-word and mid-URL. That log is the
+        # only account of a failure, and `_log_tail` feeds it straight into
+        # the `error` field of a `failed` payload, so a wrapped message is
+        # a corrupted diagnostic, not a cosmetic issue. `COLUMNS` is the
+        # documented way to tell Rich otherwise.
+        "COLUMNS": "200",
+    }
+
+    # Detach properly on both platforms: a new session (POSIX) or a new
+    # process group with no console (Windows) means the child survives the
+    # parent exiting and never receives the parent's Ctrl+C.
+    popen_kwargs: dict[str, object] = {}
+    if _platform._WINDOWS:
+        popen_kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    with log_path.open("wb") as log:
+        child = subprocess.Popen(  # noqa: S603 — argv is our own, see _detached_child_argv
+            _detached_child_argv(),
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            env=child_env,
+            **popen_kwargs,  # type: ignore[arg-type]
+        )
+
+    deadline = time.time() + _DETACH_READY_TIMEOUT
+    while time.time() < deadline:
+        running = registry.get(app_name)
+        if running is not None:
+            payload = _ready_payload_from_registry(running, log_path=log_path)
+            _emit_payload(payload, json_output=json_output)
+            if want_qr:
+                # Under --json stdout is reserved for the one machine-
+                # readable line, so the code goes to stderr with the rest
+                # of the human-facing output.
+                qr.print_qr(payload["url"], out=sys.stderr if json_output else None)
+            return 0
+        if child.poll() is not None:
+            # Exited before registering: a validation error, a failed
+            # dependency resolve, a port conflict. The log is the only
+            # account of why, so it's carried in the payload rather than
+            # leaving the caller to go find it.
+            payload = {
+                "status": "failed",
+                "app": app_name,
+                "pid": child.pid,
+                "exit_code": child.returncode,
+                "log": str(log_path),
+                "error": _log_tail(log_path),
+            }
+            _emit_payload(payload, json_output=json_output)
+            return 1
+        time.sleep(0.25)
+
+    payload = {
+        "status": "starting",
+        "app": app_name,
+        "pid": child.pid,
+        "log": str(log_path),
+        "note": (
+            f"no registry entry after {_DETACH_READY_TIMEOUT:g}s; still running. "
+            f"Check `sidepage status {app_name}` or the log."
+        ),
+    }
+    _emit_payload(payload, json_output=json_output)
+    return 0
+
+
+def _log_tail(path: Path, *, lines: int = 20) -> str:
+    try:
+        content = path.read_text(errors="replace")
+    except OSError:
+        return ""
+    return "\n".join(content.splitlines()[-lines:])
+
+
+def _ready_payload_from_registry(running: registry.RunningApp, *, log_path: Path | None) -> dict:
+    payload: dict = {
+        "status": "running",
+        "app": running.name,
+        "pid": running.pid,
+        "url": running.tunnel_url or running.url,
+        "local_url": running.url,
+        "tunnel_url": running.tunnel_url,
+    }
+    if log_path is not None:
+        payload["log"] = str(log_path)
+    return payload
+
+
+def _emit_payload(payload: dict, *, json_output: bool) -> None:
+    """One readiness report, in whichever form the caller asked for."""
+    if json_output:
+        json_line(payload)
+        return
+    status = payload["status"]
+    if status == "running":
+        success(f"{payload['app']} serving at {payload['url']}")
+        info(f"log: {payload['log']}")
+        info(f"`sidepage stop {payload['app']}` to tear it down")
+    elif status == "failed":
+        error(f"{payload['app']} failed to start — see {payload['log']}")
+        if payload.get("error"):
+            plain.print(payload["error"])
+    else:
+        warn(payload["note"])
+
+
 def serve(config: ServeConfig) -> None:
     """Start the app and block until interrupted. See module docstring for
-    what's real vs. not."""
+    what's real vs. not.
+
+    With `--detach`, returns as soon as the app is up (or has failed)
+    instead of blocking — see `_spawn_detached`.
+    """
+    if config.detach and not is_detached_child():
+        # Deliberately before any validation: the child re-runs every
+        # check itself, and duplicating them here would mean two places
+        # to keep in sync and two chances to disagree. A config error
+        # surfaces as a `failed` payload carrying the child's own error
+        # message, which is the same text an attached run would print.
+        app_name = config.name or config.target.resolve().stem or config.target.name
+        raise SystemExit(
+            _spawn_detached(app_name, json_output=config.json_output, want_qr=config.qr)
+        )
+
     domain_config = _validate_supported(config)
 
     # Resolve to an absolute path up front — the wrapped subprocess runs
@@ -452,6 +1076,34 @@ def serve(config: ServeConfig) -> None:
             f"an app named {app_name!r} is already registered as running — "
             f"`sidepage stop {app_name}` it first, or pass --name for a different one."
         )
+    # The same question as the check above, asked of the one namespace
+    # this machine's registry can't see: the domain's own DNS. Raises
+    # NameCollisionError if the hostname is already pointed somewhere
+    # that isn't this domain's sidepage tunnel. Here rather than at
+    # tunnel-open time so a taken name is reported before a port is
+    # allocated or a subprocess spawned — `open_byo_tunnel` re-checks
+    # anyway, but that happens after the app is already up.
+    _assert_hostname_available(config.no_suffix, app_name, domain_config)
+
+    # Checked here, before any port is allocated or subprocess spawned,
+    # for the same reason as everything else above: a name already
+    # registered with a *different* config is a real conflict, and finding
+    # that out after a slow dependency resolve would be needlessly cruel.
+    # The actual write happens only once the app is serving — see
+    # `_autoregister_commit`.
+    autoregister_pending = False
+    if config.autoregister:
+        autoregister_pending = _autoregister_preflight(
+            config, app_name=app_name, target=target, target_kind=target_kind
+        )
+
+    # Built here, before any port is allocated or subprocess spawned — a
+    # bad --pwa-icon/--pwa-manifest/hex color (pwa.PwaConfigError) fails
+    # loud immediately, same "fail before touching anything" posture as
+    # every other early check in this function.
+    pwa_runtime: pwa.PwaRuntime | None = None
+    if config.pwa is not None:
+        pwa_runtime = pwa.build_runtime(config.pwa, app_name=app_name, domain=config.domain)
 
     token: str | None = None
     if config.auth is AuthTier.TOKEN:
@@ -472,6 +1124,28 @@ def serve(config: ServeConfig) -> None:
         )
 
     listen_port = allocate_port()
+
+    # The one real origin this app will actually be reachable at — used
+    # to allowlist Streamlit/Jupyter's own Origin/Host checks instead of
+    # wildcarding them wide open (see _build_code_launch_argv's STREAMLIT
+    # branch and notebook.build_jupyter_launch_command). Computable here,
+    # before any subprocess launches, for --domain (directory_client.
+    # check_name is a local, deterministic lookup — no network call, no
+    # dependency on the tunnel actually being open yet) and for a plain
+    # local serve (the proxy's own loopback address, known the moment
+    # listen_port is allocated). --anon is the one case this can't cover:
+    # the *.trycloudflare.com hostname isn't assigned until cloudflared
+    # reports it, which happens after this point — None here means "keep
+    # the wide-open fallback for this session," not "forgot to compute
+    # it."
+    if domain_config is not None:
+        routed_name = directory_client.check_name(app_name, suffix=not config.no_suffix)
+        public_origin: str | None = f"https://{routed_name}.{domain_config.domain}"
+    elif config.anon:
+        public_origin = None
+    else:
+        public_origin = f"http://127.0.0.1:{listen_port}"
+
     proc: subprocess.Popen | None = None
     proxy: ProxyHandle
     tunnel = None
@@ -503,11 +1177,11 @@ def serve(config: ServeConfig) -> None:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        if launcher is CodeLauncher.MCP:
-            # Best-effort: `_write_mcp_host_wrapper` always writes this
-            # file before the subprocess referencing it is ever started,
-            # so it exists by the time any teardown path can run.
-            _mcp_wrapper_path(app_name).unlink(missing_ok=True)
+        if launcher in _WRAPPER_LAUNCHERS:
+            # Best-effort: `_write_launch_wrapper` always writes this file
+            # before the subprocess referencing it is ever started, so it
+            # exists by the time any teardown path can run.
+            _wrapper_path(app_name, launcher).unlink(missing_ok=True)
         stdout.print()
         info(f"{app_name} stopped")
 
@@ -525,11 +1199,12 @@ def serve(config: ServeConfig) -> None:
             auth=config.auth.value,
             token=token,
             control_token=control_token,
+            pwa=pwa_runtime,
         )
     elif target_kind is TargetKind.CODE:
         upstream_port = allocate_port()
         launcher = detect_code_launcher(target)
-        argv = _build_code_launch_argv(target, launcher, upstream_port, app_name)
+        argv = _build_code_launch_argv(target, launcher, upstream_port, app_name, public_origin)
         env = {**os.environ, **injected_env, "PORT": str(upstream_port)}
 
         def _start_code_upstream() -> None:
@@ -548,10 +1223,13 @@ def serve(config: ServeConfig) -> None:
             control_token=control_token,
             start_upstream=_start_code_upstream,
             peers=config.peers,
+            pwa=pwa_runtime,
         )
     elif target_kind is TargetKind.NOTEBOOK:
         upstream_port = allocate_port()
-        argv = notebook.build_jupyter_launch_command(target, port=upstream_port)
+        argv = notebook.build_jupyter_launch_command(
+            target, port=upstream_port, public_origin=public_origin
+        )
         env = {**os.environ, **injected_env}
 
         def _start_notebook_upstream() -> None:
@@ -567,6 +1245,7 @@ def serve(config: ServeConfig) -> None:
             control_token=control_token,
             start_upstream=_start_notebook_upstream,
             peers=config.peers,
+            pwa=pwa_runtime,
         )
     else:
         raise NotImplementedError(
@@ -594,8 +1273,19 @@ def serve(config: ServeConfig) -> None:
             tunnel_id=domain_config.tunnel_id,
             api_token_name=domain_config.api_token_name,
             tunnel_token_name=domain_config.tunnel_token_name,
+            suffix=not config.no_suffix,
         )
         tunnel_url = tunnel.url
+
+    if pwa_runtime is not None:
+        # Only knowable now — the tunnel (if any) is up, so this is the
+        # actual served URL, not a startup-time guess. See
+        # pwa.finalize_offline_page and PwaRuntime's own docstring for why
+        # offline.html is mutated in place rather than built once up front
+        # like everything else in pwa_runtime.
+        pwa.finalize_offline_page(
+            pwa_runtime, app_name=app_name, served_url=tunnel_url or local_url
+        )
 
     started_at = time.time()
     registry.register(
@@ -612,6 +1302,24 @@ def serve(config: ServeConfig) -> None:
         )
     )
 
+    if config.json_output:
+        # Emitted at the same instant as the registry entry, so an
+        # attached `--json` run and a `--detach` parent report identical
+        # facts from the same moment. In a detached child this line lands
+        # at the top of the log, which makes the log self-describing.
+        json_line(
+            {
+                "status": "running",
+                "app": app_name,
+                "pid": os.getpid(),
+                "url": tunnel_url or local_url,
+                "local_url": local_url,
+                "tunnel_url": tunnel_url,
+                "auth": config.auth.value,
+                "token": token,
+            }
+        )
+
     success(f"{app_name} serving at {local_url}")
     if launcher is CodeLauncher.FASTAPI:
         info(f"API docs: {local_url}/docs (FastAPI's own Swagger UI — served automatically)")
@@ -625,7 +1333,26 @@ def serve(config: ServeConfig) -> None:
         info(f"auto-stop after {config.timeout:g}s")
     if config.idle_timeout is not None:
         info(f"auto-stop after {config.idle_timeout:g}s of no traffic")
-    info("Ctrl+C to stop")
+    if pwa_runtime is not None:
+        sw_desc = "sw disabled (--pwa-no-sw)" if pwa_runtime.sw_js is None else "sw /sw.js"
+        icon_desc = "icon bundled default" if config.pwa.icon is None else f"icon {config.pwa.icon}"
+        info(f"PWA: manifest /manifest.webmanifest · {sw_desc} · {icon_desc}")
+        if domain_config is not None:
+            info(f"PWA: stable install · id {domain_config.domain}")
+        else:
+            info("PWA: ephemeral session — icon breaks when this URL ends")
+            info("PWA: use --domain for a permanent install")
+    if autoregister_pending:
+        _autoregister_commit(config, app_name=app_name, target=target, target_kind=target_kind)
+    # A detached child has no terminal to Ctrl+C, and this line ends up
+    # in its log where a reader needs the command that actually works.
+    info(f"`sidepage stop {app_name}` to stop" if is_detached_child() else "Ctrl+C to stop")
+    if config.qr:
+        # stderr under --json, for the same reason as the detached path:
+        # stdout carries the one parseable line and nothing else.
+        qr.print_qr(
+            tunnel_url or local_url, out=sys.stderr if config.json_output else None
+        )
 
     # §20 timeout / idle-timeout: both checked right here in the existing
     # blocking loop, both exiting through the same `break` -> `finally:
@@ -677,6 +1404,12 @@ def proxy(config: ProxyConfig) -> None:
     (Origin/CSRF, localhost-trust security, OAuth/`--anon`) this prints a
     condensed version of at startup.
     """
+    if config.detach and not is_detached_child():
+        # Same reasoning as `serve`'s branch — validation belongs to the
+        # child alone. `proxy` needs no name resolution: --name is
+        # required by the time a ProxyConfig exists.
+        raise SystemExit(_spawn_detached(config.name, json_output=config.json_output))
+
     domain_config = _validate_common(
         domain=config.domain,
         anon=config.anon,
@@ -692,6 +1425,9 @@ def proxy(config: ProxyConfig) -> None:
             f"an app named {app_name!r} is already registered as running — "
             f"`sidepage stop {app_name}` it first, or pass --name for a different one."
         )
+    # Same DNS pre-flight as `serve` — `proxy` has no `--no-suffix` of its
+    # own, so always the suffixed form. See `_assert_hostname_available`.
+    _assert_hostname_available(False, app_name, domain_config)
 
     token: str | None = None
     if config.auth is AuthTier.TOKEN:
@@ -776,6 +1512,21 @@ def proxy(config: ProxyConfig) -> None:
         )
     )
 
+    if config.json_output:
+        json_line(
+            {
+                "status": "running",
+                "app": app_name,
+                "pid": os.getpid(),
+                "url": tunnel_url or local_url,
+                "local_url": local_url,
+                "tunnel_url": tunnel_url,
+                "auth": config.auth.value,
+                "token": token,
+                "upstream_port": config.port,
+            }
+        )
+
     success(f"{app_name} proxying 127.0.0.1:{config.port} -> {local_url}")
     if tunnel_url:
         success(f"public URL: {tunnel_url}")
@@ -803,7 +1554,9 @@ def proxy(config: ProxyConfig) -> None:
             "--anon: this hostname changes every run — OAuth/SSO redirect URIs can't be "
             "registered against it; use --domain if your app does OAuth login"
         )
-    info("Ctrl+C to stop")
+    # A detached child has no terminal to Ctrl+C, and this line ends up
+    # in its log where a reader needs the command that actually works.
+    info(f"`sidepage stop {app_name}` to stop" if is_detached_child() else "Ctrl+C to stop")
 
     try:
         while True:

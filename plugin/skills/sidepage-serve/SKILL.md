@@ -1,6 +1,6 @@
 ---
 name: sidepage-serve
-description: Spin up, register, inspect, and shut down local websites and apps (static sites, scripts, Streamlit, FastAPI, Python MCP servers, Jupyter notebooks) using the `sidepage` CLI, and get back a shareable URL. Also proxies an already-running local service (npm run dev, a container, anything on a port) through the same auth/tunnel stack via `sidepage proxy`. Use this whenever the user asks to "host", "serve", "preview", "spin up", "share a link to", "demo", "deploy locally", or "tunnel" a site, app, or already-running dev server, or asks to stop/tear down/take down one that's running, check what's running (`ls`/`status`/`usage`), save a reusable launch config (`app register`), or manage sidepage secrets/domains. Trigger even if they just paste a file path/port and say "can people see this" or "give me a link" — that's a serve/proxy request. Assumes `sidepage` is already installed and on PATH via a native Python 3.12 (not necessarily behind `uv run`).
+description: Spin up, register, inspect, and shut down local websites and apps (static sites, scripts, Streamlit, FastAPI, Python MCP servers, Gradio apps, Jupyter notebooks) using the `sidepage` CLI, and get back a shareable URL. Also proxies an already-running local service (npm run dev, a container, anything on a port) through the same auth/tunnel stack via `sidepage proxy`. Use this whenever the user asks to "host", "serve", "preview", "spin up", "share a link to", "demo", "deploy locally", or "tunnel" a site, app, or already-running dev server, or asks to stop/tear down/take down one that's running, check what's running (`ls`/`status`/`usage`), save a reusable launch config (`app register`), or manage sidepage secrets/domains. Trigger even if they just paste a file path/port and say "can people see this" or "give me a link" — that's a serve/proxy request. Assumes `sidepage` is already installed and on PATH via a native Python 3.12 (not necessarily behind `uv run`).
 ---
 
 # sidepage-serve
@@ -11,71 +11,78 @@ bring a site up, hand back a working URL, and tear it down again —
 including when running as a dispatched/background task with no
 interactive terminal.
 
-## The one thing that will bite you: `serve` and `proxy` both block
+## If `sidepage` isn't on PATH
 
-`sidepage serve <target>` and `sidepage proxy --port <n>` both run in the
-foreground and **only** exit on Ctrl+C or a `sidepage stop <app-name>`
-from another terminal — there is no daemon/background mode built into the
-CLI, for either command. If you run either directly in a dispatched task,
-the command never returns and the task hangs forever.
+It's a real PyPI package now — `pip install sidepage` (needs Python
+3.12+), then `sidepage setup` once to install `cloudflared` (only needed
+for `--anon`/`--domain` tunneling; skip it if the user only wants a local
+`127.0.0.1` link). Don't try `uv run sidepage` as a substitute — this
+skill assumes a native install on `PATH` and invokes `sidepage` directly. `sidepage` itself still shells
+out to `uv` to run whatever `serve` points at (the wrapped app's own
+dependencies), so `uv` needs to be on `PATH` too, separately from
+installing sidepage itself.
 
-**Always launch through `scripts/start_site.sh`**, which backgrounds the
-process correctly (`nohup` + `disown`) and polls until it can tell you
-whether the app actually came up, rather than guessing. It has three
-modes, because `sidepage serve` takes exactly one positional argument
-that means different things depending on whether you're serving a fresh
-target or a name already saved in the registry, and `sidepage proxy`
-takes no positional target at all (just `--port`):
+## Always pass `--detach --json`
+
+`sidepage serve <target>` and `sidepage proxy --port <n>` block by
+default: they run in the foreground and exit only on Ctrl+C or a
+`sidepage stop <app-name>` from elsewhere. Run either one bare and the
+command never returns — in a dispatched task, that hangs forever.
+
+**`--detach` fixes this, and `--json` makes the result parseable.** Use
+both, every time:
 
 ```bash
-# Fresh target, not yet registered — script fills in --name for you:
-scripts/start_site.sh new <app-name> <target> [serve flags...]
-
-# Already-registered app (see "the app registry" below):
-scripts/start_site.sh registered <app-name> [override flags...]
-
-# An already-running local service, wrapped instead of launched:
-scripts/start_site.sh proxy <app-name> --port <n> [proxy flags...]
+sidepage serve <target> --name <app-name> --detach --json [flags...]
+sidepage serve <app-name> --detach --json [override flags...]   # registered app
+sidepage proxy --port <n> --name <app-name> --detach --json [flags...]
 ```
 
 Examples:
 
 ```bash
-scripts/start_site.sh new demo app.py --auth token --anon
-scripts/start_site.sh registered abc-app --scope web
-scripts/start_site.sh proxy my-vite-app --port 5173 --anon
+sidepage serve app.py --name demo --auth token --anon --detach --json
+sidepage serve abc-app --scope web --detach --json
+sidepage proxy --port 5173 --name my-vite-app --anon --detach --json
 ```
 
-This prints one line of JSON, e.g.:
+`--detach` returns only once the app is genuinely serving or has
+definitively failed — it is asynchronous in lifetime, synchronous in
+readiness — and prints one line of JSON to stdout:
 
 ```json
-{"status":"running","app":"demo","pid":12345,"log":"/home/user/.local/state/sidepage/skill-logs/demo.log","url":"https://random-words.trycloudflare.com"}
+{"status":"running","app":"demo","pid":12345,"url":"https://random-words.trycloudflare.com","local_url":"http://127.0.0.1:8501","tunnel_url":"https://random-words.trycloudflare.com","log":"~/.local/state/sidepage/logs/demo.log"}
 ```
 
-- `status: "running"` — hand the `url` straight to the user.
-- `status: "failed"` — read `log` (the script already tails the last 20
-  lines into `error`) and diagnose before retrying. Common causes: target
-  path wrong, `--anon`/`--domain` both passed, a `--env` secret that isn't
-  in the vault, port conflict from a previous run that wasn't stopped, or
-  (for `proxy`) nothing actually listening on `--port` yet.
-- `status: "starting"` — no URL yet after 30s. Not necessarily broken (first
-  run resolves dependencies via `uv run`, which can be slow) — check
-  `sidepage status <app-name>` or tail the log yourself before deciding
-  what to do.
+- `status: "running"` (exit 0) — hand `url` straight to the user. It is
+  the tunnel URL when there is one, else the local URL.
+- `status: "failed"` (exit 1) — `error` carries the child's actual error
+  message, and `log` is the full output. Common causes: target path
+  wrong, `--anon`/`--domain` both passed, a `--env` secret that isn't in
+  the vault, a name already running, or (for `proxy`) nothing listening
+  on `--port` yet.
+- `status: "starting"` (exit 0) — no registry entry after 180s. Rare, and
+  not necessarily broken: a first run resolves dependencies through `uv`,
+  which can be slow on a cold cache. Check `sidepage status <app-name>`
+  or read the log before deciding whether to stop it.
+
+With `--json`, stdout carries *only* that line — every human-readable
+message moves to stderr — so it can be piped into a parser directly.
+`--json` also works without `--detach`, printing the same line the moment
+the app is up and then continuing to block; use that only if you intend
+to own the process yourself.
 
 To stop it:
 
 ```bash
-scripts/stop_site.sh <app-name>
+sidepage stop <app-name>
 ```
 
-This runs `sidepage stop`, then confirms with `sidepage status` rather than
-assuming the teardown worked, and returns JSON. Works the same for a
-`serve`d app and a `proxy`d one — but see the teardown-asymmetry warning
-in the proxy section below before assuming it stops everything. Always
-stop apps you started once the user is done with them or the task is
-finished — a forgotten background `serve`/`proxy` keeps a tunnel and port
-open indefinitely.
+Works the same for a `serve`d app and a `proxy`d one — but see the
+teardown-asymmetry warning in the proxy section below before assuming it
+stops everything. Always stop apps you started once the user is done with
+them or the task is finished: a forgotten background `serve`/`proxy`
+keeps a tunnel and a port open indefinitely.
 
 ## Deciding what to run
 
@@ -89,6 +96,8 @@ launches:
 | `.py` script, Streamlit app | `code` (auto-detected) | launched via `streamlit run` |
 | `.py` script, FastAPI app | `code` (auto-detected) | `uvicorn`; `/docs` works automatically |
 | `.py` script, MCP server (official `mcp` SDK or `fastmcp`) | `code` (auto-detected) | served over real Streamable HTTP at `/mcp`, regardless of what the script's own `__main__`/`mcp.run()` would normally do |
+| `.py` script, Gradio app | `code` (auto-detected) | mounted and served by sidepage; the script's own `demo.launch()` is neutralized, so a hardcoded `server_port=`/`share=True` can't fight sidepage's port or tunnel |
+| Hugging Face Space | fetched by `sidepage pull` first | see **Remote apps** below — needs an explicit human confirmation before it will run |
 | `.ipynb` notebook | `notebook` | full editable Jupyter Lab with a live kernel |
 
 `--type` almost never needs to be set explicitly — trust auto-detection
@@ -116,6 +125,14 @@ Key flags to reason about before launching `serve`:
   under the user's own domain. **Passing neither** means the app only
   listens on `127.0.0.1` — fine for "just let me look at it myself," wrong
   if the user wants to share a link.
+- **`--no-suffix`** — `--domain` only (rejected otherwise). Serves at a bare
+  `<app-name>.<domain>` instead of the default
+  `<app-name>-<id>.<domain>`. Pass it when the user asks for a specific,
+  clean hostname on their own domain (`docs.example.com`); don't add it
+  speculatively. A name already pointed somewhere else in that zone is
+  rejected loud (`an app with this name already exists`) rather than
+  overwritten — relay the error's options (different `--name`, drop
+  `--no-suffix`, or delete the stale DNS record) instead of retrying.
 - **`--env <SECRET_NAME>`** — repeatable; injects a named secret from the
   vault into the served process's environment. Fails loud if the name
   isn't in the vault yet — check with `sidepage secrets list` and prompt
@@ -141,6 +158,29 @@ Key flags to reason about before launching `serve`:
   yet. The app can also re-resolve peers live via `GET
   /.sidepage/peers.json`, so a peer that restarts mid-session is never
   stale. Serve the peer first, then the app that references it.
+- **`--pwa`** — makes the app installable to a phone home screen (manifest
+  + service worker + HTML injection, all at the proxy layer — the app on
+  disk is never touched). Reach for this whenever the user wants to "add
+  it to my home screen," "make it an app," or install a demo on their
+  phone — not just for a plain sharable link, that's `--anon`/`--domain`
+  alone. Common flags: `--pwa-name`/`--pwa-short-name` (default: the
+  resolved app name), `--pwa-icon <path>` (square PNG, ≥512px — validated,
+  fails loud with the actual dimensions if it isn't), `--pwa-theme`/
+  `--pwa-bg` (hex colors). Mention up front that an `--anon` install
+  breaks the moment that session ends (sidepage says so in its own
+  output) — use `--domain` if the user wants the icon to survive restarts.
+- **`--qr`** — prints a terminal QR code for the resulting URL. Independent
+  of `--pwa`; pass it any time the user is going to want to scan a link
+  onto a phone rather than type it. Combines fine with `--detach --json`:
+  the code is rendered by the foreground command you ran, not by the
+  backgrounded app, and under `--json` it goes to stderr so the payload on
+  stdout stays parseable. It needs a real terminal to draw into, so it
+  degrades to a warning (no crash) when output is piped or redirected —
+  in that case hand back the plain `url` from the JSON instead.
+
+```bash
+sidepage serve app.py --name demo --anon --pwa --pwa-name "Demo" --detach --json
+```
 
 ## Proxying an already-running service
 
@@ -151,7 +191,8 @@ structural difference: **sidepage never launches or owns the process**.
 It only listens on the port and forwards traffic.
 
 ```bash
-scripts/start_site.sh proxy <app-name> --port <n> [--domain <domain> | --anon]
+sidepage proxy --port <n> --name <app-name> --detach --json
+                                        [--domain <domain> | --anon]
                                         [--auth open|token] [--token <value>]
                                         [--timeout <seconds>] [--idle-timeout <seconds>]
 ```
@@ -171,7 +212,7 @@ scripts/start_site.sh proxy <app-name> --port <n> [--domain <domain> | --anon]
   concepts and `proxy` doesn't own a subprocess. Don't pass them.
 
 **Teardown asymmetry — the one behavior genuinely different from
-`serve`:** Ctrl+C / `sidepage stop <app-name>` / `scripts/stop_site.sh`
+`serve`:** Ctrl+C / `sidepage stop <app-name>`
 tear down the proxy, the tunnel, and the registry entry **only**. The
 service on `--port` was never sidepage's to stop, and it keeps running
 after teardown. Tell the user this explicitly if they ask you to "shut it
@@ -213,9 +254,9 @@ user proactively, not just on request:
 
 ```bash
 # User already has: npm run dev -- --host 127.0.0.1 --port 5173
-scripts/start_site.sh proxy my-vite-app --port 5173               # local only
-scripts/start_site.sh proxy my-vite-app --port 5173 --domain example.com
-scripts/start_site.sh proxy my-vite-app --port 5173 --anon
+sidepage proxy --port 5173 --name my-vite-app --detach --json               # local only
+sidepage proxy --port 5173 --name my-vite-app --domain example.com --detach --json
+sidepage proxy --port 5173 --name my-vite-app --anon --detach --json
 ```
 
 `sidepage ls`/`status` list a proxied app the same as a served one (just
@@ -228,7 +269,7 @@ things" below.
 `sidepage app register` only covers `serve` invocations, not `proxy` —
 there's no persistent target to detect/store for something sidepage never
 launches. If the user wants to re-run the same `proxy` call repeatedly,
-just re-issue the same `scripts/start_site.sh proxy ...` command; there's
+just re-issue the same `sidepage proxy ...` command; there's
 no registry shortcut for it.
 
 If the user wants to serve the same thing repeatedly (a recurring demo, a
@@ -241,9 +282,25 @@ sidepage app show <app-name>
 sidepage app unregister <app-name>
 ```
 
+Or pass **`--autoregister`** on the `serve` call itself — the same entry is
+saved once the app is actually up, without composing a separate
+registration string. Prefer this when you're already starting the app and
+the user asks to keep it: it can't drift from what actually ran.
+
+```bash
+sidepage serve ./dashboard.py --name dash --auth token --autoregister --detach --json
+```
+
+Re-running `--autoregister` for an app that's already registered with the
+identical config is safe — it writes nothing and warns that `sidepage
+serve <app-name>` is enough next time. A *different* config under the same
+name is refused before the app starts, so treat that error as a real
+question for the user (`sidepage app show <app-name>` to compare), not
+something to retry around.
+
 `register`/`list`/`show`/`unregister` all return immediately — run them
 directly, no backgrounding needed. To actually run a registered app, use
-`scripts/start_site.sh registered <app-name> [override flags...]` (same
+`sidepage serve <app-name> --detach --json [override flags...]` (same
 backgrounding/polling reasoning as any other `serve` call — see above).
 
 Notes that matter when using this:
@@ -258,16 +315,70 @@ Notes that matter when using this:
   app show <app-name> --with "<flags>"` — e.g. `sidepage app show
   abc-app --with "--scope web"` — which prints the effective merged config
   without actually running it. `--timeout`/`--idle-timeout`/`--peer`/
-  `--token` are never part of a registration (nothing to merge against);
-  they always come from whatever is passed at `serve`/`start_site.sh` time.
+  `--qr`/`--token` are never part of a registration (nothing to merge
+  against); they always come from whatever is passed at
+  `serve` time. `--pwa`/`--pwa-*` **are** stored, and merge
+  as one unit: passing any `--pwa*` flag at `serve <app-name>` time
+  replaces the saved PWA config wholesale rather than field by field.
 - `sidepage app register` will **reject** a registration string containing
   a literal `--token <value>` — auth tokens are process-scoped and meant to
   regenerate per-serve, so this isn't a bug to work around, it's the
   registry refusing to persist a secret. If the user wants a stable token
   across runs, that's what `--env` + the vault are for, not `app register`.
+  `--autoregister` is the one place a `--token` doesn't abort anything: it
+  saves the rest of the invocation and prints what it dropped. Don't read
+  that warning as a failure — the app is serving and the entry is saved.
 - `sidepage app list` / `sidepage app show <app-name>` / `sidepage app
   unregister <app-name>` round out the registry — use `list` when the user
   asks "what do I have set up" rather than guessing from memory.
+
+## Remote apps: `sidepage pull`
+
+To host someone else's Hugging Face Space, fetch it first — this
+downloads and registers it but **runs nothing**:
+
+```bash
+sidepage pull huggingface.co/spaces/<owner>/<name>     # or hf:<owner>/<name>
+sidepage pull hf:<owner>/<name> --dry-run              # plan + download size, fetches nothing
+sidepage pull hf:<owner>/<name> --json                 # one parseable line
+```
+
+Use `--dry-run` first when the user hasn't seen the Space before: it
+reports the total download size without paying for it, which matters
+because Spaces routinely carry multi-gigabyte model weights.
+
+**You cannot serve a pulled app on the user's behalf.** `serve` prints
+what it's about to run and asks for confirmation, and in a non-interactive
+context — which is what you are — it refuses outright and exits 1. That is
+deliberate: it's the difference between a convenience and a remote-code
+execution path. When the user asks you to run a pulled app:
+
+1. Run `sidepage pull ...` and show them the plan.
+2. Tell them the exact command to run themselves, including any `--env`
+   names the Space requested:
+   `sidepage serve <app-name> --env SOME_KEY`
+3. Do **not** pass `--trust-remote-code` to work around the prompt. Only
+   the user can make that call, and only after reading the code. If they
+   explicitly instruct you to, quote what the app is and where it came
+   from first.
+
+Requested env names are shown as `(requested — not granted)`. Nothing is
+bound until the user passes `--env`, and sidepage will never auto-grant a
+vault secret a downloaded manifest asks for.
+
+`pull` refuses Docker Spaces, GPU/ZeroGPU hardware tiers, and
+private/gated repos before downloading anything — those errors are final,
+not something to retry differently.
+
+To remove a pulled app and its downloaded source:
+
+```bash
+sidepage app delete <app-name> --yes
+```
+
+`app unregister` only forgets the config and leaves the files;
+`app delete` removes both. Neither will ever delete files for an app that
+was registered against a path the user already had.
 
 ## Checking on things
 
@@ -281,7 +392,7 @@ Notes that matter when using this:
   yet — say so if asked.)
 
 Run these directly (they return immediately, no backgrounding needed) —
-only `serve`/`proxy` themselves need `start_site.sh`.
+only `serve`/`proxy` themselves need `--detach`.
 
 ## Bring-your-own-domain (only if the user asks for their own domain)
 
@@ -296,7 +407,9 @@ This provisions one Cloudflare Tunnel for the whole domain and stores its
 run-token in the vault automatically (`cf-tunnel-token::<domain>`). After
 that, `--domain example.com` on any `serve` or `proxy` call routes through
 it — every app on the same domain shares the one tunnel, so there's no
-per-app provisioning after the first.
+per-app provisioning after the first. Apps land at
+`<app-name>-<id>.<domain>`; add `--no-suffix` for a bare
+`<app-name>.<domain>` when the user wants a specific hostname.
 
 ## Things that aren't implemented — say so, don't fake it
 
@@ -319,7 +432,7 @@ User: "spin up the streamlit app in ./dash for me to share with the team,
 gate it behind a token"
 
 ```bash
-scripts/start_site.sh new dash ./dash/app.py --auth token --anon
+sidepage serve ./dash/app.py --name dash --auth token --anon --detach --json
 ```
 → report the `url` and mention the app is gated behind a token (the gate
 page/cookie flow handles the token itself — no need to separately explain
@@ -330,25 +443,25 @@ User: "I'll want to demo this same dashboard every week — save it"
 ```bash
 sidepage app register "./dash/app.py --auth token --anon" dash-weekly
 ```
-Next time: `scripts/start_site.sh registered dash-weekly` — no need to
+Next time: `sidepage serve dash-weekly --detach --json` — no need to
 retype the target or flags, and `sidepage app show dash-weekly` first if
 you want to confirm what will actually run before firing it.
 
 User: "ok take it down"
 
 ```bash
-scripts/stop_site.sh dash
+sidepage stop dash
 ```
 → confirm it's stopped.
 
 User: "I've got `npm run dev` running on 5173, can people see this?"
 
 ```bash
-scripts/start_site.sh proxy vite-demo --port 5173 --anon
+sidepage proxy --port 5173 --name vite-demo --anon --detach --json
 ```
 → hand back the `url`, and mention up front that the tunnel hostname
 changes every run, that Vite's dev overlay needs `server.allowedHosts` set
 to see traffic from it (wildcard `.trycloudflare.com` for `--anon`), and
 that HMR over `--anon` is a known unreliable case — the initial page load
 will work regardless. Also mention that stopping this later
-(`scripts/stop_site.sh vite-demo`) won't stop their `npm run dev` process.
+(`sidepage stop vite-demo`) won't stop their `npm run dev` process.

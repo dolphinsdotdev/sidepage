@@ -10,6 +10,7 @@ build/
 .coverage
 htmlcov/
 node_modules/
+tests/fixtures/notebook-app/.ipynb_checkpoints/
 
 # Backstop only — sidepage.core.process now writes these under
 # SIDEPAGE_HOME's state dir (mcp_wrappers_dir()), never next to a served

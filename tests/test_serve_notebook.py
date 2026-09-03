@@ -1,19 +1,35 @@
 """Integration tests for notebook (Jupyter Lab) support in `sidepage
 serve`, against the real `tests/fixtures/notebook-app` fixture.
 
-The flagship test here (`test_notebook_kernel_execution_round_trip`) is
-the one that actually matters: Jupyter Server rejects cross-origin
-requests and WebSocket upgrades by default, and the browser's `Origin`
-through Sidepage's proxy is the *proxy's* address, not Jupyter's own
-(different) upstream port — a mismatch that gets rejected without the
-`--ServerApp.allow_origin=*`/`--ServerApp.disable_check_xsrf=True` flags
-`sidepage.core.notebook.build_jupyter_launch_command` passes (verified
-live against a real Jupyter Server before committing to that design — see
-that module's docstring). This test reproduces the real shape of that
-risk: it starts a kernel and opens the WebSocket *through the actual
-sidepage proxy port*, deliberately sending the proxy's own origin (what a
-real browser would send), and checks a real `execute_request` gets a real
-stdout reply back — not just that the server started.
+Jupyter Server checks `Origin` and `Host` separately, and Sidepage's proxy
+breaks each for a different reason (see `sidepage.core.notebook`'s module
+docstring for the full "verified live, not assumed" story on both):
+
+- `test_notebook_kernel_execution_round_trip` is the flagship test:
+  Jupyter rejects cross-origin requests/WebSocket upgrades by default,
+  comparing `Origin` against its own `Host` — through the proxy, the
+  browser's `Origin` is the *proxy's* address, not Jupyter's real
+  (different) upstream port, a mismatch that gets rejected without
+  `--ServerApp.allow_origin=*`/`--ServerApp.disable_check_xsrf=True`. This
+  test starts a real kernel and opens the WebSocket *through the actual
+  sidepage proxy port*, deliberately sending the proxy's own origin (what
+  a real browser would send), and checks a real `execute_request` gets a
+  real stdout reply back — not just that the server started.
+- `test_notebook_allows_its_own_local_url_host`/
+  `test_notebook_rejects_spoofed_host_when_served_locally` cover the
+  separate `Host` check (distinct from the `Origin` one above — reproduced
+  live as every static asset 403ing with "Blocking request with non-local
+  'Host'" once a real `--domain` tunnel is in front of a notebook): a
+  plain local serve's `Host` allowlist is now `sidepage.core.process.
+  serve`'s real computed `public_origin`, not a blanket
+  `--ServerApp.allow_remote_access=True` bypass — the app's own real
+  address still works, and a spoofed/unrelated `Host` (what a malicious
+  page on the same machine could send, the exact DNS-rebinding-style risk
+  `ServerApp.allow_remote_access`'s own docstring names) is still
+  rejected. `test_build_jupyter_launch_command_allowlists_known_origin`
+  is the fast, no-server complement covering the `--domain` shape of
+  `public_origin` (not exercised live here — would need the same
+  fake-Cloudflare-API mocking `tests/test_tunnel_byo.py` uses).
 
 No Jupyter client library is used: the kernel WebSocket protocol is
 exercised directly over `websockets` (already a project dependency, used
@@ -169,6 +185,85 @@ def test_notebook_kernel_execution_round_trip(sidepage_home: Path) -> None:
     finally:
         _stop("nb-exec", env)
         proc.wait(timeout=15)
+
+
+def test_notebook_allows_its_own_local_url_host(sidepage_home: Path) -> None:
+    """`sidepage.core.process.serve`'s `public_origin` for a plain local
+    serve (no `--domain`/`--anon`) is the proxy's own
+    `http://127.0.0.1:<listen_port>` — this checks that real value (not a
+    guess) round-trips correctly through
+    `notebook.build_jupyter_launch_command`'s `local_hostnames` allowlist:
+    a request whose `Host` genuinely matches what the app is served at
+    still works, not just requests that happen to hit Jupyter's
+    always-local loopback-IP exemption directly."""
+    env = {**os.environ, "SIDEPAGE_HOME": str(sidepage_home)}
+    proc = _run_serve(
+        [str(FIXTURES / "notebook-app" / "notebook.ipynb"), "--name", "nb-host-ok"], env=env
+    )
+    try:
+        entry = _wait_for_registry_entry(sidepage_home, "nb-host-ok", timeout=30)
+        resp = _poll_until_ready(f"{entry['url']}/lab", timeout=30)
+        assert resp.status_code == 200
+        assert "non-local" not in resp.text.lower()
+    finally:
+        _stop("nb-host-ok", env)
+        proc.wait(timeout=15)
+
+
+def test_notebook_rejects_spoofed_host_when_served_locally(sidepage_home: Path) -> None:
+    """The DNS-rebinding-style protection this whole check exists for
+    (`ServerApp.allow_remote_access`'s own docstring names it explicitly):
+    a plain local serve's `local_hostnames` allowlist is now the proxy's
+    *actual* address, not a blanket bypass — a request claiming an
+    unrelated `Host` a malicious page on the same machine could send must
+    still be rejected, exactly the shape of request
+    `test_notebook_allows_non_local_host_through_domain_tunnel` used to
+    assert was let through back when the fix here was
+    `--ServerApp.allow_remote_access=True` unconditionally."""
+    env = {**os.environ, "SIDEPAGE_HOME": str(sidepage_home)}
+    proc = _run_serve(
+        [str(FIXTURES / "notebook-app" / "notebook.ipynb"), "--name", "nb-host-spoof"], env=env
+    )
+    try:
+        entry = _wait_for_registry_entry(sidepage_home, "nb-host-spoof", timeout=30)
+        _poll_until_ready(f"{entry['url']}/lab", timeout=30)  # wait for readiness first
+
+        resp = httpx.get(
+            f"{entry['url']}/lab",
+            headers={"Host": "not-this-app.example.com"},
+            timeout=10,
+        )
+        assert resp.status_code == 403
+    finally:
+        _stop("nb-host-spoof", env)
+        proc.wait(timeout=15)
+
+
+def test_build_jupyter_launch_command_allowlists_known_origin() -> None:
+    """Fast, no-server unit test on the pure argv-building logic — the
+    live-server tests above prove the *mechanism* (Jupyter really does
+    enforce this allowlist) using the plain-local-serve shape of
+    `public_origin`; this covers the `--domain` shape too (not otherwise
+    exercised without mocking a real BYO-domain tunnel — see
+    `tests/test_tunnel_byo.py`'s fake-Cloudflare-API approach for why
+    that's heavier machinery than this one argv shape needs) without
+    needing that harness."""
+    from sidepage.core.notebook import build_jupyter_launch_command
+
+    domain_argv = build_jupyter_launch_command(
+        FIXTURES / "notebook-app" / "notebook.ipynb",
+        port=12345,
+        public_origin="https://nb-app-ab12.example.com",
+    )
+    assert "--ServerApp.allow_origin=https://nb-app-ab12.example.com" in domain_argv
+    assert "--ServerApp.local_hostnames=['localhost', 'nb-app-ab12.example.com']" in domain_argv
+    assert "--ServerApp.allow_remote_access=True" not in domain_argv
+
+    anon_argv = build_jupyter_launch_command(
+        FIXTURES / "notebook-app" / "notebook.ipynb", port=12345, public_origin=None
+    )
+    assert "--ServerApp.allow_origin=*" in anon_argv
+    assert "--ServerApp.allow_remote_access=True" in anon_argv
 
 
 def test_notebook_gated_by_auth_token_too(sidepage_home: Path) -> None:
